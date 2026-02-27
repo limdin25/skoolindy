@@ -732,6 +732,7 @@ class AutomationEngine:
             self._state.profiles = restored
             self._state.global_settings = db_settings
             self._task = asyncio.create_task(self._scheduler_loop(), name="automation-scheduler")
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_task_loop(), name="automation-heartbeat")
             self._session_task = (
                 asyncio.create_task(self._session_monitor_loop(), name="automation-session-monitor")
                 if SESSION_MONITOR_ENABLED

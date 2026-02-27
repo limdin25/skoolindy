@@ -9,6 +9,7 @@ import type {
   LogEntry,
   Profile,
   QueueItem,
+  QueuePreviewItem,
 } from "./types";
 
 const normalizeBase = (value: string) => value.replace(/\/+$/, "");
@@ -301,6 +302,7 @@ export const api = {
   updateAutomationSettings: (payload: AutomationSettings) => request<AutomationSettings>("/automation/settings", { method: "PUT", body: JSON.stringify(payload) }),
 
   getQueue: () => request<QueueItem[]>("/queue"),
+  getQueuePreview: (limit = 50, days = 2) => request<QueuePreviewItem[]>(`/queue/preview?limit=${limit}&days=${days}`),
   updateQueueItem: (id: string, payload: Partial<QueueItem>) => request<QueueItem>(`/queue/${id}`, { method: "PUT", body: JSON.stringify(payload) }),
   queueStartSoon: (id: string, seconds = 10) => request<QueueItem>(`/queue/${id}/start-soon?seconds=${Math.max(1, Math.floor(seconds))}`, { method: "POST" }),
   deleteQueueItem: (id: string) => request<{ success: boolean }>(`/queue/${id}`, { method: "DELETE" }),

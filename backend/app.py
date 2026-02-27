@@ -1,4 +1,4 @@
-﻿
+
 from __future__ import annotations
 
 import asyncio
@@ -6381,6 +6381,161 @@ def update_automation_settings(payload: AutomationSettingsModel):
         )
         db.commit()
     return payload
+
+
+@app.get("/queue/preview")
+def queue_preview(limit: int = 50, days: int = 2):
+    """Read-only projected schedule. No DB writes, no Playwright, no mutation."""
+    limit = max(1, min(200, limit))
+    days = max(1, min(7, days))
+    now = datetime.now()
+    end_boundary = now + timedelta(days=days)
+
+    with get_db() as db:
+        profiles = db.execute("SELECT * FROM profiles WHERE status IN ('ready','running','idle') ORDER BY name").fetchall()
+        communities_rows = db.execute("SELECT * FROM communities WHERE status = 'active' ORDER BY name").fetchall()
+        settings_row = db.execute("SELECT value FROM automation_settings WHERE key = 'default'").fetchone()
+
+    if not profiles:
+        return []
+
+    profiles = [dict(row) for row in profiles]
+    settings = json.loads(settings_row["value"]) if settings_row else {}
+    global_daily_cap = max(1, int(settings.get("globalDailyCapPerAccount", 5)))
+    scan_interval_minutes = max(1, int(settings.get("scanIntervalMinutes", 5)))
+    step_seconds = scan_interval_minutes * 60
+
+    communities_by_profile: Dict[str, List[Dict[str, Any]]] = {}
+    for row in communities_rows:
+        pid = str(row["profileId"] or "")
+        communities_by_profile.setdefault(pid, []).append(dict(row))
+
+    # Load rotation pointers from run_state
+    rotation_pointers: Dict[str, int] = {}
+    run_state_path = Path(__file__).parent / "skool_run_state.json"
+    try:
+        with open(run_state_path, "r", encoding="utf-8") as f:
+            rs = json.load(f)
+        for p in rs.get("profiles", []):
+            pid = str(p.get("id") or "")
+            if pid:
+                rotation_pointers[pid] = int(p.get("_current_community_index", 0) or 0)
+    except Exception:
+        pass
+
+    # Build per-profile projection state
+    profile_states = []
+    for prof in profiles:
+        pid = str(prof["id"])
+        comms = communities_by_profile.get(pid, [])
+        if not comms:
+            continue
+        done_today = int(prof.get("dailyUsage", 0) or 0)
+        remaining_today = max(0, global_daily_cap - done_today)
+        comm_idx = rotation_pointers.get(pid, 0) % len(comms)
+        profile_states.append({
+            "id": pid,
+            "name": str(prof.get("name") or prof.get("email") or pid),
+            "communities": comms,
+            "comm_idx": comm_idx,
+            "remaining_today": remaining_today,
+            "daily_cap": global_daily_cap,
+        })
+
+    if not profile_states:
+        return []
+
+    # Generate interleaved projections round-robin across profiles
+    items = []
+    slot = 0
+    # Track per-day remaining (resets at midnight boundaries)
+    day_remaining: Dict[str, int] = {ps["id"]: ps["remaining_today"] for ps in profile_states}
+    day_comm_actions: Dict[str, Dict[str, int]] = {ps["id"]: {} for ps in profile_states}
+    current_day = now.date()
+
+    while len(items) < limit:
+        added_this_round = False
+        for ps in profile_states:
+            if len(items) >= limit:
+                break
+            pid = ps["id"]
+
+            # Compute projected time for this slot
+            projected_dt = now + timedelta(seconds=step_seconds * (slot + 1))
+            if projected_dt > end_boundary:
+                continue
+
+            # Reset daily counters at day boundary
+            proj_day = projected_dt.date()
+            if proj_day != current_day:
+                current_day = proj_day
+                for ps2 in profile_states:
+                    day_remaining[ps2["id"]] = ps2["daily_cap"]
+                    day_comm_actions[ps2["id"]] = {}
+
+            if day_remaining[pid] <= 0:
+                continue
+
+            # Find next eligible community using rotation pointer
+            comms = ps["communities"]
+            found_community = None
+            for _ in range(len(comms)):
+                c = comms[ps["comm_idx"] % len(comms)]
+                ps["comm_idx"] += 1
+                cid = str(c.get("id") or "")
+                c_limit = int(c.get("dailyLimit") or 0)
+                c_used = int(day_comm_actions.get(pid, {}).get(cid, 0) or 0)
+                if c_limit > 0 and c_used >= c_limit:
+                    continue
+                found_community = c
+                break
+
+            if not found_community:
+                continue
+
+            cid = str(found_community.get("id") or "")
+            day_comm_actions.setdefault(pid, {})[cid] = int(day_comm_actions.get(pid, {}).get(cid, 0) or 0) + 1
+            day_remaining[pid] -= 1
+
+            display_time = _format_queue_display_time(projected_dt)
+            local_tz = now.astimezone().tzinfo
+            scheduled_for_iso = projected_dt.replace(tzinfo=local_tz).isoformat(timespec="seconds") if local_tz else projected_dt.isoformat(timespec="seconds")
+
+            day_label = ""
+            delta_days = (projected_dt.date() - now.date()).days
+            if delta_days == 1:
+                day_label = "Tomorrow"
+            elif delta_days > 1:
+                day_label = projected_dt.strftime("%a %b %d")
+
+            items.append({
+                "id": f"preview-{len(items)}",
+                "profile": ps["name"],
+                "profileId": pid,
+                "community": str(found_community.get("name") or ""),
+                "communityId": cid,
+                "postId": "",
+                "keyword": "",
+                "keywordId": "",
+                "scheduledTime": display_time,
+                "scheduledFor": scheduled_for_iso,
+                "priorityScore": 0,
+                "countdown": max(0, int((projected_dt - now).total_seconds())),
+                "isProjected": True,
+                "dayLabel": day_label,
+                "actionLabel": f"Next eligible post in {found_community.get('name', 'community')}",
+            })
+            added_this_round = True
+
+        slot += 1
+        if not added_this_round:
+            # All profiles exhausted for the remaining window
+            break
+        if slot > limit * 10:
+            # Safety valve
+            break
+
+    return items
 
 
 @app.get("/queue", response_model=List[QueueItemModel])

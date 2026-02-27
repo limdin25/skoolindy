@@ -49,6 +49,15 @@ export const useQueue = () =>
     refetchOnWindowFocus: false,
   });
 
+export const useQueuePreview = () =>
+  useQuery({
+    queryKey: ["queuePreview"],
+    queryFn: () => api.getQueuePreview(50, 2),
+    refetchInterval: 30000,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: false,
+  });
+
 export const useLogs = () =>
   useQuery({
     queryKey: ["logs"],

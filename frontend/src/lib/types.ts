@@ -86,6 +86,12 @@ export interface QueueItem {
   countdown: number;
 }
 
+export interface QueuePreviewItem extends QueueItem {
+  isProjected: boolean;
+  dayLabel: string;
+  actionLabel: string;
+}
+
 export interface LogEntry {
   id: string;
   timestamp: string;

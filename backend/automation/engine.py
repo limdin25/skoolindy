@@ -533,7 +533,9 @@ class AutomationEngine:
             settings = {**db_settings, **(global_settings or {})}
             run_profiles = self._merge_profiles(db_profiles, profiles or [])
             persisted = self._load_run_state_file()
-            should_restore = bool(persisted and persisted.get("run_state") not in {"completed", "idle", None})
+            persisted_day = (persisted.get("state_day") or (persisted.get("last_updated", "")[:10] or None)) if persisted else None
+            same_day = (persisted_day == datetime.now().strftime("%Y-%m-%d")) if persisted_day else True
+            should_restore = bool(persisted and persisted.get("run_state") not in {"completed", "idle", None} and same_day)
             if should_restore:
                 run_profiles = self._apply_persisted_counters(run_profiles, persisted)
 
@@ -727,6 +729,17 @@ class AutomationEngine:
             return
         if persisted.get("run_state") not in {"running", "paused"}:
             return
+
+        # Discard stale per-profile counters from a previous day to prevent
+        # restoring "finished" statuses across daily boundaries.
+        today = datetime.now().strftime("%Y-%m-%d")
+        persisted_day = persisted.get("state_day") or (persisted.get("last_updated", "")[:10] or None)
+        if persisted_day and persisted_day != today:
+            LOGGER.info(
+                "[SKOOL] Discarded stale run_state from previous day (%s); rebuilt from DB",
+                persisted_day,
+            )
+            persisted = {"run_state": "running", "profiles": [], "stats": {"total_comments": 0, "total_skipped": 0, "total_blacklisted": 0}, "current_profile_index": 0}
 
         db_profiles, db_settings = self._load_runtime_config_from_db()
         restored = self._apply_persisted_counters(db_profiles, persisted)
@@ -4950,6 +4963,7 @@ class AutomationEngine:
             "run_state": self._state.run_state,
             "current_profile_index": self._state.current_profile_index,
             "last_updated": datetime.now().isoformat(),
+            "state_day": datetime.now().strftime("%Y-%m-%d"),
         }
         with self.run_state_file.open("w", encoding="utf-8") as f:
             json.dump(payload, f)

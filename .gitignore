@@ -1,0 +1,56 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Frontend artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/*.local
+
+# Root artifacts
+node_modules/
+dist/
+dist-ssr/
+*.zip
+
+# Backend artifacts
+backend/__pycache__/
+backend/*.py[cod]
+backend/*.db
+backend/*.sqlite
+backend/skool_accounts/
+backend/skool_daily_counters_state.json
+backend/skool_global_blacklist.json
+backend/skool_run_state.json
+backend/config.local.json
+backend/logs/
+backend/venv/
+backend/.venv/
+backend/.claude_state/
+backend/.claude/
+
+# Python cache (fallback)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Playwright cache
+playwright/.cache/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

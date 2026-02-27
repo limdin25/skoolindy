@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.db
+skool_accounts/
+skool_daily_counters_state.json
+skool_global_blacklist.json
+skool_run_state.json
+config.local.json

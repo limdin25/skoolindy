@@ -1,0 +1,28 @@
+services:
+  backend:
+    # Internal API service. Not published to host to avoid direct :8000 access.
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: skool-backend
+    expose:
+      - "8000"
+    volumes:
+      - ./backend:/app
+    environment:
+      - TZ=Europe/London
+    restart: unless-stopped
+
+  frontend:
+    # Public entrypoint. Nginx serves UI and proxies /api/* to backend.
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: skool-frontend
+    depends_on:
+      - backend
+    environment:
+      - TZ=Europe/London
+    ports:
+      - "80:80"
+    restart: unless-stopped

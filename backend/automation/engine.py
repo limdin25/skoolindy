@@ -455,6 +455,7 @@ class AutomationEngine:
         self._queue_community_cooldown_until: Dict[str, float] = {}
         self._prefill_skip_log_state: Dict[str, Dict[str, float]] = {}
         self._ensure_profile_auth_fn: Optional[Callable[[str], dict]] = None
+        self._settings_etag: str = ""
 
         self._hydrate_state_from_disk()
     async def subscribe(self) -> asyncio.Queue[Dict[str, Any]]:
@@ -1289,8 +1290,10 @@ class AutomationEngine:
                 if not pending_prefill:
                     bootstrap_queue_fill_required = False
                     now_ts = time.time()
+                    _use_idle_wait = False
                     if in_schedule_profiles and not capacity_profiles:
                         wait_seconds = max(60, min(1800, int(self._seconds_until_next_daily_reset())))
+                        _use_idle_wait = True
                         if now_ts - daily_exhausted_wait_log_ts >= 300:
                             daily_exhausted_wait_log_ts = now_ts
                             await self.publish_log(
@@ -1326,7 +1329,10 @@ class AutomationEngine:
                                 f"[SKOOL] All profiles are outside schedule; waiting {wait_seconds}s until next run window",
                                 status="info",
                             )
-                    await self._countdown(wait_seconds)
+                    if _use_idle_wait:
+                        await self._idle_daily_reset_wait(wait_seconds)
+                    else:
+                        await self._countdown(wait_seconds)
                     continue
                 await self.publish_log("[SKOOL] Queue prefill started for all profiles", status="info")
                 for prefill_round in range(2):
@@ -1650,6 +1656,56 @@ class AutomationEngine:
         async with self._lock:
             if self._session_task is asyncio.current_task():
                 self._session_task = None
+
+    def _compute_settings_etag(self) -> str:
+        """Hash the DB rows that drive capacity decisions so idle can detect changes."""
+        import hashlib
+        try:
+            with self._db() as db:
+                settings_row = db.execute(
+                    "SELECT value FROM automation_settings WHERE key = 'default'"
+                ).fetchone()
+                communities = db.execute(
+                    "SELECT id, dailyLimit, status FROM communities ORDER BY id"
+                ).fetchall()
+            parts = [
+                (settings_row["value"] if settings_row else ""),
+                json.dumps([dict(c) for c in communities], sort_keys=True),
+            ]
+            return hashlib.md5("|".join(parts).encode()).hexdigest()
+        except Exception:
+            return self._settings_etag  # don't break on transient DB error
+
+    async def _idle_daily_reset_wait(self, initial_seconds: int) -> None:
+        """Interruptible idle wait: wakes at reset time or on settings change."""
+        _TICK = 5.0
+        _ETAG_INTERVAL = 10.0
+        deadline = time.time() + initial_seconds
+        _fake_reset = int(os.environ.get("ENGAGEFLOW_DEBUG_FAKE_RESET_SECONDS", "0") or "0")
+        reset_time = time.time() + (_fake_reset if _fake_reset > 0 else self._seconds_until_next_daily_reset())
+        etag_check_ts = 0.0
+        while time.time() < deadline:
+            async with self._lock:
+                if not self._state.is_running or self._state.is_paused:
+                    return
+            now = time.time()
+            if now >= reset_time:
+                await self.publish_log(
+                    "[SKOOL] Daily reset time reached; resuming scheduler immediately",
+                    status="info",
+                )
+                return
+            if now - etag_check_ts >= _ETAG_INTERVAL:
+                etag_check_ts = now
+                new_etag = await asyncio.to_thread(self._compute_settings_etag)
+                if new_etag != self._settings_etag:
+                    self._settings_etag = new_etag
+                    await self.publish_log(
+                        "[SKOOL] Settings change detected during idle; resuming immediately",
+                        status="info",
+                    )
+                    return
+            await asyncio.sleep(min(_TICK, max(0.1, deadline - time.time())))
 
     async def _countdown(self, seconds: int) -> None:
         for remaining in range(seconds, 0, -1):

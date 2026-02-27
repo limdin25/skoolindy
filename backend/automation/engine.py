@@ -1683,7 +1683,10 @@ class AutomationEngine:
         deadline = time.time() + initial_seconds
         _fake_reset = int(os.environ.get("ENGAGEFLOW_DEBUG_FAKE_RESET_SECONDS", "0") or "0")
         reset_time = time.time() + (_fake_reset if _fake_reset > 0 else self._seconds_until_next_daily_reset())
-        etag_check_ts = 0.0
+        # Seed etag on first entry so we detect *changes* from this point forward, not from "".
+        if not self._settings_etag:
+            self._settings_etag = await asyncio.to_thread(self._compute_settings_etag)
+        etag_check_ts = time.time()  # first real check in _ETAG_INTERVAL seconds
         while time.time() < deadline:
             async with self._lock:
                 if not self._state.is_running or self._state.is_paused:

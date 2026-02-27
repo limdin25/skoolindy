@@ -539,6 +539,13 @@ class AutomationEngine:
             should_restore = bool(persisted and persisted.get("run_state") not in {"completed", "idle", None} and same_day)
             if should_restore:
                 run_profiles = self._apply_persisted_counters(run_profiles, persisted)
+            elif persisted:
+                # Rotation pointers survive day boundaries even when counters don't
+                by_id = {str(p.get("id") or ""): p for p in persisted.get("profiles", [])}
+                for profile in run_profiles:
+                    saved = by_id.get(str(profile.get("id") or ""))
+                    if saved and "_current_community_index" in saved:
+                        profile["_current_community_index"] = int(saved.get("_current_community_index", 0) or 0)
 
             self._validate_start_payload(run_profiles, settings)
 
@@ -741,7 +748,13 @@ class AutomationEngine:
                 persisted_day,
             )
             self._last_recover_reason = f"stale_day:{persisted_day}"
-            persisted = {"run_state": "running", "profiles": [], "stats": {"total_comments": 0, "total_skipped": 0, "total_blacklisted": 0}, "current_profile_index": 0}
+            # Preserve rotation pointers (not daily counters) across day boundary
+            stale_run_state = persisted.get("run_state", "running")
+            rotation_profiles = [
+                {"id": p.get("id"), "_current_community_index": int(p.get("_current_community_index", 0) or 0)}
+                for p in persisted.get("profiles", [])
+            ]
+            persisted = {"run_state": stale_run_state, "profiles": rotation_profiles, "stats": {"total_comments": 0, "total_skipped": 0, "total_blacklisted": 0}, "current_profile_index": 0}
 
         db_profiles, db_settings = self._load_runtime_config_from_db()
         restored = self._apply_persisted_counters(db_profiles, persisted)
@@ -4878,6 +4891,8 @@ class AutomationEngine:
                 profile["visitsCompleted"] = saved.get("visitsCompleted", 0)
                 profile["repliesCompleted"] = saved.get("repliesCompleted", 0)
                 profile["status"] = saved.get("status", "idle")
+                if "_current_community_index" in saved:
+                    profile["_current_community_index"] = int(saved.get("_current_community_index", 0) or 0)
         return profiles
 
     def _refresh_runtime_profiles_locked(self, db_profiles: List[Dict[str, Any]]) -> None:
@@ -4975,7 +4990,7 @@ class AutomationEngine:
 
     def _save_run_state_locked(self) -> None:
         payload = {
-            "profiles": [{"id": p.get("id"), "visitsCompleted": p.get("visitsCompleted", 0), "repliesCompleted": p.get("repliesCompleted", 0), "status": p.get("status", "idle")} for p in self._state.profiles],
+            "profiles": [{"id": p.get("id"), "visitsCompleted": p.get("visitsCompleted", 0), "repliesCompleted": p.get("repliesCompleted", 0), "status": p.get("status", "idle"), "_current_community_index": int(p.get("_current_community_index", 0) or 0)} for p in self._state.profiles],
             "stats": self._state.stats,
             "run_state": self._state.run_state,
             "current_profile_index": self._state.current_profile_index,

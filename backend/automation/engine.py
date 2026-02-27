@@ -463,6 +463,7 @@ class AutomationEngine:
         self._debug_snapshot_ts: float = 0.0
         self._last_action: Dict[str, Any] = {}
         self._last_error: Dict[str, Any] = {}
+        self._last_recover_reason: Optional[str] = None
 
         self._hydrate_state_from_disk()
     async def subscribe(self) -> asyncio.Queue[Dict[str, Any]]:
@@ -739,6 +740,7 @@ class AutomationEngine:
                 "[SKOOL] Discarded stale run_state from previous day (%s); rebuilt from DB",
                 persisted_day,
             )
+            self._last_recover_reason = f"stale_day:{persisted_day}"
             persisted = {"run_state": "running", "profiles": [], "stats": {"total_comments": 0, "total_skipped": 0, "total_blacklisted": 0}, "current_profile_index": 0}
 
         db_profiles, db_settings = self._load_runtime_config_from_db()
@@ -1778,11 +1780,26 @@ class AutomationEngine:
             except Exception:
                 pass
 
+        # state_day from run_state file
+        run_state_day: Optional[str] = None
+        run_state_last_updated: Optional[str] = None
+        try:
+            rs = json.loads(self.run_state_file.read_text(encoding="utf-8"))
+            run_state_day = rs.get("state_day")
+            run_state_last_updated = rs.get("last_updated")
+        except Exception:
+            pass
+        today_str = datetime.now().strftime("%Y-%m-%d")
+
         result: Dict[str, Any] = {
             "now_iso": datetime.now().isoformat(),
             "heartbeat_age_seconds": hb_age,
             "engine_running": is_running,
             "engine_paused": is_paused,
+            "state_day": run_state_day,
+            "state_day_is_stale": bool(run_state_day and run_state_day != today_str),
+            "last_recover_reason": self._last_recover_reason,
+            "run_state_last_updated_iso": run_state_last_updated,
             "last_scheduler_tick_iso": tick_iso,
             "last_scheduler_tick_age_seconds": tick_age,
             "last_reset_date": last_reset_date,

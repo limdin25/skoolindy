@@ -145,6 +145,9 @@ class EngineState:
         "total_skipped": 0,
         "total_blacklisted": 0,
     })
+    last_scheduler_tick_ts: float = 0.0
+    idle_mode: bool = False
+    idle_reason: str = "unknown"
 
 
 @dataclass
@@ -456,6 +459,10 @@ class AutomationEngine:
         self._prefill_skip_log_state: Dict[str, Dict[str, float]] = {}
         self._ensure_profile_auth_fn: Optional[Callable[[str], dict]] = None
         self._settings_etag: str = ""
+        self._debug_snapshot_cache: Dict[str, Any] = {}
+        self._debug_snapshot_ts: float = 0.0
+        self._last_action: Dict[str, Any] = {}
+        self._last_error: Dict[str, Any] = {}
 
         self._hydrate_state_from_disk()
     async def subscribe(self) -> asyncio.Queue[Dict[str, Any]]:
@@ -1185,6 +1192,8 @@ class AutomationEngine:
             async with self._lock:
                 if not self._state.is_running:
                     break
+                self._state.last_scheduler_tick_ts = time.time()
+                self._state.idle_mode = False
                 if db_settings:
                     self._state.global_settings = dict(db_settings)
                 # Apply profile/community changes from DB immediately on next scheduler loop.
@@ -1192,6 +1201,9 @@ class AutomationEngine:
                 if db_profiles:
                     self._refresh_runtime_profiles_locked(db_profiles)
                 paused = self._state.is_paused
+                if paused:
+                    self._state.idle_mode = True
+                    self._state.idle_reason = "paused"
                 settings = dict(self._state.global_settings)
                 profile, next_index = self._get_next_profile_locked()
                 self._state.current_profile_index = next_index
@@ -1291,9 +1303,11 @@ class AutomationEngine:
                     bootstrap_queue_fill_required = False
                     now_ts = time.time()
                     _use_idle_wait = False
+                    _idle_reason_pending = "unknown"
                     if in_schedule_profiles and not capacity_profiles:
                         wait_seconds = max(60, min(1800, int(self._seconds_until_next_daily_reset())))
                         _use_idle_wait = True
+                        _idle_reason_pending = "limits_reached"
                         if now_ts - daily_exhausted_wait_log_ts >= 300:
                             daily_exhausted_wait_log_ts = now_ts
                             await self.publish_log(
@@ -1305,6 +1319,7 @@ class AutomationEngine:
                             )
                     elif in_schedule_profiles and capacity_profiles:
                         wait_seconds = max(10, min(120, int(self._seconds_until_next_run_for_all())))
+                        _idle_reason_pending = "backoff"
                         if now_ts - outside_schedule_wait_log_ts >= 60:
                             outside_schedule_wait_log_ts = now_ts
                             await self.publish_log(
@@ -1319,6 +1334,7 @@ class AutomationEngine:
                             5,
                             min(AUTOMATION_OUTSIDE_SCHEDULE_POLL_SECONDS, int(self._seconds_until_next_run_for_all())),
                         )
+                        _idle_reason_pending = "outside_schedule"
                         async with self._lock:
                             self._state.run_state = "waiting_schedule"
                             self._save_run_state_locked()
@@ -1329,10 +1345,15 @@ class AutomationEngine:
                                 f"[SKOOL] All profiles are outside schedule; waiting {wait_seconds}s until next run window",
                                 status="info",
                             )
+                    async with self._lock:
+                        self._state.idle_mode = True
+                        self._state.idle_reason = _idle_reason_pending
                     if _use_idle_wait:
                         await self._idle_daily_reset_wait(wait_seconds)
                     else:
                         await self._countdown(wait_seconds)
+                    async with self._lock:
+                        self._state.idle_mode = False
                     continue
                 await self.publish_log("[SKOOL] Queue prefill started for all profiles", status="info")
                 for prefill_round in range(2):
@@ -1516,8 +1537,16 @@ class AutomationEngine:
                     self._persist_activity_rows(run_result.activity_rows)
                     self._update_profile_locked(applied_profile)
                     self._save_run_state_locked()
+                self._last_action = {
+                    "type": "profile_run",
+                    "profile_id": applied_profile.get("id"),
+                    "profile_label": applied_profile.get("label"),
+                    "comments_posted": run_result.comments_posted,
+                    "ts": datetime.now().isoformat(),
+                }
             except Exception as exc:
                 err_text = str(exc or "")
+                self._last_error = {"message": err_text[:500], "ts": datetime.now().isoformat()}
                 if "network timeout" in err_text.lower():
                     streak = int(profile_network_fail_streak.get(profile_key, 0) or 0) + 1
                     profile_network_fail_streak[profile_key] = streak
@@ -1656,6 +1685,108 @@ class AutomationEngine:
         async with self._lock:
             if self._session_task is asyncio.current_task():
                 self._session_task = None
+
+    async def get_debug_snapshot(self) -> Dict[str, Any]:
+        """Read-only scheduler diagnostics. Cached for 10s to avoid repeated DB hits."""
+        now = time.time()
+        if now - self._debug_snapshot_ts < 10.0 and self._debug_snapshot_cache:
+            return dict(self._debug_snapshot_cache)
+
+        # Heartbeat age
+        hb_age: Optional[float] = None
+        try:
+            hb_data = json.loads(self.heartbeat_file.read_text(encoding="utf-8"))
+            hb_age = round(time.time() - float(hb_data.get("ts", 0)), 1)
+        except Exception:
+            pass
+
+        # last_reset_date from daily counters state file
+        last_reset_date: Optional[str] = None
+        try:
+            dc = json.loads(self.daily_counters_state_file.read_text(encoding="utf-8"))
+            last_reset_date = dc.get("last_reset_date")
+        except Exception:
+            pass
+
+        # Snapshot mutable state under lock
+        async with self._lock:
+            is_running = self._state.is_running
+            is_paused = self._state.is_paused
+            idle_mode = self._state.idle_mode
+            idle_reason_raw = self._state.idle_reason
+            tick_ts = self._state.last_scheduler_tick_ts
+            profiles = list(self._state.profiles)
+            settings = dict(self._state.global_settings)
+
+        tick_iso = datetime.fromtimestamp(tick_ts).isoformat() if tick_ts else None
+        tick_age = round(time.time() - tick_ts, 1) if tick_ts else None
+
+        # Derive idle_reason
+        if not is_running:
+            idle_reason: Optional[str] = "stopped"
+        elif is_paused:
+            idle_reason = "paused"
+        elif idle_mode:
+            idle_reason = idle_reason_raw
+        else:
+            idle_reason = None
+
+        # Counts derived from in-memory profiles (no extra DB query)
+        profiles_total = len(profiles)
+        profiles_active = sum(
+            1 for p in profiles
+            if str(p.get("status", "")).lower() not in {"stopped", "paused", "finished"}
+        )
+        communities_all = [c for p in profiles for c in (p.get("communities") or [])]
+        communities_total = len(communities_all)
+        in_schedule = self._check_schedule(settings)
+        communities_in_schedule = communities_total if in_schedule else 0
+        communities_reached = sum(
+            1 for c in communities_all
+            if str(c.get("status", "active")).lower() == "active"
+            and int(c.get("dailyLimit") or 0) > 0
+            and int(c.get("actionsToday") or 0) >= int(c.get("dailyLimit") or 0)
+        )
+
+        # Queue pending: single cheap COUNT(*)
+        queue_pending = 0
+        try:
+            queue_pending = await asyncio.to_thread(self._count_all_queue_actions)
+        except Exception:
+            pass
+
+        secs_to_reset: Optional[int] = None
+        if is_running:
+            try:
+                secs_to_reset = self._seconds_until_next_daily_reset()
+            except Exception:
+                pass
+
+        result: Dict[str, Any] = {
+            "now_iso": datetime.now().isoformat(),
+            "heartbeat_age_seconds": hb_age,
+            "engine_running": is_running,
+            "engine_paused": is_paused,
+            "last_scheduler_tick_iso": tick_iso,
+            "last_scheduler_tick_age_seconds": tick_age,
+            "last_reset_date": last_reset_date,
+            "seconds_until_next_daily_reset": secs_to_reset,
+            "idle_mode": idle_mode,
+            "idle_reason": idle_reason,
+            "counts": {
+                "profiles_total": profiles_total,
+                "profiles_active": profiles_active,
+                "communities_total": communities_total,
+                "communities_in_schedule": communities_in_schedule,
+                "communities_reached_limit": communities_reached,
+                "queue_pending": queue_pending,
+            },
+            "last_action": self._last_action or None,
+            "last_error": self._last_error or None,
+        }
+        self._debug_snapshot_cache = result
+        self._debug_snapshot_ts = time.time()
+        return result
 
     def _compute_settings_etag(self) -> str:
         """Hash the DB rows that drive capacity decisions so idle can detect changes."""

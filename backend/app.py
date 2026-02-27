@@ -5801,6 +5801,13 @@ def build_profile_model(row: sqlite3.Row) -> ProfileModel:
     )
 
 
+@app.get("/debug/scheduler")
+async def debug_scheduler(request: Request):
+    engine: AutomationEngine = get_automation_engine(request)
+    snapshot = await engine.get_debug_snapshot()
+    return JSONResponse(snapshot)
+
+
 @app.get("/health")
 async def health_check(request: Request):
     engine: AutomationEngine = get_automation_engine(request)

@@ -1189,6 +1189,9 @@ class AutomationEngine:
                     "Daily counter reset failed (scheduler continues):\n%s",
                     traceback.format_exc(),
                 )
+            # IMPORTANT: reset may change daily counters in DB.
+            # Reload runtime config so in-memory state reflects the post-reset truth.
+            db_profiles, db_settings = await asyncio.to_thread(self._load_runtime_config_from_db)
             async with self._lock:
                 if not self._state.is_running:
                     break

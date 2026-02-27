@@ -1822,6 +1822,7 @@ class AutomationEngine:
             async with self._lock:
                 if not self._state.is_running or self._state.is_paused:
                     return
+                self._state.last_scheduler_tick_ts = time.time()
             now = time.time()
             if now >= reset_time:
                 await self.publish_log(
@@ -1851,6 +1852,7 @@ class AutomationEngine:
                     self._state.countdown_seconds = 0
                     return
                 self._state.countdown_seconds = remaining
+                self._state.last_scheduler_tick_ts = time.time()
                 if self._state.connection_rest_active:
                     # Keep the visible connection-rest timer ticking each second.
                     self._state.connection_rest_remaining_seconds = remaining

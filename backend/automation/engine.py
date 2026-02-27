@@ -446,7 +446,7 @@ class AutomationEngine:
         self._session_check_lock = asyncio.Lock()
         self._task: Optional[asyncio.Task[None]] = None
         self._session_task: Optional[asyncio.Task[None]] = None
-        self._watchdog_task: Optional[asyncio.Task[None]] = None
+        self._heartbeat_task: Optional[asyncio.Task[None]] = None
         self._subscribers: Set[asyncio.Queue[Dict[str, Any]]] = set()
         self._queue_network_fail_streak: Dict[str, int] = {}
         self._queue_submit_fail_streak: Dict[str, int] = {}
@@ -557,9 +557,9 @@ class AutomationEngine:
                 self._task.cancel()
             shifted_on_start = self._reschedule_overdue_queue_items()
             self._task = asyncio.create_task(self._scheduler_loop(), name="automation-scheduler")
-            if self._watchdog_task and not self._watchdog_task.done():
-                self._watchdog_task.cancel()
-            self._watchdog_task = asyncio.create_task(self._watchdog_loop(), name="automation-watchdog")
+            if self._heartbeat_task and not self._heartbeat_task.done():
+                self._heartbeat_task.cancel()
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_task_loop(), name="automation-heartbeat")
             if self._session_task and not self._session_task.done():
                 self._session_task.cancel()
             self._session_task = (
@@ -591,13 +591,13 @@ class AutomationEngine:
             self._state.connection_rest_rounds_completed = 0
             task_to_wait = self._task
             session_task_to_wait = self._session_task
-            watchdog_task_to_cancel = self._watchdog_task
+            watchdog_task_to_cancel = self._heartbeat_task
             self._save_run_state_locked()
         if watchdog_task_to_cancel and not watchdog_task_to_cancel.done():
             watchdog_task_to_cancel.cancel()
         async with self._lock:
-            if self._watchdog_task is watchdog_task_to_cancel:
-                self._watchdog_task = None
+            if self._heartbeat_task is watchdog_task_to_cancel:
+                self._heartbeat_task = None
         if task_to_wait and not task_to_wait.done():
             try:
                 await asyncio.wait_for(task_to_wait, timeout=5)
@@ -645,12 +645,12 @@ class AutomationEngine:
                 self._save_run_state_locked()
             task_to_wait = self._task
             session_task_to_wait = self._session_task
-            watchdog_task_to_cancel = self._watchdog_task
+            watchdog_task_to_cancel = self._heartbeat_task
         if watchdog_task_to_cancel and not watchdog_task_to_cancel.done():
             watchdog_task_to_cancel.cancel()
         async with self._lock:
-            if self._watchdog_task is watchdog_task_to_cancel:
-                self._watchdog_task = None
+            if self._heartbeat_task is watchdog_task_to_cancel:
+                self._heartbeat_task = None
         if task_to_wait and not task_to_wait.done():
             try:
                 await asyncio.wait_for(task_to_wait, timeout=5)
@@ -1132,28 +1132,16 @@ class AutomationEngine:
         await self.publish_log("[SKOOL] ========== PROOF RUN COMPLETED ==========", profile=profile_name, status="success")
         return result
 
-    async def _watchdog_loop(self) -> None:
-        """Background task: exit the process if the scheduler loop stops heartbeating."""
+    async def _heartbeat_task_loop(self) -> None:
+        """Dedicated background task: write heartbeat every 30s regardless of scheduler state."""
+        _log_ts = 0.0
         while True:
-            await asyncio.sleep(30)
-            async with self._lock:
-                if not self._state.is_running:
-                    return
-            try:
-                if self.heartbeat_file.exists():
-                    data = json.loads(self.heartbeat_file.read_text(encoding="utf-8"))
-                    age = time.time() - float(data.get("ts", 0))
-                    if age > _HEARTBEAT_MAX_AGE_SECONDS:
-                        LOGGER.error(
-                            "WATCHDOG: scheduler loop stalled — no heartbeat for %.0fs (>%ds); forcing process exit",
-                            age,
-                            _HEARTBEAT_MAX_AGE_SECONDS,
-                        )
-                        sys.stdout.flush()
-                        sys.stderr.flush()
-                        os._exit(1)
-            except Exception:
-                pass
+            _write_heartbeat(self.heartbeat_file)
+            _now = time.time()
+            if _now - _log_ts >= _HEARTBEAT_LOG_INTERVAL:
+                LOGGER.info("HEARTBEAT ok ts=%d", int(_now))
+                _log_ts = _now
+            await asyncio.sleep(_HEARTBEAT_WRITE_INTERVAL)
 
     async def _scheduler_loop(self) -> None:
         await self.publish_log("[SKOOL] ===== SCHEDULER LOOP STARTED =====")
@@ -1174,8 +1162,6 @@ class AutomationEngine:
         connection_rest_until_ts = 0.0
         connection_rest_log_ts = 0.0
         rest_wait_due_drain_log_ts = 0.0
-        _hb_write_ts = 0.0
-        _hb_log_ts = 0.0
         async with self._lock:
             self._state.run_state = "running" if not self._state.is_paused else "paused"
             self._state.connection_rest_active = False
@@ -1186,15 +1172,6 @@ class AutomationEngine:
             self._save_run_state_locked()
 
         while True:
-            # --- Heartbeat ---
-            _now_hb = time.time()
-            if _now_hb - _hb_write_ts >= _HEARTBEAT_WRITE_INTERVAL:
-                _write_heartbeat(self.heartbeat_file)
-                _hb_write_ts = _now_hb
-            if _now_hb - _hb_log_ts >= _HEARTBEAT_LOG_INTERVAL:
-                LOGGER.info("HEARTBEAT ok ts=%d", int(_now_hb))
-                _hb_log_ts = _now_hb
-
             db_profiles, db_settings = await asyncio.to_thread(self._load_runtime_config_from_db)
             try:
                 await asyncio.to_thread(self._reset_daily_counters_if_needed)

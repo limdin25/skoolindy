@@ -2349,3 +2349,351 @@ class TestItemSelectionOrdering:
         _blocked_profiles.clear()
         _worker_state.disabled = False
         _worker_state.disable_reason = None
+
+
+# ===== Phase 4.4 — API-First Join Tests =====
+
+from joiner import _extract_slug_from_key, _try_join_via_api2, _API2_BASE
+
+
+class TestExtractSlugFromKey:
+    """Unit tests for _extract_slug_from_key."""
+
+    def test_standard_key(self):
+        assert _extract_slug_from_key("www.skool.com/my-group") == "my-group"
+
+    def test_trailing_slash(self):
+        assert _extract_slug_from_key("www.skool.com/my-group/") == "my-group"
+
+    def test_bare_slug(self):
+        assert _extract_slug_from_key("my-group") == "my-group"
+
+    def test_empty_string(self):
+        assert _extract_slug_from_key("") == ""
+
+    def test_deep_path(self):
+        assert _extract_slug_from_key("www.skool.com/category/my-group") == "my-group"
+
+
+class _MockApiPage:
+    """Mock page for _try_join_via_api2 tests. Supports goto, evaluate, classify helpers."""
+
+    def __init__(self, *, goto_state="AUTH_OK", evaluate_result=None, goto_error=None):
+        self.url = "https://www.skool.com/settings?t=communities"
+        self._goto_state = goto_state  # AUTH_OK | BLOCKED | AUTH_REQUIRED
+        self._evaluate_result = evaluate_result or {"ok": False, "status": 404, "text": "not found"}
+        self._goto_error = goto_error
+        self._goto_called = False
+        self._evaluate_called = False
+
+    def goto(self, url, **kwargs):
+        self._goto_called = True
+        if self._goto_error:
+            raise Exception(self._goto_error)
+        self.url = url
+
+    def wait_for_timeout(self, ms):
+        pass
+
+    def set_default_timeout(self, ms):
+        pass
+
+    def text_content(self, sel):
+        if self._goto_state == "BLOCKED":
+            return "access denied by waf"
+        if self._goto_state == "AUTH_REQUIRED":
+            return ""
+        # Normal settings page — simulate member area
+        return "settings community preferences classroom members"
+
+    def query_selector(self, sel):
+        if self._goto_state == "AUTH_REQUIRED" and sel == "input#email":
+            return _MockElement(visible=True)
+        if self._goto_state == "BLOCKED" and 'captcha' in sel:
+            return None
+        # For auth markers on settings page (logged in)
+        if self._goto_state == "AUTH_OK":
+            if sel in ('div[class*="TopNav"]', 'a[href*="/chat?ch="]'):
+                return _MockElement(visible=True)
+        return None
+
+    def content(self):
+        if self._goto_state == "BLOCKED":
+            return "<html>edge.sdk.awswaf.com challenge</html>"
+        return "<html><body>settings page</body></html>"
+
+    def title(self):
+        if self._goto_state == "BLOCKED":
+            return "Attention Required"
+        return "Settings"
+
+    def evaluate(self, js, *args):
+        self._evaluate_called = True
+        return self._evaluate_result
+
+    def screenshot(self, **kwargs):
+        pass
+
+    def on(self, event, handler):
+        pass
+
+
+class TestTryJoinViaApi2:
+    """Unit tests for _try_join_via_api2."""
+
+    def test_api_join_success(self):
+        page = _MockApiPage(evaluate_result={"ok": True, "status": 200, "text": '{"joined": true}'})
+        result = _try_join_via_api2(page, "www.skool.com/test-group")
+        assert result["status"] == "JOINED"
+        assert "api2_join_success" in result["detail"]
+        assert page._evaluate_called
+
+    def test_api_join_already_member(self):
+        page = _MockApiPage(evaluate_result={"ok": False, "status": 409, "text": "already member"})
+        result = _try_join_via_api2(page, "www.skool.com/test-group")
+        assert result["status"] == "ALREADY_MEMBER"
+
+    def test_api_join_pending(self):
+        page = _MockApiPage(evaluate_result={"ok": False, "status": 409, "text": "pending approval"})
+        result = _try_join_via_api2(page, "www.skool.com/test-group")
+        assert result["status"] == "PENDING_APPROVAL"
+
+    def test_api_join_paid(self):
+        page = _MockApiPage(evaluate_result={"ok": False, "status": 402, "text": "payment required"})
+        result = _try_join_via_api2(page, "www.skool.com/test-group")
+        assert result["status"] == "SKIPPED_PAID"
+
+    def test_api_join_404(self):
+        page = _MockApiPage(evaluate_result={"ok": False, "status": 404, "text": "not found"})
+        result = _try_join_via_api2(page, "www.skool.com/test-group")
+        assert result["status"] == "FAILED"
+        assert "api2_endpoint_not_found" in result["detail"]
+
+    def test_api_join_rejected(self):
+        page = _MockApiPage(evaluate_result={"ok": False, "status": 500, "text": "server error"})
+        result = _try_join_via_api2(page, "www.skool.com/test-group")
+        assert result["status"] == "FAILED"
+        assert "api2_join_rejected" in result["detail"]
+
+    def test_settings_page_also_blocked(self):
+        page = _MockApiPage(goto_state="BLOCKED")
+        result = _try_join_via_api2(page, "www.skool.com/test-group")
+        assert result["status"] == "FAILED"
+        assert "api_settings_also_blocked" in result["detail"]
+        assert result.get("blocked_terminal") is True
+        assert not page._evaluate_called  # should not even try fetch
+
+    def test_settings_page_auth_required(self):
+        page = _MockApiPage(goto_state="AUTH_REQUIRED")
+        result = _try_join_via_api2(page, "www.skool.com/test-group")
+        assert result["status"] == "FAILED"
+        assert "auth_session_invalid" in result["detail"]
+
+    def test_settings_nav_error(self):
+        page = _MockApiPage(goto_error="Timeout exceeded")
+        result = _try_join_via_api2(page, "www.skool.com/test-group")
+        assert result["status"] == "FAILED"
+        assert "api_settings_nav_failed" in result["detail"]
+
+    def test_evaluate_exception(self):
+        page = _MockApiPage()
+        # Override evaluate to throw
+        def raise_eval(js, *args):
+            raise Exception("evaluate crashed")
+        page.evaluate = raise_eval
+        result = _try_join_via_api2(page, "www.skool.com/test-group")
+        assert result["status"] == "FAILED"
+        assert "api_fetch_error" in result["detail"]
+
+
+class TestApiFirstInBlockedHandler:
+    """Integration: WAF detected -> api-first tried -> result."""
+
+    def _tick_pw(self, db_path, pw_fn):
+        get_db = _get_db_factory(db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "playwright"
+        return worker_tick(get_db, _playwright_join_fn=pw_fn)
+
+    def test_waf_then_api_join_succeeds(self, test_db_path):
+        """When WAF is detected but API-first join succeeds, item should be JOINED."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def pw_fn(*args, **kwargs):
+            return {"status": "JOINED", "detail": "api2_join_success slug=test-0-p1",
+                    "api_first": True}
+
+        self._tick_pw(test_db_path, pw_fn)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT * FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        assert item["status"] == "JOINED"
+        conn.close()
+
+    def test_waf_api_also_fails_terminal(self, test_db_path):
+        """When both WAF and API-first fail, item is terminal FAILED."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def pw_fn(*args, **kwargs):
+            return {"status": "FAILED", "detail": "aws_waf_challenge",
+                    "blocked_terminal": True,
+                    "api_first_detail": "api_settings_also_blocked",
+                    "forensic_events": []}
+
+        self._tick_pw(test_db_path, pw_fn)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT * FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        assert item["status"] == "FAILED"
+        assert item["next_attempt_at"] is None  # terminal
+        # Check api_first_detail event was emitted
+        events = conn.execute(
+            "SELECT * FROM join_events WHERE job_id = ? AND event_type = 'ITEM_DEBUG'",
+            (job_id,),
+        ).fetchall()
+        debug_details = [e["detail"] for e in events]
+        assert any("api_first_attempted" in d for d in debug_details)
+        conn.close()
+
+    def test_api_first_does_not_trigger_when_no_waf(self, test_db_path):
+        """Normal JOINED result (no WAF, no api_first flag) should work as before."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def pw_fn(*args, **kwargs):
+            return {"status": "JOINED", "detail": "joined www.skool.com/test-0-p1"}
+
+        self._tick_pw(test_db_path, pw_fn)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT * FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        assert item["status"] == "JOINED"
+        # No api_first_attempted events
+        events = conn.execute(
+            "SELECT * FROM join_events WHERE job_id = ? AND event_type = 'ITEM_DEBUG' AND detail LIKE '%api_first%'",
+            (job_id,),
+        ).fetchall()
+        assert len(events) == 0
+        conn.close()
+
+
+    def teardown_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+
+class TestNetworkRecorderCandidates:
+    """Integration: api_candidates emitted as ITEM_DEBUG events."""
+
+    def _tick_pw(self, db_path, pw_fn):
+        get_db = _get_db_factory(db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "playwright"
+        return worker_tick(get_db, _playwright_join_fn=pw_fn)
+
+    def test_api_candidates_emitted_on_join(self, test_db_path):
+        """When api_candidates are returned, they appear as ITEM_DEBUG events."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def pw_fn(*args, **kwargs):
+            return {"status": "JOINED", "detail": "joined www.skool.com/test-0-p1",
+                    "api_candidates": ["POST /groups/abc123/join", "GET /groups/abc123"]}
+
+        self._tick_pw(test_db_path, pw_fn)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        events = conn.execute(
+            "SELECT * FROM join_events WHERE job_id = ? AND event_type = 'ITEM_DEBUG'",
+            (job_id,),
+        ).fetchall()
+        debug_details = [e["detail"] for e in events]
+        assert any("join_api_candidate=POST /groups/abc123/join" in d for d in debug_details)
+        assert any("join_api_candidate=GET /groups/abc123" in d for d in debug_details)
+        conn.close()
+
+    def test_no_candidates_no_events(self, test_db_path):
+        """When no api_candidates, no ITEM_DEBUG events for candidates."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def pw_fn(*args, **kwargs):
+            return {"status": "JOINED", "detail": "joined www.skool.com/test-0-p1"}
+
+        self._tick_pw(test_db_path, pw_fn)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        events = conn.execute(
+            "SELECT * FROM join_events WHERE job_id = ? AND event_type = 'ITEM_DEBUG' AND detail LIKE '%join_api_candidate%'",
+            (job_id,),
+        ).fetchall()
+        assert len(events) == 0
+        conn.close()
+
+    def test_candidates_on_failed_join(self, test_db_path):
+        """api_candidates emitted even when join fails (for discovery)."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def pw_fn(*args, **kwargs):
+            return {"status": "FAILED", "detail": "join_click_no_state_change: unknown",
+                    "forensic_events": [],
+                    "api_candidates": ["POST /groups/xyz/join"]}
+
+        self._tick_pw(test_db_path, pw_fn)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        events = conn.execute(
+            "SELECT * FROM join_events WHERE job_id = ? AND event_type = 'ITEM_DEBUG' AND detail LIKE '%join_api_candidate%'",
+            (job_id,),
+        ).fetchall()
+        assert len(events) == 1
+        assert "POST /groups/xyz/join" in events[0]["detail"]
+        conn.close()
+
+
+    def teardown_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+
+class TestPhase44CoreTableInvariant:
+    """Phase 4.4 does not write to core tables (profiles, scheduler, etc.)."""
+
+    def _tick_pw(self, db_path, pw_fn):
+        get_db = _get_db_factory(db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "playwright"
+        return worker_tick(get_db, _playwright_join_fn=pw_fn)
+
+    def test_api_first_join_no_core_writes(self, test_db_path):
+        """API-first join should not modify profiles table."""
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        before = conn.execute("SELECT * FROM profiles ORDER BY id").fetchall()
+        before_data = [(r["id"], r["status"]) for r in before]
+        conn.close()
+
+        _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def pw_fn(*args, **kwargs):
+            return {"status": "JOINED", "detail": "api2_join_success slug=test",
+                    "api_first": True}
+
+        self._tick_pw(test_db_path, pw_fn)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        after = conn.execute("SELECT * FROM profiles ORDER BY id").fetchall()
+        after_data = [(r["id"], r["status"]) for r in after]
+        conn.close()
+        assert before_data == after_data
+
+    def teardown_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None

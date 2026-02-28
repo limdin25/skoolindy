@@ -1,7 +1,7 @@
 """
-EngageFlow Community Joiner — Phase 2+3+4+4.1+4.2+4.3a
+EngageFlow Community Joiner — Phase 2+3+4+4.1+4.2+4.3a+4.4
 DB tables, API routes, normalization, event audit, background worker,
-Playwright join execution (canary), post-click verification (4.1), forensic capture (4.2), WAF detection (4.3a).
+Playwright join execution (canary), post-click verification (4.1), forensic capture (4.2), WAF detection (4.3a), API-first join (4.4).
 No mutation of core tables. Self-contained Playwright — no imports from automation/.
 """
 from __future__ import annotations
@@ -293,6 +293,9 @@ _MEMBER_AREA_SELECTORS = [
 # Paid wall indicators (near join area)
 _PAID_INDICATORS = ["$", "pricing", "payment", "subscribe", "buy now", "upgrade"]
 
+# API-first join: Skool internal API base (Phase 4.4)
+_API2_BASE = "https://api2.skool.com"
+
 
 def _parse_proxy_for_joiner(proxy_str: Optional[str]) -> Optional[dict]:
     """Parse proxy string to Playwright proxy config. Replicated from engine pattern."""
@@ -318,6 +321,12 @@ def _parse_proxy_for_joiner(proxy_str: Optional[str]) -> Optional[dict]:
     if len(parts) == 2:
         return {"server": f"http://{parts[0]}:{parts[1]}"}
     return None
+
+
+def _extract_slug_from_key(community_key: str) -> str:
+    """Extract slug from community_key like 'www.skool.com/my-group'."""
+    parts = community_key.strip("/").split("/")
+    return parts[-1] if parts else community_key
 
 
 def _sanitize_html_head(raw: str, max_len: int = 5000) -> str:
@@ -397,6 +406,75 @@ def _capture_forensics(page, job_id: str, item_id: str) -> list:
         LOGGER.warning("Forensic debug capture failed: %s", str(e)[:200])
 
     return events
+
+
+def _try_join_via_api2(page, community_key: str) -> dict:
+    """Attempt join via fetch() inside browser context to reduce WAF exposure.
+
+    Navigates to settings page (less likely to be WAF-challenged), then calls
+    api2.skool.com via page.evaluate(fetch(..., credentials:'include')).
+
+    Returns: {"status": str, "detail": str}
+    """
+    slug = _extract_slug_from_key(community_key)
+
+    # Navigate to settings (safe page, unlikely WAF)
+    try:
+        page.goto("https://www.skool.com/settings?t=communities",
+                   timeout=30000, wait_until="domcontentloaded")
+        page.wait_for_timeout(2000)
+    except Exception as e:
+        return {"status": "FAILED", "detail": f"api_settings_nav_failed: {str(e)[:200]}"}
+
+    # Check if settings page is also WAF/blocked
+    settings_state = _classify_page_state(page)
+    if settings_state["state"] == "BLOCKED":
+        return {"status": "FAILED", "detail": "api_settings_also_blocked",
+                "blocked_terminal": True}
+    if settings_state["state"] == "AUTH_REQUIRED":
+        return {"status": "FAILED", "detail": "auth_session_invalid"}
+
+    # Try join via fetch inside browser context
+    js_template = """
+        async (slug) => {
+            try {
+                const res = await fetch(
+                    `https://api2.skool.com/groups/${slug}/join`,
+                    { method: 'POST', credentials: 'include',
+                      headers: { 'Content-Type': 'application/json' } }
+                );
+                const text = await res.text().catch(() => '');
+                return { ok: res.ok, status: res.status, text: text.substring(0, 500) };
+            } catch (e) {
+                return { ok: false, status: 0, text: e.message };
+            }
+        }
+    """
+    try:
+        result = page.evaluate(js_template, slug)
+    except Exception as e:
+        return {"status": "FAILED", "detail": f"api_fetch_error: {str(e)[:200]}"}
+
+    if result.get("ok"):
+        return {"status": "JOINED", "detail": f"api2_join_success slug={slug}"}
+
+    status_code = result.get("status", 0)
+    response_text = (result.get("text", "") or "")[:200]
+
+    # Interpret common HTTP status codes
+    if status_code == 409:
+        if "pending" in response_text.lower():
+            return {"status": "PENDING_APPROVAL", "detail": f"api2_pending slug={slug}"}
+        return {"status": "ALREADY_MEMBER", "detail": f"api2_already_member slug={slug}"}
+    if status_code in (402, 403):
+        lower_text = response_text.lower()
+        if "paid" in lower_text or "payment" in lower_text or "price" in lower_text:
+            return {"status": "SKIPPED_PAID", "detail": f"api2_paid slug={slug}"}
+    if status_code == 404:
+        return {"status": "FAILED", "detail": f"api2_endpoint_not_found slug={slug}"}
+
+    return {"status": "FAILED",
+            "detail": f"api2_join_rejected status={status_code} slug={slug} body={response_text}"}
 
 
 def _classify_page_state(page) -> dict:
@@ -562,7 +640,13 @@ def _execute_playwright_join(
         if state == "AUTH_REQUIRED":
             return {"status": "FAILED", "detail": detail}
         if state == "BLOCKED":
-            # Capture forensics for blocked pages (WAF, captcha, etc.)
+            # --- API-first fallback: try joining via api2 before terminal ---
+            api_result = _try_join_via_api2(page, community_key)
+            if api_result["status"] not in ("FAILED",):
+                api_result["api_first"] = True
+                return api_result
+
+            # API also failed — capture forensics and return terminal
             forensic_events = []
             if job_id and item_id:
                 try:
@@ -570,7 +654,8 @@ def _execute_playwright_join(
                 except Exception as fe:
                     LOGGER.warning("Forensic capture on BLOCKED: %s", str(fe)[:200])
             return {"status": "FAILED", "detail": detail, "blocked_terminal": True,
-                    "forensic_events": forensic_events}
+                    "forensic_events": forensic_events,
+                    "api_first_detail": api_result.get("detail", "")}
         if state == "PENDING":
             return {"status": "PENDING_APPROVAL", "detail": detail}
         if state == "MEMBER":
@@ -579,6 +664,17 @@ def _execute_playwright_join(
             return {"status": "SKIPPED_PAID", "detail": detail}
         if state == "UNKNOWN":
             return {"status": "FAILED", "detail": detail}
+
+        # --- Network recorder: capture api2 candidates during click (Phase 4.4) ---
+        _api_candidates = []
+        def _on_api_request(request):
+            try:
+                if "api2.skool.com" in request.url:
+                    path = urlparse(request.url).path
+                    _api_candidates.append(f"{request.method} {path}")
+            except Exception:
+                pass
+        page.on("request", _on_api_request)
 
         # --- JOIN_VISIBLE: click with robustness ---
         join_btn = None
@@ -633,7 +729,8 @@ def _execute_playwright_join(
 
             s = post_state["state"]
             if s == "MEMBER":
-                return {"status": "JOINED", "detail": f"joined {community_key}"}
+                return {"status": "JOINED", "detail": f"joined {community_key}",
+                        "api_candidates": list(_api_candidates)}
             if s == "PENDING":
                 return {"status": "PENDING_APPROVAL", "detail": "pending_after_join_click"}
             if s == "PAID":
@@ -657,6 +754,7 @@ def _execute_playwright_join(
             "status": "FAILED",
             "detail": f"join_click_no_state_change: {final_detail}",
             "forensic_events": forensic_events,
+            "api_candidates": list(_api_candidates),
         }
 
     except Exception as exc:
@@ -920,6 +1018,12 @@ def worker_tick(get_db_func, *, _playwright_join_fn=None) -> dict:
                             _emit_event(db, job_id, fe["type"], item_id=item_id, profile_id=profile_id,
                                        detail=fe["detail"])
 
+                        # Emit API-first detail if present (Phase 4.4)
+                        api_first_detail = pw_result.get("api_first_detail", "")
+                        if api_first_detail:
+                            _emit_event(db, job_id, "ITEM_DEBUG", item_id=item_id, profile_id=profile_id,
+                                       detail=f"api_first_attempted={api_first_detail}")
+
                     else:
                         # Success states: JOINED, ALREADY_MEMBER, PENDING_APPROVAL, SKIPPED_PAID
                         db.execute(
@@ -933,6 +1037,11 @@ def worker_tick(get_db_func, *, _playwright_join_fn=None) -> dict:
                         if pw_status == "JOINED":
                             _emit_event(db, job_id, "ITEM_JOINED", item_id=item_id, profile_id=profile_id,
                                        detail=pw_detail)
+
+                    # Emit API candidate discoveries (network recorder, Phase 4.4)
+                    for cand in pw_result.get("api_candidates", []):
+                        _emit_event(db, job_id, "ITEM_DEBUG", item_id=item_id, profile_id=profile_id,
+                                   detail=f"join_api_candidate={cand}")
 
                 else:
                     # ----- SIMULATE MODE (Phase 3 behavior) -----

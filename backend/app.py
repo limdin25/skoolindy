@@ -27,6 +27,7 @@ from pydantic import BaseModel
 
 from security_utils import decrypt_secret, encrypt_secret, is_encrypted_secret, mask_secret
 from proxy_slots import acquire_proxy_slot, release_proxy_slot
+from joiner import ensure_joiner_tables, create_joiner_router
 
 
 def _load_local_env_file() -> None:
@@ -305,6 +306,9 @@ def get_db():
     finally:
         conn.close()
 
+
+# Joiner router (Phase 2 — DB + API skeleton, no Playwright)
+app.include_router(create_joiner_router(get_db))
 
 def get_automation_engine(request: Request) -> AutomationEngine:
     return request.app.state.automation_engine
@@ -5004,6 +5008,7 @@ def ensure_tables() -> None:
                 (encrypt_secret(raw_password), row["id"]),
             )
         _load_proxy_cache_from_db(db)
+        ensure_joiner_tables(db)
         db.commit()
 
 

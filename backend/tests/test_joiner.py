@@ -2214,3 +2214,138 @@ class TestWAFBlockTerminal:
         _blocked_profiles.clear()
         _worker_state.disabled = False
         _worker_state.disable_reason = None
+
+
+# ===== Phase 4.3b — Item Selection Ordering Tests =====
+
+from datetime import datetime, timezone
+
+class TestItemSelectionOrdering:
+    """Verify worker picks newest items first (created_at DESC, attempt_count ASC)."""
+
+    def _tick_pw(self, db_path, pw_fn):
+        get_db = _get_db_factory(db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "playwright"
+        return worker_tick(get_db, _playwright_join_fn=pw_fn)
+
+    def test_newer_item_processed_before_older(self, test_db_path):
+        """Items created later should be picked first."""
+        get_db = _get_db_factory(test_db_path)
+        with get_db() as db:
+            job_id = _uuid()
+            db.execute(
+                "INSERT INTO join_jobs (id, status, paused, created_at, total_items, completed_items, failed_items) VALUES (?, 'CREATED', 0, ?, 0, 0, 0)",
+                (job_id, _now_iso()),
+            )
+            # Old item (created 10 min ago)
+            old_id = _uuid()
+            old_ts = datetime.fromtimestamp(time.time() - 600, tz=timezone.utc).isoformat(timespec="seconds")
+            db.execute(
+                "INSERT INTO join_job_items (id, job_id, profile_id, community_url, community_key, status, attempt_count, created_at, updated_at) "
+                "VALUES (?, ?, 'p1', 'https://www.skool.com/old-community', 'old-community', 'PENDING', 0, ?, ?)",
+                (old_id, job_id, old_ts, old_ts),
+            )
+            # New item (created now)
+            new_id = _uuid()
+            new_ts = _now_iso()
+            db.execute(
+                "INSERT INTO join_job_items (id, job_id, profile_id, community_url, community_key, status, attempt_count, created_at, updated_at) "
+                "VALUES (?, ?, 'p1', 'https://www.skool.com/new-community', 'new-community', 'PENDING', 0, ?, ?)",
+                (new_id, job_id, new_ts, new_ts),
+            )
+            db.commit()
+
+        processed_urls = []
+
+        def capture_join(*args, **kwargs):
+            processed_urls.append(args[1])  # community_url is 2nd arg
+            return {"status": "JOINED", "detail": "joined"}
+
+        self._tick_pw(test_db_path, capture_join)
+
+        # Should have picked the newer item
+        assert len(processed_urls) == 1
+        assert "new-community" in processed_urls[0]
+
+    def test_lower_attempt_count_preferred_at_same_timestamp(self, test_db_path):
+        """When created_at is identical, prefer items with fewer attempts."""
+        get_db = _get_db_factory(test_db_path)
+        same_ts = _now_iso()
+        with get_db() as db:
+            job_id = _uuid()
+            db.execute(
+                "INSERT INTO join_jobs (id, status, paused, created_at, total_items, completed_items, failed_items) VALUES (?, 'CREATED', 0, ?, 0, 0, 0)",
+                (job_id, same_ts),
+            )
+            # Item with 2 attempts
+            retried_id = _uuid()
+            db.execute(
+                "INSERT INTO join_job_items (id, job_id, profile_id, community_url, community_key, status, attempt_count, created_at, updated_at) "
+                "VALUES (?, ?, 'p1', 'https://www.skool.com/retried', 'retried', 'PENDING', 2, ?, ?)",
+                (retried_id, job_id, same_ts, same_ts),
+            )
+            # Item with 0 attempts
+            fresh_id = _uuid()
+            db.execute(
+                "INSERT INTO join_job_items (id, job_id, profile_id, community_url, community_key, status, attempt_count, created_at, updated_at) "
+                "VALUES (?, ?, 'p1', 'https://www.skool.com/fresh', 'fresh', 'PENDING', 0, ?, ?)",
+                (fresh_id, job_id, same_ts, same_ts),
+            )
+            db.commit()
+
+        processed_urls = []
+
+        def capture_join(*args, **kwargs):
+            processed_urls.append(args[1])
+            return {"status": "JOINED", "detail": "joined"}
+
+        self._tick_pw(test_db_path, capture_join)
+
+        assert len(processed_urls) == 1
+        assert "fresh" in processed_urls[0]
+
+    def test_new_item_beats_old_retry(self, test_db_path):
+        """A brand-new item (attempt_count=0, recent created_at) should be
+        processed before an old item that has been retried (attempt_count>0,
+        old created_at)."""
+        get_db = _get_db_factory(test_db_path)
+        with get_db() as db:
+            job_id = _uuid()
+            db.execute(
+                "INSERT INTO join_jobs (id, status, paused, created_at, total_items, completed_items, failed_items) VALUES (?, 'CREATED', 0, ?, 0, 0, 0)",
+                (job_id, _now_iso()),
+            )
+            # Old retry: created 1 hour ago, 2 attempts
+            old_retry_id = _uuid()
+            old_ts = datetime.fromtimestamp(time.time() - 3600, tz=timezone.utc).isoformat(timespec="seconds")
+            db.execute(
+                "INSERT INTO join_job_items (id, job_id, profile_id, community_url, community_key, status, attempt_count, created_at, updated_at) "
+                "VALUES (?, ?, 'p1', 'https://www.skool.com/old-retry', 'old-retry', 'PENDING', 2, ?, ?)",
+                (old_retry_id, job_id, old_ts, old_ts),
+            )
+            # Brand new: created now, 0 attempts
+            brand_new_id = _uuid()
+            new_ts = _now_iso()
+            db.execute(
+                "INSERT INTO join_job_items (id, job_id, profile_id, community_url, community_key, status, attempt_count, created_at, updated_at) "
+                "VALUES (?, ?, 'p1', 'https://www.skool.com/brand-new', 'brand-new', 'PENDING', 0, ?, ?)",
+                (brand_new_id, job_id, new_ts, new_ts),
+            )
+            db.commit()
+
+        processed_urls = []
+
+        def capture_join(*args, **kwargs):
+            processed_urls.append(args[1])
+            return {"status": "JOINED", "detail": "joined"}
+
+        self._tick_pw(test_db_path, capture_join)
+
+        assert len(processed_urls) == 1
+        assert "brand-new" in processed_urls[0]
+
+    def teardown_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None

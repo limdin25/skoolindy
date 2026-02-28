@@ -837,7 +837,7 @@ def worker_tick(get_db_func, *, _playwright_join_fn=None) -> dict:
                 now_iso = _now_iso()
                 item = db.execute(
                     "SELECT * FROM join_job_items WHERE job_id = ? AND profile_id = ? AND status = 'PENDING' "
-                    "AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY rowid LIMIT 1",
+                    "AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY created_at DESC, attempt_count ASC LIMIT 1",
                     (job_id, profile_id, now_iso),
                 ).fetchone()
 

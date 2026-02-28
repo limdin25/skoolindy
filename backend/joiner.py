@@ -1,7 +1,7 @@
 """
 EngageFlow Community Joiner — Phase 2+3+4+4.1+4.2+4.3a+4.4
 DB tables, API routes, normalization, event audit, background worker,
-Playwright join execution (canary), post-click verification (4.1), forensic capture (4.2), WAF detection (4.3a), API-first join (4.4).
+Playwright join execution (canary), post-click verification (4.1), forensic capture (4.2), WAF detection (4.3a), WAF false-positive fix (4.4-waf), API-first join (4.4).
 No mutation of core tables. Self-contained Playwright — no imports from automation/.
 """
 from __future__ import annotations
@@ -250,8 +250,20 @@ _BLOCK_KEYWORDS = [
 
 # AWS WAF / bot challenge markers
 _WAF_URL_MARKERS = ["challenge"]
-_WAF_HTML_MARKERS = ["edge.sdk.awswaf.com", "challenge.js"]
 _WAF_TITLE_MARKERS = ["attention required", "request blocked"]
+
+# Strong WAF challenge indicators (require corroboration with challenge.js)
+_WAF_CHALLENGE_SELECTORS = [
+    "#challenge-form",
+    "#challenge-container",
+    'form[action*="challenge"]',
+]
+_WAF_CHALLENGE_TEXT = [
+    "checking your browser",
+    "please wait while we verify",
+    "complete the security check",
+    "this process is automatic",
+]
 
 # Per-profile cooldown: blocked_profiles[profile_id] = timestamp (6h TTL)
 PROFILE_BLOCK_COOLDOWN_SECONDS = 6 * 3600  # 6 hours
@@ -505,14 +517,16 @@ def _classify_page_state(page) -> dict:
     for marker in _WAF_URL_MARKERS:
         if marker in page_url:
             return {"state": "BLOCKED", "detail": "aws_waf_challenge"}
+
+    # URL host is edge.sdk.awswaf.com (real WAF challenge redirect)
     try:
-        html_src = page.content() or ""
-    except Exception:
-        html_src = ""
-    html_src_lower = html_src.lower()
-    for marker in _WAF_HTML_MARKERS:
-        if marker in html_src_lower:
+        url_host = urlparse(page.url).hostname or ""
+        if url_host.endswith("edge.sdk.awswaf.com"):
             return {"state": "BLOCKED", "detail": "aws_waf_challenge"}
+    except Exception:
+        pass
+
+    # Title / body text markers (strong standalone indicators)
     page_title = ""
     try:
         page_title = (page.title() or "").lower()
@@ -520,6 +534,20 @@ def _classify_page_state(page) -> dict:
         pass
     for marker in _WAF_TITLE_MARKERS:
         if marker in page_title or marker in page_text:
+            return {"state": "BLOCKED", "detail": "aws_waf_challenge"}
+
+    # challenge.js in HTML requires corroboration (selector or text)
+    try:
+        html_src = page.content() or ""
+    except Exception:
+        html_src = ""
+    html_src_lower = html_src.lower()
+    if "challenge.js" in html_src_lower:
+        has_challenge_sel = any(
+            page.query_selector(sel) for sel in _WAF_CHALLENGE_SELECTORS
+        )
+        has_challenge_text = any(t in page_text for t in _WAF_CHALLENGE_TEXT)
+        if has_challenge_sel or has_challenge_text:
             return {"state": "BLOCKED", "detail": "aws_waf_challenge"}
 
     # 3. Auth markers

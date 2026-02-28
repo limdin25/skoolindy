@@ -1952,8 +1952,9 @@ from joiner import (
     _set_profile_blocked,
     _blocked_profiles,
     _WAF_URL_MARKERS,
-    _WAF_HTML_MARKERS,
     _WAF_TITLE_MARKERS,
+    _WAF_CHALLENGE_SELECTORS,
+    _WAF_CHALLENGE_TEXT,
     PROFILE_BLOCK_COOLDOWN_SECONDS,
 )
 
@@ -1968,28 +1969,72 @@ class TestClassifyWAFDetection:
         assert result["state"] == "BLOCKED"
         assert result["detail"] == "aws_waf_challenge"
 
-    def test_waf_html_awswaf_sdk(self):
-        """HTML containing edge.sdk.awswaf.com triggers WAF detection."""
-        page = _MockPage(
-            body_text="loading security check",
-            selectors={},
-        )
-        # _MockPage.text_content returns body_text but classifier also calls page.content()
-        # We need a page that returns WAF HTML from content()
-        class WAFPage(_MockPage):
-            def content(self):
-                return '<html><head><script src="https://edge.sdk.awswaf.com/captcha.js"></script></head><body>Please wait</body></html>'
-        page = WAFPage(body_text="please wait")
+    def test_waf_url_host_awswaf(self):
+        """URL host ending in edge.sdk.awswaf.com triggers WAF detection."""
+        page = _MockPage(url="https://edge.sdk.awswaf.com/challenge?token=abc")
         result = _classify_page_state(page)
         assert result["state"] == "BLOCKED"
         assert result["detail"] == "aws_waf_challenge"
 
-    def test_waf_html_challenge_js(self):
-        """HTML containing challenge.js triggers WAF detection."""
-        class ChallengeJSPage(_MockPage):
+    def test_waf_html_awswaf_sdk_telemetry_not_blocked(self):
+        """HTML containing edge.sdk.awswaf.com as telemetry does NOT trigger WAF.
+
+        This is the false-positive regression test: edge.sdk.awswaf.com appears
+        on every normal Skool page as a monitoring script.
+        """
+        class NormalSkoolPage(_MockPage):
+            def content(self):
+                return (
+                    '<html><head><script src="https://edge.sdk.awswaf.com/token.js">'
+                    '</script></head><body><h1>Test Group</h1></body></html>'
+                )
+            def title(self):
+                return "Test Group"
+        page = NormalSkoolPage(
+            body_text="welcome to test group classroom calendar members leaderboard",
+            selectors={'div[class*="TopNav"]': _MockElement()},
+        )
+        result = _classify_page_state(page)
+        assert result["state"] != "BLOCKED", (
+            f"edge.sdk.awswaf.com telemetry should not trigger BLOCKED, got {result}"
+        )
+
+    def test_waf_challenge_js_alone_not_blocked(self):
+        """challenge.js alone without corroboration does NOT trigger WAF."""
+        class ChallengeJSOnlyPage(_MockPage):
+            def content(self):
+                return '<html><script src="/challenge.js"></script><body>My Group</body></html>'
+            def title(self):
+                return "My Group"
+        page = ChallengeJSOnlyPage(body_text="welcome to my group")
+        result = _classify_page_state(page)
+        assert result["state"] != "BLOCKED", (
+            f"challenge.js alone should not trigger BLOCKED, got {result}"
+        )
+
+    def test_waf_challenge_js_with_challenge_text(self):
+        """challenge.js + challenge text triggers WAF detection."""
+        class ChallengeJSWithTextPage(_MockPage):
             def content(self):
                 return '<html><script src="/challenge.js"></script></html>'
-        page = ChallengeJSPage(body_text="verifying")
+            def title(self):
+                return ""
+        page = ChallengeJSWithTextPage(body_text="checking your browser please wait")
+        result = _classify_page_state(page)
+        assert result["state"] == "BLOCKED"
+        assert result["detail"] == "aws_waf_challenge"
+
+    def test_waf_challenge_js_with_challenge_form(self):
+        """challenge.js + #challenge-form selector triggers WAF detection."""
+        class ChallengeJSWithFormPage(_MockPage):
+            def content(self):
+                return '<html><script src="/challenge.js"></script></html>'
+            def title(self):
+                return ""
+        page = ChallengeJSWithFormPage(
+            body_text="",
+            selectors={"#challenge-form": _MockElement()},
+        )
         result = _classify_page_state(page)
         assert result["state"] == "BLOCKED"
         assert result["detail"] == "aws_waf_challenge"
@@ -2039,19 +2084,57 @@ class TestClassifyWAFDetection:
         assert result["state"] == "BLOCKED"
         assert "account suspended" in result["detail"]
 
-    def test_waf_takes_precedence_over_join_button(self):
-        """WAF challenge page with join button text should still be BLOCKED."""
+    def test_waf_challenge_takes_precedence_over_join_button(self):
+        """Real WAF challenge page with join button text should still be BLOCKED."""
         class WAFWithJoinPage(_MockPage):
             def content(self):
-                return '<html><script src="https://edge.sdk.awswaf.com/token.js"></script></html>'
+                return '<html><script src="/challenge.js"></script></html>'
             def title(self):
                 return ""
         page = WAFWithJoinPage(
-            body_text="join for free",
+            body_text="checking your browser join for free",
             selectors={'button:has-text("Join for Free")': _MockElement(visible=True)},
         )
         result = _classify_page_state(page)
         assert result["state"] == "BLOCKED"
+
+    def test_member_area_with_awswaf_telemetry_is_member(self):
+        """Page with edge.sdk.awswaf.com telemetry + member area = MEMBER not BLOCKED."""
+        class MemberWithTelemetry(_MockPage):
+            def content(self):
+                return (
+                    '<html><head><script src="https://edge.sdk.awswaf.com/token.js">'
+                    '</script></head><body>Member area</body></html>'
+                )
+            def title(self):
+                return "My Group"
+        page = MemberWithTelemetry(
+            body_text="classroom calendar members leaderboard",
+            selectors={'div[class*="TopNav"]': _MockElement()},
+        )
+        result = _classify_page_state(page)
+        assert result["state"] == "MEMBER", (
+            f"Expected MEMBER with WAF telemetry present, got {result}"
+        )
+
+    def test_join_visible_with_awswaf_telemetry_is_join_visible(self):
+        """Page with edge.sdk.awswaf.com telemetry + join button = JOIN_VISIBLE not BLOCKED."""
+        class JoinWithTelemetry(_MockPage):
+            def content(self):
+                return (
+                    '<html><head><script src="https://edge.sdk.awswaf.com/token.js">'
+                    '</script></head><body>Join this group</body></html>'
+                )
+            def title(self):
+                return "Cool Group"
+        page = JoinWithTelemetry(
+            body_text="join for free about this group",
+            selectors={'button:has-text("Join for Free")': _MockElement(visible=True)},
+        )
+        result = _classify_page_state(page)
+        assert result["state"] == "JOIN_VISIBLE", (
+            f"Expected JOIN_VISIBLE with WAF telemetry present, got {result}"
+        )
 
 
 class TestProfileBlockedCooldown:

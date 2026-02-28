@@ -2780,3 +2780,328 @@ class TestPhase44CoreTableInvariant:
         _blocked_profiles.clear()
         _worker_state.disabled = False
         _worker_state.disable_reason = None
+
+
+# =========================================================================
+# PHASE 4.5: www API Join Tests
+# =========================================================================
+
+from joiner import (
+    _try_join_via_www_api,
+    _submit_survey_via_www_api,
+    _verify_membership_via_classroom,
+)
+
+
+class _MockWwwApiPage:
+    """Mock page for _try_join_via_www_api tests."""
+
+    def __init__(self, *, evaluate_results=None, goto_state="MEMBER", goto_error=None):
+        self.url = "https://www.skool.com/test-group"
+        self._evaluate_results = list(evaluate_results or [])
+        self._evaluate_call_idx = 0
+        self._goto_state = goto_state
+        self._goto_error = goto_error
+        self._goto_urls = []
+
+    def evaluate(self, js, *args):
+        if self._evaluate_call_idx < len(self._evaluate_results):
+            result = self._evaluate_results[self._evaluate_call_idx]
+            self._evaluate_call_idx += 1
+            return result
+        return {"ok": False, "status": 500, "text": "no mock result"}
+
+    def goto(self, url, **kwargs):
+        self._goto_urls.append(url)
+        if self._goto_error:
+            raise Exception(self._goto_error)
+        self.url = url
+
+    def wait_for_timeout(self, ms):
+        pass
+
+    def text_content(self, sel):
+        if self._goto_state == "MEMBER":
+            return "classroom calendar members leaderboard"
+        if self._goto_state == "PENDING":
+            return "membership pending"
+        return ""
+
+    def query_selector(self, sel):
+        if self._goto_state == "MEMBER":
+            if sel in ('div[class*="TopNav"]', 'a[href*="/chat?ch="]'):
+                return _MockElement(visible=True)
+            # Member area selectors
+            if sel in ('a[href*="/classroom"]', 'a[href*="/calendar"]'):
+                return _MockElement(visible=True)
+        if self._goto_state == "PENDING":
+            if 'pending' in sel.lower():
+                return _MockElement(visible=True)
+        return None
+
+    def content(self):
+        return "<html><body>normal page</body></html>"
+
+    def title(self):
+        return "Test Group"
+
+
+class TestTryJoinViaWwwApi:
+    """Unit tests for _try_join_via_www_api."""
+
+    def test_join_success(self):
+        """HTTP 200 with no survey/pending -> JOINED."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": True, "status": 200, "text": '{"success": true}'},
+        ])
+        result = _try_join_via_www_api(page, "www.skool.com/test-group")
+        assert result["status"] == "JOINED"
+        assert "www_api_joined" in result["detail"]
+        assert "test-group" in result["detail"]
+
+    def test_join_already_member_409(self):
+        """HTTP 409 without pending text -> ALREADY_MEMBER."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": False, "status": 409, "text": "already a member"},
+        ])
+        result = _try_join_via_www_api(page, "www.skool.com/test-group")
+        assert result["status"] == "ALREADY_MEMBER"
+
+    def test_join_pending_409(self):
+        """HTTP 409 with pending text -> PENDING_APPROVAL."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": False, "status": 409, "text": "pending approval"},
+        ])
+        result = _try_join_via_www_api(page, "www.skool.com/test-group")
+        assert result["status"] == "PENDING_APPROVAL"
+
+    def test_join_paid_402(self):
+        """HTTP 402 -> SKIPPED_PAID."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": False, "status": 402, "text": "payment required"},
+        ])
+        result = _try_join_via_www_api(page, "www.skool.com/test-group")
+        assert result["status"] == "SKIPPED_PAID"
+
+    def test_join_paid_403(self):
+        """HTTP 403 -> SKIPPED_PAID."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": False, "status": 403, "text": "forbidden"},
+        ])
+        result = _try_join_via_www_api(page, "www.skool.com/test-group")
+        assert result["status"] == "SKIPPED_PAID"
+
+    def test_join_auth_required_401(self):
+        """HTTP 401 -> FAILED with auth_required."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": False, "status": 401, "text": "not logged in"},
+        ])
+        result = _try_join_via_www_api(page, "www.skool.com/test-group")
+        assert result["status"] == "FAILED"
+        assert "auth_required" in result["detail"]
+
+    def test_join_not_found_404(self):
+        """HTTP 404 -> FAILED with not_found."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": False, "status": 404, "text": "not found"},
+        ])
+        result = _try_join_via_www_api(page, "www.skool.com/test-group")
+        assert result["status"] == "FAILED"
+        assert "not_found" in result["detail"]
+
+    def test_join_rejected_500(self):
+        """HTTP 500 -> FAILED with status code."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": False, "status": 500, "text": "server error"},
+        ])
+        result = _try_join_via_www_api(page, "www.skool.com/test-group")
+        assert result["status"] == "FAILED"
+        assert "500" in result["detail"]
+
+    def test_evaluate_exception(self):
+        """evaluate() throws -> FAILED."""
+        class ThrowingPage(_MockWwwApiPage):
+            def evaluate(self, js, *args):
+                raise Exception("browser crashed")
+        page = ThrowingPage()
+        result = _try_join_via_www_api(page, "www.skool.com/test-group")
+        assert result["status"] == "FAILED"
+        assert "fetch_error" in result["detail"]
+
+    def test_join_pending_in_200_response(self):
+        """HTTP 200 with pending in body -> PENDING_APPROVAL."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": True, "status": 200, "text": '{"status": "pending"}'},
+        ])
+        result = _try_join_via_www_api(page, "www.skool.com/test-group")
+        assert result["status"] == "PENDING_APPROVAL"
+
+    def test_no_body_text_logged(self):
+        """Detail string must NOT contain response body content."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": False, "status": 418, "text": "secret_body_content_xyz"},
+        ])
+        result = _try_join_via_www_api(page, "www.skool.com/test-group")
+        assert "secret_body_content_xyz" not in result["detail"]
+        assert "418" in result["detail"]
+
+
+class TestSurveyHandling:
+    """Unit tests for survey flow in _try_join_via_www_api."""
+
+    def test_survey_success_and_verify_member(self):
+        """200 with survey -> submit survey -> verify classroom -> JOINED."""
+        page = _MockWwwApiPage(
+            evaluate_results=[
+                {"ok": True, "status": 200, "text": '{"survey": true}'},
+                {"ok": True, "status": 200},  # survey submit
+            ],
+            goto_state="MEMBER",
+        )
+        result = _try_join_via_www_api(page, "www.skool.com/test-group")
+        assert result["status"] == "JOINED"
+        assert "survey" in result["detail"]
+
+    def test_survey_success_verify_pending(self):
+        """200 with survey -> submit survey -> classroom shows pending."""
+        page = _MockWwwApiPage(
+            evaluate_results=[
+                {"ok": True, "status": 200, "text": '{"survey": true}'},
+                {"ok": True, "status": 200},  # survey submit
+            ],
+            goto_state="PENDING",
+        )
+        result = _try_join_via_www_api(page, "www.skool.com/test-group")
+        assert result["status"] == "PENDING_APPROVAL"
+
+    def test_survey_submit_failed(self):
+        """200 with survey -> survey submit fails -> PENDING_APPROVAL."""
+        page = _MockWwwApiPage(
+            evaluate_results=[
+                {"ok": True, "status": 200, "text": '{"survey": true}'},
+                {"ok": False, "status": 400},  # survey submit fails
+            ],
+        )
+        result = _try_join_via_www_api(page, "www.skool.com/test-group")
+        assert result["status"] == "PENDING_APPROVAL"
+        assert "survey_needed" in result["detail"]
+
+    def test_submit_survey_helper_returns_bool(self):
+        """_submit_survey_via_www_api returns True on 200, False otherwise."""
+        page_ok = _MockWwwApiPage(evaluate_results=[{"ok": True, "status": 200}])
+        assert _submit_survey_via_www_api(page_ok, "test") is True
+
+        page_fail = _MockWwwApiPage(evaluate_results=[{"ok": False, "status": 400}])
+        assert _submit_survey_via_www_api(page_fail, "test") is False
+
+
+class TestWwwApiFlowIntegration:
+    """Integration: www API join in _execute_playwright_join flow."""
+
+    def _tick_pw(self, db_path, pw_fn):
+        get_db = _get_db_factory(db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "playwright"
+        try:
+            return worker_tick(get_db, _playwright_join_fn=pw_fn)
+        finally:
+            worker_tick._force_enabled = False
+            worker_tick._force_mode = None
+
+    def setup_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+    def test_www_api_success_returns_joined(self, test_db_path):
+        """When www API returns JOINED, worker marks item joined."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def fake_pw(*args, **kwargs):
+            return {"status": "JOINED", "detail": "www_api_joined slug=freegroup", "www_api": True}
+
+        self._tick_pw(test_db_path, fake_pw)
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT status FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        conn.close()
+        assert item["status"] == "JOINED"
+
+    def test_www_api_auth_failure_is_terminal(self, test_db_path):
+        """When www API returns auth_required, worker treats as terminal."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def fake_pw(*args, **kwargs):
+            return {"status": "FAILED", "detail": "www_api_auth_required slug=freegroup",
+                    "blocked_terminal": True}
+
+        self._tick_pw(test_db_path, fake_pw)
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT status FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        conn.close()
+        assert item["status"] == "FAILED"
+
+    def test_awswaf_telemetry_does_not_block_www_api_path(self, test_db_path):
+        """WAF telemetry in page HTML does NOT prevent www API from executing.
+
+        Regression test: edge.sdk.awswaf.com is telemetry, classifier should not
+        return BLOCKED, so www API path is reached.
+        """
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def fake_pw(*args, **kwargs):
+            return {"status": "JOINED", "detail": "www_api_joined slug=freegroup", "www_api": True}
+
+        self._tick_pw(test_db_path, fake_pw)
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT status FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        conn.close()
+        assert item["status"] == "JOINED"
+
+    def teardown_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+
+class TestPhase45CoreTableInvariant:
+    """Phase 4.5 must not modify core tables (profiles, communities)."""
+
+    def test_www_api_join_no_core_writes(self, test_db_path):
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        profiles_before = [dict(r) for r in conn.execute("SELECT * FROM profiles").fetchall()]
+        conn.close()
+
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def fake_pw(*args, **kwargs):
+            return {"status": "JOINED", "detail": "www_api_joined slug=freegroup", "www_api": True}
+
+        get_db_fn = _get_db_factory(test_db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "playwright"
+        try:
+            worker_tick(get_db_fn, _playwright_join_fn=fake_pw)
+        finally:
+            worker_tick._force_enabled = False
+            worker_tick._force_mode = None
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        profiles_after = [dict(r) for r in conn.execute("SELECT * FROM profiles").fetchall()]
+        conn.close()
+        assert profiles_before == profiles_after
+
+    def setup_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+    def teardown_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+

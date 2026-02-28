@@ -1,7 +1,7 @@
 """
 EngageFlow Community Joiner — Phase 2+3+4+4.1+4.2+4.3a+4.4
 DB tables, API routes, normalization, event audit, background worker,
-Playwright join execution (canary), post-click verification (4.1), forensic capture (4.2), WAF detection (4.3a), WAF false-positive fix (4.4-waf), API-first join (4.4).
+Playwright join execution (canary), post-click verification (4.1), forensic capture (4.2), WAF detection (4.3a), WAF false-positive fix (4.4-waf), API-first join (4.4), www API join (4.5).
 No mutation of core tables. Self-contained Playwright — no imports from automation/.
 """
 from __future__ import annotations
@@ -489,6 +489,119 @@ def _try_join_via_api2(page, community_key: str) -> dict:
             "detail": f"api2_join_rejected status={status_code} slug={slug} body={response_text}"}
 
 
+def _try_join_via_www_api(page, community_key: str) -> dict:
+    """Attempt join via www.skool.com/groups/<slug>/join-group inside browser context.
+
+    Uses proven endpoints from standalone joiner. Works from any www.skool.com
+    page since cookies are domain-scoped.
+
+    Returns: {"status": str, "detail": str}
+    """
+    slug = _extract_slug_from_key(community_key)
+
+    # Step 1: POST /groups/<slug>/join-group
+    js_join = """
+        async (slug) => {
+            try {
+                const res = await fetch(
+                    'https://www.skool.com/groups/' + encodeURIComponent(slug) + '/join-group',
+                    { method: 'POST', credentials: 'include',
+                      headers: { 'Content-Type': 'application/json' } }
+                );
+                const text = await res.text().catch(() => '');
+                return { ok: res.ok, status: res.status, text: text.substring(0, 500) };
+            } catch (e) {
+                return { ok: false, status: 0, text: e.message };
+            }
+        }
+    """
+    try:
+        result = page.evaluate(js_join, slug)
+    except Exception as e:
+        return {"status": "FAILED", "detail": f"www_api_fetch_error slug={slug}"}
+
+    status_code = result.get("status", 0)
+    response_text = (result.get("text", "") or "")[:500]
+
+    if result.get("ok"):
+        lower_text = response_text.lower()
+
+        # Check if survey is required
+        if "survey" in lower_text:
+            survey_ok = _submit_survey_via_www_api(page, slug)
+            if survey_ok:
+                # Verify membership via classroom navigation
+                verify = _verify_membership_via_classroom(page, slug)
+                return verify
+            return {"status": "PENDING_APPROVAL",
+                    "detail": f"www_api_survey_needed slug={slug}"}
+
+        # Check for pending approval in response
+        if "pending" in lower_text:
+            return {"status": "PENDING_APPROVAL", "detail": f"www_api_pending slug={slug}"}
+
+        return {"status": "JOINED", "detail": f"www_api_joined slug={slug}"}
+
+    # Error status codes
+    if status_code == 409:
+        if "pending" in response_text.lower():
+            return {"status": "PENDING_APPROVAL", "detail": f"www_api_pending slug={slug}"}
+        return {"status": "ALREADY_MEMBER", "detail": f"www_api_already_member slug={slug}"}
+    if status_code in (402, 403):
+        return {"status": "SKIPPED_PAID", "detail": f"www_api_paid slug={slug}"}
+    if status_code == 401:
+        return {"status": "FAILED", "detail": f"www_api_auth_required slug={slug}"}
+    if status_code == 404:
+        return {"status": "FAILED", "detail": f"www_api_not_found slug={slug}"}
+
+    return {"status": "FAILED",
+            "detail": f"www_api_rejected status={status_code} slug={slug}"}
+
+
+def _submit_survey_via_www_api(page, slug: str) -> bool:
+    """Submit empty survey answers. Returns True if HTTP 200."""
+    js_survey = """
+        async (slug) => {
+            try {
+                const res = await fetch(
+                    'https://www.skool.com/groups/' + encodeURIComponent(slug) + '/submit-survey-answers',
+                    { method: 'POST', credentials: 'include',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ answers: [] }) }
+                );
+                return { ok: res.ok, status: res.status };
+            } catch (e) {
+                return { ok: false, status: 0 };
+            }
+        }
+    """
+    try:
+        result = page.evaluate(js_survey, slug)
+        return bool(result.get("ok"))
+    except Exception:
+        return False
+
+
+def _verify_membership_via_classroom(page, slug: str) -> dict:
+    """Navigate to /<slug>/classroom and classify membership state."""
+    try:
+        page.goto(f"https://www.skool.com/{slug}/classroom",
+                   timeout=15000, wait_until="domcontentloaded")
+        page.wait_for_timeout(2000)
+        post = _classify_page_state(page)
+        if post["state"] == "MEMBER":
+            return {"status": "JOINED",
+                    "detail": f"www_api_joined_with_survey slug={slug}"}
+        if post["state"] == "PENDING":
+            return {"status": "PENDING_APPROVAL",
+                    "detail": f"www_api_survey_pending slug={slug}"}
+    except Exception:
+        pass
+    # Default to JOINED: join-group returned 200, survey submitted OK
+    return {"status": "JOINED",
+            "detail": f"www_api_joined_survey_unverified slug={slug}"}
+
+
 def _classify_page_state(page) -> dict:
     """Classify current page state into a deterministic result.
 
@@ -690,8 +803,21 @@ def _execute_playwright_join(
             return {"status": "ALREADY_MEMBER", "detail": detail}
         if state == "PAID":
             return {"status": "SKIPPED_PAID", "detail": detail}
+
+        # --- API-first: try www.skool.com/groups/<slug>/join-group (Phase 4.5) ---
+        www_result = _try_join_via_www_api(page, community_key)
+        www_status = www_result["status"]
+        if www_status in ("JOINED", "ALREADY_MEMBER", "PENDING_APPROVAL", "SKIPPED_PAID"):
+            www_result["www_api"] = True
+            return www_result
+        www_detail = www_result.get("detail", "")
+        if "auth_required" in www_detail:
+            return {"status": "FAILED", "detail": www_detail, "blocked_terminal": True}
+        # Non-auth API failure — fall through to UI click if JOIN_VISIBLE
+        LOGGER.info("www_api failed (%s), state=%s — UI click fallback", www_detail, state)
+
         if state == "UNKNOWN":
-            return {"status": "FAILED", "detail": detail}
+            return {"status": "FAILED", "detail": f"www_api_and_unknown: {www_detail}"}
 
         # --- Network recorder: capture api2 candidates during click (Phase 4.4) ---
         _api_candidates = []

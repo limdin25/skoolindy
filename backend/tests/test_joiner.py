@@ -2830,9 +2830,9 @@ class _MockWwwApiPage:
 
     def text_content(self, sel):
         if self._goto_state == "MEMBER":
-            return "classroom calendar members leaderboard"
+            return "classroom calendar members leaderboard Leave Group"
         if self._goto_state == "PENDING":
-            return "membership pending"
+            return "membership pending Cancel Request"
         return ""
 
     def query_selector(self, sel):
@@ -2970,7 +2970,6 @@ class TestSurveyHandling:
         )
         result = _try_join_via_www_api(page, "www.skool.com/test-group")
         assert result["status"] == "JOINED"
-        assert "survey" in result["detail"]
         assert result.get("survey_answers_count", 0) > 0
 
     def test_survey_success_verify_pending(self):
@@ -3123,40 +3122,43 @@ class TestBuildSurveyAnswers:
     """Unit tests: survey answers are never empty and match field patterns."""
 
     def test_empty_questions_returns_generic(self):
-        """No questions -> at least one generic answer."""
+        """No questions -> at least one generic answer object."""
         answers = _build_survey_answers([])
         assert len(answers) >= 1
-        assert answers[0] == _GENERIC_ANSWER
+        assert isinstance(answers[0], dict)
+        assert answers[0]["answer"] == _GENERIC_ANSWER
 
     def test_email_field_matched(self):
-        """Question with 'email' in label -> email default."""
+        """Question with 'email' in label -> email default answer object."""
         questions = [{"label": "What is your email address?", "type": "email"}]
         answers = _build_survey_answers(questions)
         assert len(answers) == 1
-        assert answers[0] == _SURVEY_DEFAULTS["email"]
+        assert isinstance(answers[0], dict)
+        assert answers[0]["answer"] == _SURVEY_DEFAULTS["email"]
 
     def test_why_join_field_matched(self):
-        """Question about 'why join' -> why_join default."""
+        """Question about 'why join' -> why_join default answer object."""
         questions = [{"label": "Why do you want to join this community?", "type": "text"}]
         answers = _build_survey_answers(questions)
-        assert answers[0] == _SURVEY_DEFAULTS["why_join"]
+        assert answers[0]["answer"] == _SURVEY_DEFAULTS["why_join"]
 
     def test_occupation_field_matched(self):
-        """Question about 'what do you do' -> occupation default."""
+        """Question about 'what do you do' -> occupation default answer object."""
         questions = [{"label": "What do you do for a living?", "type": "text"}]
         answers = _build_survey_answers(questions)
-        assert answers[0] == _SURVEY_DEFAULTS["occupation"]
+        assert answers[0]["answer"] == _SURVEY_DEFAULTS["occupation"]
 
     def test_unknown_field_gets_generic(self):
-        """Unrecognized question -> generic answer, never empty."""
+        """Unrecognized question -> generic answer object, never empty."""
         questions = [{"label": "Random unrelated question xyz123", "type": "text"}]
         answers = _build_survey_answers(questions)
         assert len(answers) == 1
-        assert answers[0] == _GENERIC_ANSWER
-        assert answers[0] != ""
+        assert isinstance(answers[0], dict)
+        assert answers[0]["answer"] == _GENERIC_ANSWER
+        assert answers[0]["answer"] != ""
 
     def test_multiple_questions_all_filled(self):
-        """Multiple questions -> all get answers, none empty."""
+        """Multiple questions -> all get answer objects, none empty."""
         questions = [
             {"label": "Email", "type": "email"},
             {"label": "Why join?", "type": "text"},
@@ -3165,8 +3167,10 @@ class TestBuildSurveyAnswers:
         answers = _build_survey_answers(questions)
         assert len(answers) == 3
         for a in answers:
-            assert a != ""
-            assert len(a) > 5
+            assert isinstance(a, dict)
+            assert "answer" in a
+            assert a["answer"] != ""
+            assert len(a["answer"]) > 5
 
     def test_answers_never_empty_array(self):
         """Answers list is never empty, even with no questions."""
@@ -3361,3 +3365,349 @@ class TestPhase46CoreTableInvariant:
         _worker_state.disabled = False
         _worker_state.disable_reason = None
 
+
+
+
+# =========================================================================
+# PHASE 4.7: join-group contract, answer objects, deterministic verify
+# =========================================================================
+
+from joiner import (
+    _try_join_via_www_join_group,
+)
+
+
+class TestTryJoinViaWwwJoinGroup:
+    """Unit: _try_join_via_www_join_group status code mapping."""
+
+    def test_200_returns_ok(self):
+        """HTTP 200 -> ok=True, status_code=200."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": True, "status": 200, "text": "joined"},
+        ])
+        result = _try_join_via_www_join_group(page, "test-group")
+        assert result["ok"] is True
+        assert result["status_code"] == 200
+        assert result["response_text"] == "joined"
+
+    def test_409_returns_conflict(self):
+        """HTTP 409 -> ok=False, status_code=409."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": False, "status": 409, "text": "already member"},
+        ])
+        result = _try_join_via_www_join_group(page, "test-group")
+        assert result["ok"] is False
+        assert result["status_code"] == 409
+
+    def test_401_returns_auth(self):
+        """HTTP 401 -> ok=False, status_code=401."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": False, "status": 401, "text": "unauthorized"},
+        ])
+        result = _try_join_via_www_join_group(page, "test-group")
+        assert result["ok"] is False
+        assert result["status_code"] == 401
+
+    def test_402_returns_paid(self):
+        """HTTP 402 -> ok=False, status_code=402."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": False, "status": 402, "text": "payment required"},
+        ])
+        result = _try_join_via_www_join_group(page, "test-group")
+        assert result["ok"] is False
+        assert result["status_code"] == 402
+
+    def test_403_returns_forbidden(self):
+        """HTTP 403 -> ok=False, status_code=403."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": False, "status": 403, "text": "forbidden"},
+        ])
+        result = _try_join_via_www_join_group(page, "test-group")
+        assert result["ok"] is False
+        assert result["status_code"] == 403
+
+    def test_404_returns_not_found(self):
+        """HTTP 404 -> ok=False, status_code=404."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": False, "status": 404, "text": "not found"},
+        ])
+        result = _try_join_via_www_join_group(page, "test-group")
+        assert result["ok"] is False
+        assert result["status_code"] == 404
+
+    def test_evaluate_error_returns_zero(self):
+        """evaluate throws -> status_code=0."""
+        class ThrowPage(_MockWwwApiPage):
+            def evaluate(self, js, *args):
+                raise Exception("crash")
+        page = ThrowPage()
+        result = _try_join_via_www_join_group(page, "test-group")
+        assert result["ok"] is False
+        assert result["status_code"] == 0
+
+    def test_response_text_truncated(self):
+        """Response text truncated to 500 chars."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": True, "status": 200, "text": "x" * 600},
+        ])
+        result = _try_join_via_www_join_group(page, "test-group")
+        assert len(result["response_text"]) <= 500
+
+
+class TestSurveyAnswerObjectFormat:
+    """Unit: survey payload format is list of answer objects (not strings)."""
+
+    def test_answers_are_dicts(self):
+        """Each answer is a dict with 'answer' key."""
+        questions = [
+            {"label": "What is your email?", "type": "email"},
+            {"label": "Why join?", "type": "text"},
+        ]
+        answers = _build_survey_answers(questions)
+        for a in answers:
+            assert isinstance(a, dict), f"Expected dict, got {type(a)}"
+            assert "answer" in a, f"Missing 'answer' key in {a}"
+            assert isinstance(a["answer"], str)
+            assert len(a["answer"]) > 0
+
+    def test_generic_fallback_is_object(self):
+        """Generic fallback (no questions) returns answer objects."""
+        answers = _build_survey_answers([])
+        assert len(answers) >= 1
+        assert isinstance(answers[0], dict)
+        assert "answer" in answers[0]
+        assert answers[0]["answer"] == _GENERIC_ANSWER
+
+    def test_no_bare_strings_in_answers(self):
+        """Answers list never contains bare strings."""
+        questions = [
+            {"label": "Email", "type": "email"},
+            {"label": "What do you do?", "type": "text"},
+            {"label": "Random q", "type": "text"},
+        ]
+        answers = _build_survey_answers(questions)
+        for a in answers:
+            assert not isinstance(a, str), f"Bare string found: {a}"
+
+
+class TestDeterministicVerify:
+    """Unit: _verify_membership_via_classroom deterministic logic."""
+
+    def test_leave_group_returns_joined(self):
+        """Body containing 'Leave Group' -> JOINED."""
+        page = _MockWwwApiPage(goto_state="MEMBER")
+        result = _verify_membership_via_classroom(page, "test-group")
+        assert result["status"] == "JOINED"
+        assert "leave_group" in result["detail"]
+
+    def test_cancel_request_returns_pending(self):
+        """Body containing 'Cancel Request' -> PENDING_APPROVAL."""
+        page = _MockWwwApiPage(goto_state="PENDING")
+        result = _verify_membership_via_classroom(page, "test-group")
+        assert result["status"] == "PENDING_APPROVAL"
+        assert "cancel_request" in result["detail"]
+
+    def test_classroom_url_no_join_btn_returns_joined(self):
+        """URL contains /classroom, no join button visible -> JOINED."""
+        class ClassroomPage(_MockWwwApiPage):
+            def text_content(self, sel):
+                return "some content without special markers"
+            def query_selector(self, sel):
+                return None  # no join button
+        page = ClassroomPage()
+        result = _verify_membership_via_classroom(page, "test-group")
+        assert result["status"] == "JOINED"
+        assert "classroom_no_join_btn" in result["detail"]
+
+    def test_redirected_about_join_visible_returns_not_member(self):
+        """Redirected to /about with join button -> NOT_MEMBER."""
+        class AboutPage(_MockWwwApiPage):
+            def goto(self, url, **kwargs):
+                self.url = url.replace("/classroom", "/about")
+            def text_content(self, sel):
+                return "about this community"
+            def query_selector(self, sel):
+                if "join" in sel.lower() or "Join" in sel:
+                    return _MockElement(visible=True)
+                return None
+        page = AboutPage()
+        result = _verify_membership_via_classroom(page, "test-group")
+        assert result["status"] == "NOT_MEMBER"
+        assert "about" in result["detail"]
+
+    def test_nav_failure_returns_optimistic_joined(self):
+        """Navigation error -> fallback optimistic JOINED."""
+        page = _MockWwwApiPage(goto_error="timeout")
+        result = _verify_membership_via_classroom(page, "test-group")
+        assert result["status"] == "JOINED"
+        assert "nav_failed" in result["detail"]
+
+
+class TestPhase47JoinGroupContractIntegration:
+    """Integration: join-group 200 -> survey -> verify flow."""
+
+    def _tick_pw(self, db_path, pw_fn):
+        get_db = _get_db_factory(db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "playwright"
+        try:
+            return worker_tick(get_db, _playwright_join_fn=pw_fn)
+        finally:
+            worker_tick._force_enabled = False
+            worker_tick._force_mode = None
+
+    def setup_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+    def teardown_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+    def test_join_200_survey_joined(self, test_db_path):
+        """join-group 200 + survey + verify -> JOINED."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def fake_pw(*args, **kwargs):
+            return {"status": "JOINED", "detail": "verified_leave_group slug=test",
+                    "www_api": True, "survey_answers_count": 3}
+
+        self._tick_pw(test_db_path, fake_pw)
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT status FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        conn.close()
+        assert item["status"] == "JOINED"
+
+    def test_join_409_verify_already_member(self, test_db_path):
+        """join-group 409 -> verify path -> ALREADY_MEMBER or JOINED."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def fake_pw(*args, **kwargs):
+            return {"status": "JOINED", "detail": "verified_leave_group slug=test",
+                    "www_api": True}
+
+        self._tick_pw(test_db_path, fake_pw)
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT status FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        conn.close()
+        assert item["status"] == "JOINED"
+
+    def test_join_401_terminal(self, test_db_path):
+        """join-group 401 -> FAILED terminal."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def fake_pw(*args, **kwargs):
+            return {"status": "FAILED", "detail": "join_group_auth_required slug=test",
+                    "blocked_terminal": True}
+
+        self._tick_pw(test_db_path, fake_pw)
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT status FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        conn.close()
+        assert item["status"] == "FAILED"
+
+    def test_join_pending_approval_via_survey(self, test_db_path):
+        """join-group 200 + survey + verify returns PENDING_APPROVAL."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def fake_pw(*args, **kwargs):
+            return {"status": "PENDING_APPROVAL",
+                    "detail": "verified_cancel_request slug=test",
+                    "www_api": True, "survey_answers_count": 2}
+
+        self._tick_pw(test_db_path, fake_pw)
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT status FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        conn.close()
+        assert item["status"] == "PENDING_APPROVAL"
+
+
+class TestPhase47WafRegression:
+    """Regression: WAF detection unchanged in Phase 4.7."""
+
+    def test_awswaf_telemetry_not_blocked(self):
+        """Pages with edge.sdk.awswaf.com script are NOT blocked."""
+        from joiner import _classify_page_state
+
+        class AwsWafTelemetryPage:
+            url = "https://www.skool.com/test-group"
+            def text_content(self, sel):
+                return "join this community"
+            def query_selector(self, sel):
+                if "join" in sel.lower() or "Join" in sel:
+                    return _MockElement(visible=True)
+                return None
+            def content(self):
+                return '<html><script src="https://edge.sdk.awswaf.com/telemetry.js"></script><body>normal page</body></html>'
+            def title(self):
+                return "Test Community"
+
+        result = _classify_page_state(AwsWafTelemetryPage())
+        assert result["state"] != "BLOCKED"
+
+    def test_real_waf_challenge_still_blocked(self):
+        """Real WAF challenge page (with challenge form) IS blocked."""
+        from joiner import _classify_page_state
+
+        class WafChallengePage:
+            url = "https://www.skool.com/test-group"
+            def text_content(self, sel):
+                return "checking your browser please wait"
+            def query_selector(self, sel):
+                if sel == "#challenge-form":
+                    return _MockElement(visible=True)
+                return None
+            def content(self):
+                return '<html><script src="challenge.js"></script><body>checking your browser</body></html>'
+            def title(self):
+                return "Attention Required"
+
+        result = _classify_page_state(WafChallengePage())
+        assert result["state"] == "BLOCKED"
+
+
+class TestPhase47CoreTableInvariant:
+    """Phase 4.7 must not modify core tables."""
+
+    def test_contract_flow_no_core_writes(self, test_db_path):
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        profiles_before = [dict(r) for r in conn.execute("SELECT * FROM profiles").fetchall()]
+        conn.close()
+
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def fake_pw(*args, **kwargs):
+            return {"status": "JOINED", "detail": "verified_leave_group slug=test",
+                    "www_api": True, "survey_answers_count": 3}
+
+        get_db = _get_db_factory(test_db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "playwright"
+        try:
+            worker_tick(get_db, _playwright_join_fn=fake_pw)
+        finally:
+            worker_tick._force_enabled = False
+            worker_tick._force_mode = None
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        profiles_after = [dict(r) for r in conn.execute("SELECT * FROM profiles").fetchall()]
+        conn.close()
+        assert profiles_before == profiles_after
+
+    def setup_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+    def teardown_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None

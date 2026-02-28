@@ -2,7 +2,8 @@
 EngageFlow Community Joiner — Phase 2+3+4+4.1+4.2+4.3a+4.4
 DB tables, API routes, normalization, event audit, background worker,
 Playwright join execution (canary), post-click verification (4.1), forensic capture (4.2), WAF detection (4.3a), WAF false-positive fix (4.4-waf), API-first join (4.4), www API join (4.5),
-filled survey + api2 group_id + cancel/leave (4.6).
+filled survey + api2 group_id + cancel/leave (4.6),
+join-group contract + answer objects + deterministic verify (4.7).
 No mutation of core tables. Self-contained Playwright — no imports from automation/.
 """
 from __future__ import annotations
@@ -566,6 +567,39 @@ def _try_join_via_www_api(page, community_key: str) -> dict:
             "detail": f"www_api_rejected status={status_code} slug={slug}"}
 
 
+def _try_join_via_www_join_group(page, slug: str) -> dict:
+    """POST www.skool.com/groups/{slug}/join-group (empty body).
+
+    Returns: {"ok": bool, "status_code": int, "response_text": str}
+    Does NOT handle survey or verify — caller is responsible.
+    """
+    js_join = """
+        async (slug) => {
+            try {
+                const res = await fetch(
+                    'https://www.skool.com/groups/' + encodeURIComponent(slug) + '/join-group',
+                    { method: 'POST', credentials: 'include',
+                      headers: { 'Content-Type': 'application/json' } }
+                );
+                const text = await res.text().catch(() => '');
+                return { ok: res.ok, status: res.status, text: text.substring(0, 500) };
+            } catch (e) {
+                return { ok: false, status: 0, text: e.message };
+            }
+        }
+    """
+    try:
+        result = page.evaluate(js_join, slug)
+    except Exception:
+        return {"ok": False, "status_code": 0, "response_text": "evaluate_error"}
+    return {
+        "ok": bool(result.get("ok")),
+        "status_code": result.get("status", 0),
+        "response_text": (result.get("text", "") or "")[:500],
+    }
+
+
+
 # ---- Survey answer defaults (mirrors standalone profileInfo) ----
 _SURVEY_DEFAULTS: Dict[str, str] = {
     "email": "hugords100@gmail.com",
@@ -652,7 +686,8 @@ def _extract_survey_questions(page) -> list:
 def _build_survey_answers(questions: list) -> list:
     """Build filled survey answers matching questions to profile defaults.
 
-    Returns list of answer strings (same order as questions). Never empty.
+    Returns list of answer OBJECTS ({"answer": str}), same order as questions.
+    Never empty — always at least one generic answer object.
     """
     answers = []
     for q in questions:
@@ -668,10 +703,10 @@ def _build_survey_answers(questions: list) -> list:
                 value = _SURVEY_DEFAULTS["email"]
             else:
                 value = _GENERIC_ANSWER
-        answers.append(value)
+        answers.append({"answer": value})
     # Guarantee non-empty
     if not answers:
-        answers = [_GENERIC_ANSWER]
+        answers = [{"answer": _GENERIC_ANSWER}]
     return answers
 
 
@@ -721,7 +756,7 @@ def _submit_survey_answers(page, slug: str, group_id: str, answers: list) -> dic
 
     Returns {"ok": bool, "endpoint": str, "answers_count": int}
     """
-    payload_answers = answers if answers else [_GENERIC_ANSWER]
+    payload_answers = answers if answers else [{"answer": _GENERIC_ANSWER}]
 
     # Prefer api2 with group_id (matches standalone)
     if group_id:
@@ -772,23 +807,63 @@ def _submit_survey_answers(page, slug: str, group_id: str, answers: list) -> dic
 
 
 def _verify_membership_via_classroom(page, slug: str) -> dict:
-    """Navigate to /<slug>/classroom and classify membership state."""
+    """Navigate to /{slug}/classroom and deterministically classify membership.
+
+    Detection order:
+    1. "Leave Group" in body text -> JOINED
+    2. "Cancel Request" in body text -> PENDING_APPROVAL
+    3. Final URL contains /classroom AND no join button visible -> JOINED
+    4. Redirected to /about with join button visible -> NOT_MEMBER (retriable)
+    5. Fallback -> JOINED (optimistic: join-group 200 was accepted)
+    """
     try:
         page.goto(f"https://www.skool.com/{slug}/classroom",
                    timeout=15000, wait_until="domcontentloaded")
         page.wait_for_timeout(2000)
-        post = _classify_page_state(page)
-        if post["state"] == "MEMBER":
-            return {"status": "JOINED",
-                    "detail": f"www_api_joined_with_survey slug={slug}"}
-        if post["state"] == "PENDING":
-            return {"status": "PENDING_APPROVAL",
-                    "detail": f"www_api_survey_pending slug={slug}"}
     except Exception:
-        pass
-    # Default to JOINED: join-group returned 200, survey submitted OK
+        return {"status": "JOINED",
+                "detail": f"verify_nav_failed slug={slug}"}
+
+    try:
+        body_text = (page.text_content("body") or "")
+    except Exception:
+        body_text = ""
+
+    final_url = (page.url or "").lower()
+
+    # 1. "Leave Group" -> JOINED (confirmed member)
+    if "Leave Group" in body_text:
+        return {"status": "JOINED",
+                "detail": f"verified_leave_group slug={slug}"}
+
+    # 2. "Cancel Request" -> PENDING_APPROVAL
+    if "Cancel Request" in body_text:
+        return {"status": "PENDING_APPROVAL",
+                "detail": f"verified_cancel_request slug={slug}"}
+
+    # 3. /classroom in URL and no join button -> JOINED
+    if "/classroom" in final_url:
+        join_visible = False
+        for sel in _JOIN_BUTTON_SELECTORS:
+            btn = page.query_selector(sel)
+            if btn and btn.is_visible():
+                join_visible = True
+                break
+        if not join_visible:
+            return {"status": "JOINED",
+                    "detail": f"verified_classroom_no_join_btn slug={slug}"}
+
+    # 4. Redirected to /about with join button -> NOT_MEMBER
+    if "/about" in final_url:
+        for sel in _JOIN_BUTTON_SELECTORS:
+            btn = page.query_selector(sel)
+            if btn and btn.is_visible():
+                return {"status": "NOT_MEMBER",
+                        "detail": f"verify_redirected_about_join_visible slug={slug}"}
+
+    # 5. Fallback optimistic
     return {"status": "JOINED",
-            "detail": f"www_api_joined_survey_unverified slug={slug}"}
+            "detail": f"verify_fallback_optimistic slug={slug}"}
 
 
 def _cancel_join_via_api2(page, slug: str) -> dict:
@@ -1037,20 +1112,73 @@ def _execute_playwright_join(
         if state == "PAID":
             return {"status": "SKIPPED_PAID", "detail": detail}
 
-        # --- API-first: try www.skool.com/groups/<slug>/join-group (Phase 4.5) ---
-        www_result = _try_join_via_www_api(page, community_key)
-        www_status = www_result["status"]
-        if www_status in ("JOINED", "ALREADY_MEMBER", "PENDING_APPROVAL", "SKIPPED_PAID"):
-            www_result["www_api"] = True
-            return www_result
-        www_detail = www_result.get("detail", "")
-        if "auth_required" in www_detail:
-            return {"status": "FAILED", "detail": www_detail, "blocked_terminal": True}
-        # Non-auth API failure — fall through to UI click if JOIN_VISIBLE
-        LOGGER.info("www_api failed (%s), state=%s — UI click fallback", www_detail, state)
+        # --- Phase 4.7: join-group contract flow ---
+        slug = _extract_slug_from_key(community_key)
 
         if state == "UNKNOWN":
-            return {"status": "FAILED", "detail": f"www_api_and_unknown: {www_detail}"}
+            # Not JOIN_VISIBLE and not any known state — try join-group anyway
+            LOGGER.debug("UNKNOWN state, attempting join-group for slug=%s", slug)
+
+        # Step 1: POST /groups/{slug}/join-group
+        join_result = _try_join_via_www_join_group(page, slug)
+        join_status = join_result["status_code"]
+
+        # --- Terminal status codes ---
+        if join_status == 401:
+            return {"status": "FAILED", "detail": f"join_group_auth_required slug={slug}",
+                    "blocked_terminal": True}
+        if join_status in (402, 403):
+            return {"status": "SKIPPED_PAID", "detail": f"join_group_paid slug={slug}"}
+        if join_status == 404:
+            return {"status": "FAILED", "detail": f"join_group_not_found slug={slug}"}
+
+        # --- 409: already member or pending ---
+        if join_status == 409:
+            verify = _verify_membership_via_classroom(page, slug)
+            verify["www_api"] = True
+            if verify["status"] == "NOT_MEMBER":
+                return {"status": "FAILED", "detail": f"join_group_409_but_not_member slug={slug}"}
+            return verify
+
+        # --- 200: join accepted, check survey ---
+        if join_result["ok"]:
+            response_text_lower = join_result["response_text"].lower()
+
+            # Check if survey is required
+            if "survey" in response_text_lower:
+                questions = _extract_survey_questions(page)
+                answers = _build_survey_answers(questions)
+                group_id = _resolve_group_id(page, slug)
+                survey_result = _submit_survey_answers(page, slug, group_id, answers)
+                LOGGER.info("Survey submitted: endpoint=%s answers_count=%d questions=%d slug=%s",
+                            survey_result["endpoint"], survey_result["answers_count"],
+                            len(questions), slug)
+
+            # Verify via classroom
+            verify = _verify_membership_via_classroom(page, slug)
+            verify["www_api"] = True
+            if "survey_result" in dir() and survey_result:
+                verify["survey_answers_count"] = survey_result["answers_count"]
+
+            if verify["status"] == "NOT_MEMBER":
+                # Re-call join-group once, then verify again
+                LOGGER.info("NOT_MEMBER after verify, re-calling join-group slug=%s", slug)
+                retry_result = _try_join_via_www_join_group(page, slug)
+                if retry_result["ok"] or retry_result["status_code"] == 409:
+                    verify2 = _verify_membership_via_classroom(page, slug)
+                    verify2["www_api"] = True
+                    verify2["join_retry"] = True
+                    if "survey_answers_count" in verify:
+                        verify2["survey_answers_count"] = verify["survey_answers_count"]
+                    return verify2
+                # Retry also failed
+                return {"status": "FAILED",
+                        "detail": f"join_group_retry_failed slug={slug} status={retry_result['status_code']}"}
+
+            return verify
+
+        # --- Non-200 non-terminal: fall through to UI click ---
+        LOGGER.info("join-group status=%d, falling back to UI click slug=%s", join_status, slug)
 
         # --- Network recorder: capture api2 candidates during click (Phase 4.4) ---
         _api_candidates = []

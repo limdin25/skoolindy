@@ -4,7 +4,8 @@ DB tables, API routes, normalization, event audit, background worker,
 Playwright join execution (canary), post-click verification (4.1), forensic capture (4.2), WAF detection (4.3a), WAF false-positive fix (4.4-waf), API-first join (4.4), www API join (4.5),
 filled survey + api2 group_id + cancel/leave (4.6),
 join-group contract + answer objects + deterministic verify (4.7),
-remove optimistic verify fallback (4.7b).
+remove optimistic verify fallback (4.7b),
+api2-first join-group + forensics on 404 (4.7c).
 No mutation of core tables. Self-contained Playwright — no imports from automation/.
 """
 from __future__ import annotations
@@ -568,17 +569,20 @@ def _try_join_via_www_api(page, community_key: str) -> dict:
             "detail": f"www_api_rejected status={status_code} slug={slug}"}
 
 
-def _try_join_via_www_join_group(page, slug: str) -> dict:
-    """POST www.skool.com/groups/{slug}/join-group (empty body).
+def _try_join_via_join_group(page, slug: str) -> dict:
+    """POST /groups/{slug}/join-group — api2 first, www fallback.
 
-    Returns: {"ok": bool, "status_code": int, "response_text": str}
+    Tries api2.skool.com first (matches standalone working behavior),
+    falls back to www.skool.com if api2 returns 404 or network error.
+
+    Returns: {"ok": bool, "status_code": int, "response_text": str, "endpoint_used": str}
     Does NOT handle survey or verify — caller is responsible.
     """
-    js_join = """
-        async (slug) => {
+    _JOIN_GROUP_JS = """
+        async (args) => {
             try {
                 const res = await fetch(
-                    'https://www.skool.com/groups/' + encodeURIComponent(slug) + '/join-group',
+                    args.base + '/groups/' + encodeURIComponent(args.slug) + '/join-group',
                     { method: 'POST', credentials: 'include',
                       headers: { 'Content-Type': 'application/json' } }
                 );
@@ -589,14 +593,36 @@ def _try_join_via_www_join_group(page, slug: str) -> dict:
             }
         }
     """
+
+    # --- Try api2 first ---
     try:
-        result = page.evaluate(js_join, slug)
+        r1 = page.evaluate(_JOIN_GROUP_JS, {"base": "https://api2.skool.com", "slug": slug})
     except Exception:
-        return {"ok": False, "status_code": 0, "response_text": "evaluate_error"}
+        r1 = {"ok": False, "status": 0, "text": "evaluate_error"}
+
+    s1 = r1.get("status", 0)
+    if s1 != 404 and s1 != 0:
+        # api2 gave a definitive answer (not 404 / not network error)
+        return {
+            "ok": bool(r1.get("ok")),
+            "status_code": s1,
+            "response_text": (r1.get("text", "") or "")[:500],
+            "endpoint_used": "api2",
+        }
+
+    # --- api2 was 404 or errored — fall back to www ---
+    LOGGER.debug("api2 join-group status=%d for slug=%s, trying www", s1, slug)
+    try:
+        r2 = page.evaluate(_JOIN_GROUP_JS, {"base": "https://www.skool.com", "slug": slug})
+    except Exception:
+        r2 = {"ok": False, "status": 0, "text": "evaluate_error"}
+
+    s2 = r2.get("status", 0)
     return {
-        "ok": bool(result.get("ok")),
-        "status_code": result.get("status", 0),
-        "response_text": (result.get("text", "") or "")[:500],
+        "ok": bool(r2.get("ok")),
+        "status_code": s2,
+        "response_text": (r2.get("text", "") or "")[:500],
+        "endpoint_used": "www",
     }
 
 
@@ -1121,7 +1147,7 @@ def _execute_playwright_join(
             LOGGER.debug("UNKNOWN state, attempting join-group for slug=%s", slug)
 
         # Step 1: POST /groups/{slug}/join-group
-        join_result = _try_join_via_www_join_group(page, slug)
+        join_result = _try_join_via_join_group(page, slug)
         join_status = join_result["status_code"]
 
         # --- Terminal status codes ---
@@ -1131,7 +1157,15 @@ def _execute_playwright_join(
         if join_status in (402, 403):
             return {"status": "SKIPPED_PAID", "detail": f"join_group_paid slug={slug}"}
         if join_status == 404:
-            return {"status": "FAILED", "detail": f"join_group_not_found slug={slug}"}
+            forensic_events = []
+            if job_id and item_id:
+                try:
+                    forensic_events = _capture_forensics(page, job_id, item_id)
+                except Exception as fe:
+                    LOGGER.warning("Forensic capture on join_group_not_found: %s", str(fe)[:200])
+            return {"status": "FAILED",
+                    "detail": f"join_group_not_found slug={slug}",
+                    "forensic_events": forensic_events}
 
         # --- 409: already member or pending ---
         if join_status == 409:
@@ -1174,7 +1208,7 @@ def _execute_playwright_join(
             if verify["status"] in ("NOT_MEMBER", "UNKNOWN_VERIFY"):
                 # Re-call join-group once, then verify again
                 LOGGER.info("%s after verify, re-calling join-group slug=%s", verify["status"], slug)
-                retry_result = _try_join_via_www_join_group(page, slug)
+                retry_result = _try_join_via_join_group(page, slug)
                 if retry_result["ok"] or retry_result["status_code"] == 409:
                     verify2 = _verify_membership_via_classroom(page, slug)
                     verify2["www_api"] = True

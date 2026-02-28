@@ -3373,47 +3373,50 @@ class TestPhase46CoreTableInvariant:
 # =========================================================================
 
 from joiner import (
-    _try_join_via_www_join_group,
+    _try_join_via_join_group,
 )
 
 
-class TestTryJoinViaWwwJoinGroup:
-    """Unit: _try_join_via_www_join_group status code mapping."""
+class TestTryJoinViaJoinGroup:
+    """Unit: _try_join_via_join_group status code mapping (api2 first, www fallback)."""
 
     def test_200_returns_ok(self):
         """HTTP 200 -> ok=True, status_code=200."""
         page = _MockWwwApiPage(evaluate_results=[
             {"ok": True, "status": 200, "text": "joined"},
         ])
-        result = _try_join_via_www_join_group(page, "test-group")
+        result = _try_join_via_join_group(page, "test-group")
         assert result["ok"] is True
         assert result["status_code"] == 200
         assert result["response_text"] == "joined"
+        assert result["endpoint_used"] == "api2"
 
     def test_409_returns_conflict(self):
         """HTTP 409 -> ok=False, status_code=409."""
         page = _MockWwwApiPage(evaluate_results=[
             {"ok": False, "status": 409, "text": "already member"},
         ])
-        result = _try_join_via_www_join_group(page, "test-group")
+        result = _try_join_via_join_group(page, "test-group")
         assert result["ok"] is False
         assert result["status_code"] == 409
+        assert result["endpoint_used"] == "api2"
 
     def test_401_returns_auth(self):
         """HTTP 401 -> ok=False, status_code=401."""
         page = _MockWwwApiPage(evaluate_results=[
             {"ok": False, "status": 401, "text": "unauthorized"},
         ])
-        result = _try_join_via_www_join_group(page, "test-group")
+        result = _try_join_via_join_group(page, "test-group")
         assert result["ok"] is False
         assert result["status_code"] == 401
+        assert result["endpoint_used"] == "api2"
 
     def test_402_returns_paid(self):
         """HTTP 402 -> ok=False, status_code=402."""
         page = _MockWwwApiPage(evaluate_results=[
             {"ok": False, "status": 402, "text": "payment required"},
         ])
-        result = _try_join_via_www_join_group(page, "test-group")
+        result = _try_join_via_join_group(page, "test-group")
         assert result["ok"] is False
         assert result["status_code"] == 402
 
@@ -3422,36 +3425,40 @@ class TestTryJoinViaWwwJoinGroup:
         page = _MockWwwApiPage(evaluate_results=[
             {"ok": False, "status": 403, "text": "forbidden"},
         ])
-        result = _try_join_via_www_join_group(page, "test-group")
+        result = _try_join_via_join_group(page, "test-group")
         assert result["ok"] is False
         assert result["status_code"] == 403
 
-    def test_404_returns_not_found(self):
-        """HTTP 404 -> ok=False, status_code=404."""
+    def test_404_both_endpoints_not_found(self):
+        """Both api2 and www return 404 -> ok=False, status_code=404, endpoint_used=www."""
         page = _MockWwwApiPage(evaluate_results=[
-            {"ok": False, "status": 404, "text": "not found"},
+            {"ok": False, "status": 404, "text": "not found"},  # api2
+            {"ok": False, "status": 404, "text": "not found"},  # www fallback
         ])
-        result = _try_join_via_www_join_group(page, "test-group")
+        result = _try_join_via_join_group(page, "test-group")
         assert result["ok"] is False
         assert result["status_code"] == 404
+        assert result["endpoint_used"] == "www"
 
     def test_evaluate_error_returns_zero(self):
-        """evaluate throws -> status_code=0."""
+        """Both evaluate calls throw -> status_code=0, endpoint_used=www."""
         class ThrowPage(_MockWwwApiPage):
             def evaluate(self, js, *args):
                 raise Exception("crash")
         page = ThrowPage()
-        result = _try_join_via_www_join_group(page, "test-group")
+        result = _try_join_via_join_group(page, "test-group")
         assert result["ok"] is False
         assert result["status_code"] == 0
+        assert result["endpoint_used"] == "www"
 
     def test_response_text_truncated(self):
         """Response text truncated to 500 chars."""
         page = _MockWwwApiPage(evaluate_results=[
             {"ok": True, "status": 200, "text": "x" * 600},
         ])
-        result = _try_join_via_www_join_group(page, "test-group")
+        result = _try_join_via_join_group(page, "test-group")
         assert len(result["response_text"]) <= 500
+        assert result["endpoint_used"] == "api2"
 
 
 class TestSurveyAnswerObjectFormat:
@@ -3868,3 +3875,143 @@ class TestPhase47bInconclusiveIntegration:
         item = conn.execute("SELECT status FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
         conn.close()
         assert item["status"] == "JOINED"
+
+
+
+# =========================================================================
+# PHASE 4.7c: api2-first join-group, forensics on 404
+# =========================================================================
+
+
+class TestJoinGroupDualEndpoint:
+    """Unit: _try_join_via_join_group tries api2 first, www fallback on 404."""
+
+    def test_api2_200_no_www_call(self):
+        """api2 returns 200 -> result returned, www never called."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": True, "status": 200, "text": "joined"},  # api2
+            # www would be next but should not be called
+        ])
+        result = _try_join_via_join_group(page, "test-group")
+        assert result["ok"] is True
+        assert result["status_code"] == 200
+        assert result["endpoint_used"] == "api2"
+        # Only one evaluate call consumed
+        assert page._evaluate_call_idx == 1
+
+    def test_api2_404_then_www_200(self):
+        """api2 returns 404, www returns 200 -> ok, endpoint_used=www."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": False, "status": 404, "text": "not found"},  # api2
+            {"ok": True, "status": 200, "text": "joined via www"},  # www
+        ])
+        result = _try_join_via_join_group(page, "test-group")
+        assert result["ok"] is True
+        assert result["status_code"] == 200
+        assert result["endpoint_used"] == "www"
+        assert result["response_text"] == "joined via www"
+
+    def test_api2_404_then_www_404(self):
+        """Both 404 -> not found, endpoint_used=www."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": False, "status": 404, "text": "not found"},  # api2
+            {"ok": False, "status": 404, "text": "not found"},  # www
+        ])
+        result = _try_join_via_join_group(page, "test-group")
+        assert result["ok"] is False
+        assert result["status_code"] == 404
+        assert result["endpoint_used"] == "www"
+
+    def test_api2_error_then_www_200(self):
+        """api2 network error (status=0), www succeeds -> ok, endpoint_used=www."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": False, "status": 0, "text": "network error"},  # api2
+            {"ok": True, "status": 200, "text": "joined"},  # www
+        ])
+        result = _try_join_via_join_group(page, "test-group")
+        assert result["ok"] is True
+        assert result["status_code"] == 200
+        assert result["endpoint_used"] == "www"
+
+    def test_api2_409_no_www_call(self):
+        """api2 returns 409 -> returned directly, no www fallback."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": False, "status": 409, "text": "conflict"},
+        ])
+        result = _try_join_via_join_group(page, "test-group")
+        assert result["ok"] is False
+        assert result["status_code"] == 409
+        assert result["endpoint_used"] == "api2"
+        assert page._evaluate_call_idx == 1
+
+    def test_endpoint_used_field_always_present(self):
+        """endpoint_used is always in result dict."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": True, "status": 200, "text": "ok"},
+        ])
+        result = _try_join_via_join_group(page, "test-group")
+        assert "endpoint_used" in result
+
+
+class TestForensicsOn404:
+    """Integration: forensics captured when join-group returns 404."""
+
+    def _tick_pw(self, db_path, pw_fn):
+        get_db = _get_db_factory(db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "playwright"
+        try:
+            return worker_tick(get_db, _playwright_join_fn=pw_fn)
+        finally:
+            worker_tick._force_enabled = False
+            worker_tick._force_mode = None
+
+    def setup_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+    def teardown_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+    def test_404_emits_forensic_events(self, test_db_path):
+        """When both endpoints 404, worker captures forensic artifacts."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def fake_pw(*args, **kwargs):
+            return {"status": "FAILED",
+                    "detail": "join_group_not_found slug=freegroup",
+                    "forensic_events": [
+                        {"type": "ITEM_ARTIFACT", "detail": "screenshot=artifacts/joiner/j1/i1/not_found.png"},
+                        {"type": "ITEM_ARTIFACT", "detail": "url=https://www.skool.com/freegroup title=Freegroup html_head=<head>...</head>"},
+                    ]}
+
+        self._tick_pw(test_db_path, fake_pw)
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        events = conn.execute(
+            "SELECT event_type, detail FROM join_events WHERE job_id = ? AND event_type = 'ITEM_ARTIFACT'",
+            (job_id,)
+        ).fetchall()
+        conn.close()
+        assert len(events) >= 1
+        details = [e["detail"] for e in events]
+        assert any("screenshot" in d for d in details)
+
+    def test_404_item_not_joined(self, test_db_path):
+        """When both endpoints 404, item is NOT marked JOINED."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def fake_pw(*args, **kwargs):
+            return {"status": "FAILED",
+                    "detail": "join_group_not_found slug=freegroup"}
+
+        self._tick_pw(test_db_path, fake_pw)
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT status, fail_reason FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        conn.close()
+        assert item["status"] != "JOINED"
+        assert "not_found" in (item["fail_reason"] or "")

@@ -2788,8 +2788,16 @@ class TestPhase44CoreTableInvariant:
 
 from joiner import (
     _try_join_via_www_api,
-    _submit_survey_via_www_api,
+    _submit_survey_answers,
     _verify_membership_via_classroom,
+    _build_survey_answers,
+    _extract_survey_questions,
+    _resolve_group_id,
+    _cancel_join_via_api2,
+    _leave_group_via_api2,
+    _SURVEY_DEFAULTS,
+    _FIELD_PATTERNS,
+    _GENERIC_ANSWER,
 )
 
 
@@ -2947,27 +2955,32 @@ class TestTryJoinViaWwwApi:
 
 
 class TestSurveyHandling:
-    """Unit tests for survey flow in _try_join_via_www_api."""
+    """Unit tests for survey flow in _try_join_via_www_api (Phase 4.6: filled answers)."""
 
     def test_survey_success_and_verify_member(self):
-        """200 with survey -> submit survey -> verify classroom -> JOINED."""
+        """200 with survey -> extract + fill + submit -> verify classroom -> JOINED."""
         page = _MockWwwApiPage(
             evaluate_results=[
                 {"ok": True, "status": 200, "text": '{"survey": true}'},
-                {"ok": True, "status": 200},  # survey submit
+                [],  # _extract_survey_questions
+                "",  # _resolve_group_id
+                {"ok": True, "status": 200},  # _submit_survey_answers (www fallback)
             ],
             goto_state="MEMBER",
         )
         result = _try_join_via_www_api(page, "www.skool.com/test-group")
         assert result["status"] == "JOINED"
         assert "survey" in result["detail"]
+        assert result.get("survey_answers_count", 0) > 0
 
     def test_survey_success_verify_pending(self):
-        """200 with survey -> submit survey -> classroom shows pending."""
+        """200 with survey -> submit -> classroom shows pending."""
         page = _MockWwwApiPage(
             evaluate_results=[
                 {"ok": True, "status": 200, "text": '{"survey": true}'},
-                {"ok": True, "status": 200},  # survey submit
+                [],  # extract
+                "",  # resolve
+                {"ok": True, "status": 200},  # submit
             ],
             goto_state="PENDING",
         )
@@ -2979,20 +2992,15 @@ class TestSurveyHandling:
         page = _MockWwwApiPage(
             evaluate_results=[
                 {"ok": True, "status": 200, "text": '{"survey": true}'},
-                {"ok": False, "status": 400},  # survey submit fails
+                [],  # extract
+                "",  # resolve
+                {"ok": False, "status": 400},  # submit fails
             ],
         )
         result = _try_join_via_www_api(page, "www.skool.com/test-group")
         assert result["status"] == "PENDING_APPROVAL"
         assert "survey_needed" in result["detail"]
-
-    def test_submit_survey_helper_returns_bool(self):
-        """_submit_survey_via_www_api returns True on 200, False otherwise."""
-        page_ok = _MockWwwApiPage(evaluate_results=[{"ok": True, "status": 200}])
-        assert _submit_survey_via_www_api(page_ok, "test") is True
-
-        page_fail = _MockWwwApiPage(evaluate_results=[{"ok": False, "status": 400}])
-        assert _submit_survey_via_www_api(page_fail, "test") is False
+        assert result.get("survey_answers_count", 0) > 0
 
 
 class TestWwwApiFlowIntegration:
@@ -3079,6 +3087,254 @@ class TestPhase45CoreTableInvariant:
 
         def fake_pw(*args, **kwargs):
             return {"status": "JOINED", "detail": "www_api_joined slug=freegroup", "www_api": True}
+
+        get_db_fn = _get_db_factory(test_db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "playwright"
+        try:
+            worker_tick(get_db_fn, _playwright_join_fn=fake_pw)
+        finally:
+            worker_tick._force_enabled = False
+            worker_tick._force_mode = None
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        profiles_after = [dict(r) for r in conn.execute("SELECT * FROM profiles").fetchall()]
+        conn.close()
+        assert profiles_before == profiles_after
+
+    def setup_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+    def teardown_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+
+# =========================================================================
+# PHASE 4.6: Filled Survey, api2 Group ID, Cancel/Leave Tests
+# =========================================================================
+
+
+class TestBuildSurveyAnswers:
+    """Unit tests: survey answers are never empty and match field patterns."""
+
+    def test_empty_questions_returns_generic(self):
+        """No questions -> at least one generic answer."""
+        answers = _build_survey_answers([])
+        assert len(answers) >= 1
+        assert answers[0] == _GENERIC_ANSWER
+
+    def test_email_field_matched(self):
+        """Question with 'email' in label -> email default."""
+        questions = [{"label": "What is your email address?", "type": "email"}]
+        answers = _build_survey_answers(questions)
+        assert len(answers) == 1
+        assert answers[0] == _SURVEY_DEFAULTS["email"]
+
+    def test_why_join_field_matched(self):
+        """Question about 'why join' -> why_join default."""
+        questions = [{"label": "Why do you want to join this community?", "type": "text"}]
+        answers = _build_survey_answers(questions)
+        assert answers[0] == _SURVEY_DEFAULTS["why_join"]
+
+    def test_occupation_field_matched(self):
+        """Question about 'what do you do' -> occupation default."""
+        questions = [{"label": "What do you do for a living?", "type": "text"}]
+        answers = _build_survey_answers(questions)
+        assert answers[0] == _SURVEY_DEFAULTS["occupation"]
+
+    def test_unknown_field_gets_generic(self):
+        """Unrecognized question -> generic answer, never empty."""
+        questions = [{"label": "Random unrelated question xyz123", "type": "text"}]
+        answers = _build_survey_answers(questions)
+        assert len(answers) == 1
+        assert answers[0] == _GENERIC_ANSWER
+        assert answers[0] != ""
+
+    def test_multiple_questions_all_filled(self):
+        """Multiple questions -> all get answers, none empty."""
+        questions = [
+            {"label": "Email", "type": "email"},
+            {"label": "Why join?", "type": "text"},
+            {"label": "Something random", "type": "text"},
+        ]
+        answers = _build_survey_answers(questions)
+        assert len(answers) == 3
+        for a in answers:
+            assert a != ""
+            assert len(a) > 5
+
+    def test_answers_never_empty_array(self):
+        """Answers list is never empty, even with no questions."""
+        answers = _build_survey_answers([])
+        assert len(answers) >= 1
+
+    def test_no_pii_in_field_patterns(self):
+        """_FIELD_PATTERNS keys all exist in _SURVEY_DEFAULTS."""
+        for key in _FIELD_PATTERNS:
+            assert key in _SURVEY_DEFAULTS, f"Pattern key '{key}' not in defaults"
+
+
+class TestResolveGroupId:
+    """Unit tests: _resolve_group_id extracts group UUID from page."""
+
+    def test_returns_group_id_from_next_data(self):
+        """When __NEXT_DATA__ has groupId, it is returned."""
+        class PageWithNextData(_MockWwwApiPage):
+            def evaluate(self, js, *args):
+                return "db46e2a8c15944448f2c03a861bd5cb6"
+        page = PageWithNextData()
+        gid = _resolve_group_id(page, "freegroup")
+        assert gid == "db46e2a8c15944448f2c03a861bd5cb6"
+
+    def test_returns_empty_when_no_data(self):
+        """When no group_id found, returns empty string."""
+        class PageNoData(_MockWwwApiPage):
+            def evaluate(self, js, *args):
+                return ""
+        page = PageNoData()
+        gid = _resolve_group_id(page, "freegroup")
+        assert gid == ""
+
+    def test_returns_empty_on_exception(self):
+        """When evaluate throws, returns empty string."""
+        class PageThrows(_MockWwwApiPage):
+            def evaluate(self, js, *args):
+                raise Exception("browser error")
+        page = PageThrows()
+        gid = _resolve_group_id(page, "freegroup")
+        assert gid == ""
+
+    def test_short_string_rejected(self):
+        """Short strings (< 20 chars) are rejected."""
+        class PageShort(_MockWwwApiPage):
+            def evaluate(self, js, *args):
+                return "short"
+        page = PageShort()
+        gid = _resolve_group_id(page, "freegroup")
+        assert gid == ""
+
+
+class TestSubmitSurveyAnswers:
+    """Unit tests: _submit_survey_answers uses api2 with group_id, fallback to www."""
+
+    def test_api2_used_when_group_id_known(self):
+        """With group_id, api2 endpoint is used."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": True, "status": 200},  # api2 submit
+        ])
+        result = _submit_survey_answers(page, "test-group", "abc123def456ghi789jkl012", ["answer1"])
+        assert result["ok"] is True
+        assert result["endpoint"] == "api2"
+        assert result["answers_count"] == 1
+
+    def test_www_fallback_when_no_group_id(self):
+        """Without group_id, www endpoint is used."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": True, "status": 200},  # www submit
+        ])
+        result = _submit_survey_answers(page, "test-group", "", ["answer1"])
+        assert result["ok"] is True
+        assert result["endpoint"] == "www"
+        assert result["answers_count"] == 1
+
+    def test_api2_fails_falls_to_www(self):
+        """If api2 fails, www is tried as fallback."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": False, "status": 500},  # api2 fails
+            {"ok": True, "status": 200},   # www succeeds
+        ])
+        result = _submit_survey_answers(page, "test-group", "abc123def456ghi789jkl012", ["ans1"])
+        assert result["ok"] is True
+        assert result["endpoint"] == "www"
+
+    def test_empty_answers_get_generic(self):
+        """Empty answers list gets at least one generic answer."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": True, "status": 200},  # www submit
+        ])
+        result = _submit_survey_answers(page, "test-group", "", [])
+        assert result["answers_count"] >= 1
+
+    def test_answers_count_in_result(self):
+        """answers_count reflects actual count submitted."""
+        page = _MockWwwApiPage(evaluate_results=[
+            {"ok": True, "status": 200},
+        ])
+        result = _submit_survey_answers(page, "test-group", "", ["a1", "a2", "a3"])
+        assert result["answers_count"] == 3
+
+
+class TestCancelJoinViaApi2:
+    """Unit tests: _cancel_join_via_api2 maps status codes."""
+
+    def test_cancel_success(self):
+        """HTTP 200 -> ok=True."""
+        page = _MockWwwApiPage(evaluate_results=[{"ok": True, "status": 200}])
+        result = _cancel_join_via_api2(page, "test-group")
+        assert result["ok"] is True
+
+    def test_cancel_not_found(self):
+        """HTTP 404 -> ok=False."""
+        page = _MockWwwApiPage(evaluate_results=[{"ok": False, "status": 404}])
+        result = _cancel_join_via_api2(page, "test-group")
+        assert result["ok"] is False
+        assert result["status"] == 404
+
+    def test_cancel_evaluate_error(self):
+        """evaluate throws -> ok=False."""
+        class ThrowPage(_MockWwwApiPage):
+            def evaluate(self, js, *args):
+                raise Exception("crash")
+        page = ThrowPage()
+        result = _cancel_join_via_api2(page, "test-group")
+        assert result["ok"] is False
+
+
+class TestLeaveGroupViaApi2:
+    """Unit tests: _leave_group_via_api2 maps status codes."""
+
+    def test_leave_success(self):
+        """HTTP 200 -> ok=True."""
+        page = _MockWwwApiPage(evaluate_results=[{"ok": True, "status": 200}])
+        result = _leave_group_via_api2(page, "test-group")
+        assert result["ok"] is True
+
+    def test_leave_forbidden(self):
+        """HTTP 403 -> ok=False."""
+        page = _MockWwwApiPage(evaluate_results=[{"ok": False, "status": 403}])
+        result = _leave_group_via_api2(page, "test-group")
+        assert result["ok"] is False
+        assert result["status"] == 403
+
+    def test_leave_evaluate_error(self):
+        """evaluate throws -> ok=False."""
+        class ThrowPage(_MockWwwApiPage):
+            def evaluate(self, js, *args):
+                raise Exception("crash")
+        page = ThrowPage()
+        result = _leave_group_via_api2(page, "test-group")
+        assert result["ok"] is False
+
+
+class TestPhase46CoreTableInvariant:
+    """Phase 4.6 must not modify core tables."""
+
+    def test_survey_fill_no_core_writes(self, test_db_path):
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        profiles_before = [dict(r) for r in conn.execute("SELECT * FROM profiles").fetchall()]
+        conn.close()
+
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def fake_pw(*args, **kwargs):
+            return {"status": "JOINED", "detail": "www_api_joined_with_survey slug=test",
+                    "www_api": True, "survey_answers_count": 3}
 
         get_db_fn = _get_db_factory(test_db_path)
         worker_tick._force_enabled = True

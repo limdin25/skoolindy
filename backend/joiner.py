@@ -1,7 +1,8 @@
 """
 EngageFlow Community Joiner — Phase 2+3+4+4.1+4.2+4.3a+4.4
 DB tables, API routes, normalization, event audit, background worker,
-Playwright join execution (canary), post-click verification (4.1), forensic capture (4.2), WAF detection (4.3a), WAF false-positive fix (4.4-waf), API-first join (4.4), www API join (4.5).
+Playwright join execution (canary), post-click verification (4.1), forensic capture (4.2), WAF detection (4.3a), WAF false-positive fix (4.4-waf), API-first join (4.4), www API join (4.5),
+filled survey + api2 group_id + cancel/leave (4.6).
 No mutation of core tables. Self-contained Playwright — no imports from automation/.
 """
 from __future__ import annotations
@@ -528,13 +529,20 @@ def _try_join_via_www_api(page, community_key: str) -> dict:
 
         # Check if survey is required
         if "survey" in lower_text:
-            survey_ok = _submit_survey_via_www_api(page, slug)
-            if survey_ok:
-                # Verify membership via classroom navigation
+            questions = _extract_survey_questions(page)
+            answers = _build_survey_answers(questions)
+            group_id = _resolve_group_id(page, slug)
+            survey_result = _submit_survey_answers(page, slug, group_id, answers)
+            LOGGER.info("Survey submitted: endpoint=%s answers_count=%d questions=%d slug=%s",
+                        survey_result["endpoint"], survey_result["answers_count"],
+                        len(questions), slug)
+            if survey_result["ok"]:
                 verify = _verify_membership_via_classroom(page, slug)
+                verify["survey_answers_count"] = survey_result["answers_count"]
                 return verify
             return {"status": "PENDING_APPROVAL",
-                    "detail": f"www_api_survey_needed slug={slug}"}
+                    "detail": f"www_api_survey_needed slug={slug}",
+                    "survey_answers_count": survey_result["answers_count"]}
 
         # Check for pending approval in response
         if "pending" in lower_text:
@@ -558,28 +566,209 @@ def _try_join_via_www_api(page, community_key: str) -> dict:
             "detail": f"www_api_rejected status={status_code} slug={slug}"}
 
 
-def _submit_survey_via_www_api(page, slug: str) -> bool:
-    """Submit empty survey answers. Returns True if HTTP 200."""
-    js_survey = """
-        async (slug) => {
+# ---- Survey answer defaults (mirrors standalone profileInfo) ----
+_SURVEY_DEFAULTS: Dict[str, str] = {
+    "email": "hugords100@gmail.com",
+    "first_name": "Hugo",
+    "last_name": "Rodriguez",
+    "full_name": "Hugo Rodriguez",
+    "phone": "+44 7412 345678",
+    "company": "Digital Marketing Solutions",
+    "website": "https://hugorodriguez.com",
+    "linkedin": "https://linkedin.com/in/hugorodriguez",
+    "instagram": "@hugo_marketing",
+    "twitter": "@hugo_mkt",
+    "facebook": "Hugo Rodriguez",
+    "youtube": "Hugo Rodriguez",
+    "tiktok": "@hugo_marketing",
+    "how_found": "Found through Skool search while looking for communities in this niche",
+    "occupation": "Digital marketer and entrepreneur focused on affiliate marketing and AI automation",
+    "why_join": "Looking to learn new strategies, connect with like-minded people, and grow my business",
+    "experience": "Intermediate — been in digital marketing for a few years, always learning new approaches",
+    "bio": "Digital marketer focused on affiliate marketing, passive income, and AI automation. Always looking to learn and connect with others.",
+}
+
+# Regex patterns matching standalone FIELD_PATTERNS (key -> pattern)
+_FIELD_PATTERNS: Dict[str, re.Pattern] = {
+    "email": re.compile(r"email|mail|adresse|correo|e-mail", re.I),
+    "first_name": re.compile(r"first.*name|given.*name|your.*name|full.*name|fullname", re.I),
+    "full_name": re.compile(r"full\s*name|fullname|what.*your\s+name", re.I),
+    "last_name": re.compile(r"last.*name|surname|family.*name", re.I),
+    "phone": re.compile(r"phone|mobile|tel|whatsapp|cell", re.I),
+    "company": re.compile(r"company|organization|org|business", re.I),
+    "website": re.compile(r"website|site|url|domain|web|link", re.I),
+    "linkedin": re.compile(r"linkedin", re.I),
+    "instagram": re.compile(r"instagram|ig\b", re.I),
+    "twitter": re.compile(r"twitter|x\.com", re.I),
+    "facebook": re.compile(r"facebook|fb", re.I),
+    "youtube": re.compile(r"youtube", re.I),
+    "tiktok": re.compile(r"tiktok", re.I),
+    "how_found": re.compile(r"how.*find|how.*hear|where.*find|referr|how.*discover|source", re.I),
+    "occupation": re.compile(r"what.*do|business|occupation|living|profession|role|work|job|career", re.I),
+    "why_join": re.compile(r"why.*join|goal|looking|interest|expect|hope|want|reason|motivation|excited", re.I),
+    "experience": re.compile(r"experience|level|background|skill|how.*long|familiar", re.I),
+    "bio": re.compile(r"about|tell.*us|describe|bio|introduce|yourself|who.*are", re.I),
+}
+
+_GENERIC_ANSWER = "Looking to learn new strategies, connect with like-minded people, and grow my business"
+
+
+def _extract_survey_questions(page) -> list:
+    """Extract survey questions from DOM. Returns list of {"label": str, "type": str}.
+
+    Runs JS in browser context to find form elements and their labels.
+    """
+    js_extract = """
+        () => {
+            const questions = [];
+            const inputs = document.querySelectorAll('input[type="text"], input[type="email"], textarea');
+            for (const el of inputs) {
+                let label = '';
+                const ph = el.getAttribute('placeholder') || '';
+                const nm = el.getAttribute('name') || '';
+                const ar = el.getAttribute('aria-label') || '';
+                // Walk up to find label text
+                let node = el;
+                for (let i = 0; i < 5; i++) {
+                    node = node.parentElement;
+                    if (!node) break;
+                    const t = node.textContent || '';
+                    if (t.length > 3 && t.length < 300) { label = t; break; }
+                }
+                questions.push({
+                    label: (label + ' ' + ph + ' ' + nm + ' ' + ar).trim().substring(0, 200),
+                    type: el.getAttribute('type') || el.tagName.toLowerCase(),
+                });
+            }
+            return questions;
+        }
+    """
+    try:
+        return page.evaluate(js_extract) or []
+    except Exception:
+        return []
+
+
+def _build_survey_answers(questions: list) -> list:
+    """Build filled survey answers matching questions to profile defaults.
+
+    Returns list of answer strings (same order as questions). Never empty.
+    """
+    answers = []
+    for q in questions:
+        ctx = q.get("label", "").lower()
+        value = ""
+        for key, pattern in _FIELD_PATTERNS.items():
+            if pattern.search(ctx):
+                value = _SURVEY_DEFAULTS.get(key, "")
+                break
+        if not value:
+            # Email type fallback
+            if q.get("type", "").lower() == "email":
+                value = _SURVEY_DEFAULTS["email"]
+            else:
+                value = _GENERIC_ANSWER
+        answers.append(value)
+    # Guarantee non-empty
+    if not answers:
+        answers = [_GENERIC_ANSWER]
+    return answers
+
+
+def _resolve_group_id(page, slug: str) -> str:
+    """Try to resolve the Skool group UUID from page context.
+
+    Checks: (1) DOM data attributes, (2) page HTML for group ID patterns,
+    (3) __NEXT_DATA__ JSON. Returns group_id or empty string.
+    """
+    js_resolve = r"""
+        (slug) => {
+            // Check __NEXT_DATA__ for group id
+            try {
+                const nd = window.__NEXT_DATA__;
+                if (nd && nd.props && nd.props.pageProps) {
+                    const pp = nd.props.pageProps;
+                    if (pp.groupId) return pp.groupId;
+                    if (pp.group && pp.group.id) return pp.group.id;
+                }
+            } catch {}
+            // Check meta tags or data attributes
+            try {
+                const el = document.querySelector('[data-group-id]');
+                if (el) return el.getAttribute('data-group-id');
+            } catch {}
+            // Check for UUID pattern in body script tags
+            try {
+                const scripts = document.querySelectorAll('script');
+                for (const s of scripts) {
+                    const txt = s.textContent || '';
+                    const m = txt.match(/"groupId"\s*:\s*"([0-9a-f]{32})"/);
+                    if (m) return m[1];
+                }
+            } catch {}
+            return '';
+        }
+    """
+    try:
+        gid = page.evaluate(js_resolve, slug)
+        return gid if gid and len(gid) >= 20 else ""
+    except Exception:
+        return ""
+
+
+def _submit_survey_answers(page, slug: str, group_id: str, answers: list) -> dict:
+    """Submit survey answers via api2 (preferred) or www fallback.
+
+    Returns {"ok": bool, "endpoint": str, "answers_count": int}
+    """
+    payload_answers = answers if answers else [_GENERIC_ANSWER]
+
+    # Prefer api2 with group_id (matches standalone)
+    if group_id:
+        js_api2 = """
+            async (args) => {
+                try {
+                    const res = await fetch(
+                        'https://api2.skool.com/groups/' + encodeURIComponent(args.gid) + '/submit-survey-answers',
+                        { method: 'POST', credentials: 'include',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ answers: args.answers }) }
+                    );
+                    return { ok: res.ok, status: res.status };
+                } catch (e) {
+                    return { ok: false, status: 0, error: e.message };
+                }
+            }
+        """
+        try:
+            result = page.evaluate(js_api2, {"gid": group_id, "answers": payload_answers})
+            if result.get("ok"):
+                return {"ok": True, "endpoint": "api2", "answers_count": len(payload_answers)}
+        except Exception:
+            pass
+        # api2 failed — fall through to www
+
+    # Fallback: www endpoint with slug
+    js_www = """
+        async (args) => {
             try {
                 const res = await fetch(
-                    'https://www.skool.com/groups/' + encodeURIComponent(slug) + '/submit-survey-answers',
+                    'https://www.skool.com/groups/' + encodeURIComponent(args.slug) + '/submit-survey-answers',
                     { method: 'POST', credentials: 'include',
                       headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ answers: [] }) }
+                      body: JSON.stringify({ answers: args.answers }) }
                 );
                 return { ok: res.ok, status: res.status };
             } catch (e) {
-                return { ok: false, status: 0 };
+                return { ok: false, status: 0, error: e.message };
             }
         }
     """
     try:
-        result = page.evaluate(js_survey, slug)
-        return bool(result.get("ok"))
+        result = page.evaluate(js_www, {"slug": slug, "answers": payload_answers})
+        return {"ok": bool(result.get("ok")), "endpoint": "www", "answers_count": len(payload_answers)}
     except Exception:
-        return False
+        return {"ok": False, "endpoint": "www_error", "answers_count": len(payload_answers)}
 
 
 def _verify_membership_via_classroom(page, slug: str) -> dict:
@@ -600,6 +789,50 @@ def _verify_membership_via_classroom(page, slug: str) -> dict:
     # Default to JOINED: join-group returned 200, survey submitted OK
     return {"status": "JOINED",
             "detail": f"www_api_joined_survey_unverified slug={slug}"}
+
+
+def _cancel_join_via_api2(page, slug: str) -> dict:
+    """Cancel a pending join request via api2. Returns {ok, status}."""
+    js = """
+        async (slug) => {
+            try {
+                const res = await fetch(
+                    'https://api2.skool.com/groups/' + encodeURIComponent(slug) + '/cancel-join',
+                    { method: 'POST', credentials: 'include',
+                      headers: { 'Content-Type': 'application/json' } }
+                );
+                return { ok: res.ok, status: res.status };
+            } catch (e) {
+                return { ok: false, status: 0, error: e.message };
+            }
+        }
+    """
+    try:
+        return page.evaluate(js, slug)
+    except Exception as e:
+        return {"ok": False, "status": 0, "error": str(e)[:200]}
+
+
+def _leave_group_via_api2(page, slug: str) -> dict:
+    """Leave a joined group via api2. Returns {ok, status}."""
+    js = """
+        async (slug) => {
+            try {
+                const res = await fetch(
+                    'https://api2.skool.com/groups/' + encodeURIComponent(slug) + '/leave',
+                    { method: 'POST', credentials: 'include',
+                      headers: { 'Content-Type': 'application/json' } }
+                );
+                return { ok: res.ok, status: res.status };
+            } catch (e) {
+                return { ok: false, status: 0, error: e.message };
+            }
+        }
+    """
+    try:
+        return page.evaluate(js, slug)
+    except Exception as e:
+        return {"ok": False, "status": 0, "error": str(e)[:200]}
 
 
 def _classify_page_state(page) -> dict:
@@ -1492,6 +1725,150 @@ def create_joiner_router(get_db_func) -> APIRouter:
                 (job_id, limit),
             ).fetchall()
         return [_row_to_dict(r) for r in rows]
+
+    # ---- POST /joiner/jobs/{job_id}/items/{item_id}/cancel-join ----
+    @router.post("/jobs/{job_id}/items/{item_id}/cancel-join")
+    def cancel_join_item(job_id: str, item_id: str):
+        """Cancel a pending join request via api2.skool.com."""
+        from playwright.sync_api import sync_playwright
+
+        with get_db_func() as db:
+            item = db.execute(
+                "SELECT * FROM join_job_items WHERE id = ? AND job_id = ?",
+                (item_id, job_id),
+            ).fetchone()
+            if not item:
+                raise HTTPException(404, "item not found")
+            if item["status"] not in ("PENDING_APPROVAL",):
+                raise HTTPException(409, f"item status is {item['status']}, expected PENDING_APPROVAL")
+
+            profile_id = item["profile_id"]
+            slug = _extract_slug_from_key(item["community_key"])
+
+            profile_path = ACCOUNTS_DIR / profile_id / "browser"
+            if not profile_path.exists():
+                raise HTTPException(400, f"profile browser dir not found: {profile_id}")
+
+            # Look up proxy
+            proxy_str = None
+            row = db.execute("SELECT proxy FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+            if row:
+                proxy_str = row["proxy"]
+
+        pw = None
+        context = None
+        try:
+            pw = sync_playwright().start()
+            launch_kwargs: Dict[str, Any] = {
+                "user_data_dir": str(profile_path), "headless": True,
+                "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            }
+            proxy_cfg = _parse_proxy_for_joiner(proxy_str)
+            if proxy_cfg:
+                launch_kwargs["proxy"] = proxy_cfg
+            context = pw.chromium.launch_persistent_context(**launch_kwargs)
+            page = context.pages[0] if context.pages else context.new_page()
+            page.set_default_timeout(15000)
+            # Navigate to settings first (auth context needed)
+            page.goto("https://www.skool.com/settings?t=communities",
+                       timeout=15000, wait_until="domcontentloaded")
+            page.wait_for_timeout(1000)
+            result = _cancel_join_via_api2(page, slug)
+        except Exception as e:
+            return {"ok": False, "detail": f"playwright_error: {str(e)[:200]}"}
+        finally:
+            try:
+                if context: context.close()
+            except Exception: pass
+            try:
+                if pw: pw.stop()
+            except Exception: pass
+
+        now = _now_iso()
+        with get_db_func() as db:
+            if result.get("ok"):
+                db.execute("UPDATE join_job_items SET status = 'CANCELLED', updated_at = ? WHERE id = ?", (now, item_id))
+                _emit_event(db, job_id, "ITEM_CANCELLED", item_id=item_id, profile_id=profile_id,
+                           detail=f"cancel_join slug={slug} status={result.get('status', 0)}")
+                _update_job_counters(db, job_id)
+                db.commit()
+            else:
+                _emit_event(db, job_id, "ITEM_DEBUG", item_id=item_id, profile_id=profile_id,
+                           detail=f"cancel_join_failed slug={slug} status={result.get('status', 0)}")
+                db.commit()
+
+        return {"ok": result.get("ok", False), "status_code": result.get("status", 0), "slug": slug}
+
+    # ---- POST /joiner/jobs/{job_id}/items/{item_id}/leave ----
+    @router.post("/jobs/{job_id}/items/{item_id}/leave")
+    def leave_group_item(job_id: str, item_id: str):
+        """Leave a joined group via api2.skool.com."""
+        from playwright.sync_api import sync_playwright
+
+        with get_db_func() as db:
+            item = db.execute(
+                "SELECT * FROM join_job_items WHERE id = ? AND job_id = ?",
+                (item_id, job_id),
+            ).fetchone()
+            if not item:
+                raise HTTPException(404, "item not found")
+            if item["status"] not in ("JOINED", "ALREADY_MEMBER"):
+                raise HTTPException(409, f"item status is {item['status']}, expected JOINED or ALREADY_MEMBER")
+
+            profile_id = item["profile_id"]
+            slug = _extract_slug_from_key(item["community_key"])
+
+            profile_path = ACCOUNTS_DIR / profile_id / "browser"
+            if not profile_path.exists():
+                raise HTTPException(400, f"profile browser dir not found: {profile_id}")
+
+            proxy_str = None
+            row = db.execute("SELECT proxy FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+            if row:
+                proxy_str = row["proxy"]
+
+        pw = None
+        context = None
+        try:
+            pw = sync_playwright().start()
+            launch_kwargs: Dict[str, Any] = {
+                "user_data_dir": str(profile_path), "headless": True,
+                "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            }
+            proxy_cfg = _parse_proxy_for_joiner(proxy_str)
+            if proxy_cfg:
+                launch_kwargs["proxy"] = proxy_cfg
+            context = pw.chromium.launch_persistent_context(**launch_kwargs)
+            page = context.pages[0] if context.pages else context.new_page()
+            page.set_default_timeout(15000)
+            page.goto("https://www.skool.com/settings?t=communities",
+                       timeout=15000, wait_until="domcontentloaded")
+            page.wait_for_timeout(1000)
+            result = _leave_group_via_api2(page, slug)
+        except Exception as e:
+            return {"ok": False, "detail": f"playwright_error: {str(e)[:200]}"}
+        finally:
+            try:
+                if context: context.close()
+            except Exception: pass
+            try:
+                if pw: pw.stop()
+            except Exception: pass
+
+        now = _now_iso()
+        with get_db_func() as db:
+            if result.get("ok"):
+                db.execute("UPDATE join_job_items SET status = 'LEFT', updated_at = ? WHERE id = ?", (now, item_id))
+                _emit_event(db, job_id, "ITEM_LEFT", item_id=item_id, profile_id=profile_id,
+                           detail=f"leave_group slug={slug} status={result.get('status', 0)}")
+                _update_job_counters(db, job_id)
+                db.commit()
+            else:
+                _emit_event(db, job_id, "ITEM_DEBUG", item_id=item_id, profile_id=profile_id,
+                           detail=f"leave_failed slug={slug} status={result.get('status', 0)}")
+                db.commit()
+
+        return {"ok": result.get("ok", False), "status_code": result.get("status", 0), "slug": slug}
 
     # ---- GET /joiner/integrity ----
     @router.get("/integrity")

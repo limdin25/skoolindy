@@ -934,7 +934,7 @@ class TestJoinerModeRouting:
 
     def test_playwright_mode_calls_pw_fn(self, test_db_path):
         calls = []
-        def mock_pw_join(profile_id, community_url, community_key, db_path):
+        def mock_pw_join(profile_id, community_url, community_key, db_path, **kwargs):
             calls.append({"profile_id": profile_id, "url": community_url})
             return {"status": "JOINED", "detail": "mock joined"}
 
@@ -1645,3 +1645,299 @@ class TestPhase41CoreTableInvariant:
         after = self._snapshot(test_db_path)
         for table in self.CORE_TABLES + ["profiles"]:
             assert before[table] == after[table], f"core table {table} changed"
+
+
+# =========================================================================
+# PHASE 4.2: Forensic Capture Tests
+# =========================================================================
+
+from joiner import _sanitize_html_head, _capture_forensics, ARTIFACTS_DIR
+
+
+class TestSanitizeHtmlHead:
+    """Unit tests for _sanitize_html_head."""
+
+    def test_empty_string(self):
+        assert _sanitize_html_head("") == ""
+
+    def test_none_like_empty(self):
+        assert _sanitize_html_head("") == ""
+
+    def test_newlines_removed(self):
+        result = _sanitize_html_head("line1\nline2\nline3")
+        assert "\n" not in result
+        assert result == "line1 line2 line3"
+
+    def test_carriage_returns_removed(self):
+        result = _sanitize_html_head("line1\r\nline2")
+        assert "\r" not in result
+        assert "\n" not in result
+
+    def test_whitespace_collapsed(self):
+        result = _sanitize_html_head("hello    world   foo")
+        assert result == "hello world foo"
+
+    def test_truncation_at_5000(self):
+        long_str = "x" * 6000
+        result = _sanitize_html_head(long_str)
+        assert len(result) == 5000 + len("...[truncated]")
+        assert result.endswith("...[truncated]")
+
+    def test_custom_max_len(self):
+        result = _sanitize_html_head("hello world", max_len=5)
+        assert result == "hello...[truncated]"
+
+    def test_exact_max_len_no_truncation(self):
+        result = _sanitize_html_head("hello", max_len=5)
+        assert result == "hello"
+
+    def test_mixed_whitespace(self):
+        result = _sanitize_html_head("  \n  hello  \n  world  \n  ")
+        assert result == "hello world"
+
+
+class TestCaptureForensicsContract:
+    """Contract tests: _capture_forensics returns correct event structure with mocked page."""
+
+    def test_returns_three_events(self):
+        """Mock page, verify we get screenshot + html_head + debug events."""
+        import tempfile, os
+
+        class MockPage:
+            url = "https://www.skool.com/test-group"
+            def title(self):
+                return "Test Group"
+            def content(self):
+                return "<html><body>Join for Free</body></html>"
+            def screenshot(self, path=None):
+                # Write a dummy file
+                if path:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "wb") as f:
+                        f.write(b"FAKEPNG")
+            def query_selector(self, sel):
+                return None
+
+        page = MockPage()
+        events = _capture_forensics(page, "job-123", "item-456")
+
+        # Should have 3 events: screenshot, html artifact, debug
+        assert len(events) == 3
+
+        types = [e["type"] for e in events]
+        assert "ITEM_ARTIFACT" in types
+        assert "ITEM_DEBUG" in types
+
+        # Screenshot event
+        screenshot_ev = [e for e in events if e["detail"].startswith("screenshot=")][0]
+        assert "artifacts/joiner/job-123/item-456/" in screenshot_ev["detail"]
+        assert "_no_state.png" in screenshot_ev["detail"]
+
+        # HTML artifact event
+        html_ev = [e for e in events if "html_head=" in e["detail"]][0]
+        assert "url=https://www.skool.com/test-group" in html_ev["detail"]
+        assert "title=Test Group" in html_ev["detail"]
+        assert "html_head=" in html_ev["detail"]
+
+        # Debug event
+        debug_ev = [e for e in events if e["type"] == "ITEM_DEBUG"][0]
+        assert "url_after=" in debug_ev["detail"]
+        assert "join_btn_text=" in debug_ev["detail"]
+
+        # Cleanup: remove artifact file
+        import shutil
+        artifact_dir = ARTIFACTS_DIR / "job-123"
+        if artifact_dir.exists():
+            shutil.rmtree(artifact_dir)
+
+    def test_screenshot_file_created(self):
+        """Verify screenshot is actually written to disk."""
+        import os, shutil
+
+        class MockPage:
+            url = "https://www.skool.com/test"
+            def title(self):
+                return "T"
+            def content(self):
+                return "<html></html>"
+            def screenshot(self, path=None):
+                if path:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "wb") as f:
+                        f.write(b"PNG_BYTES")
+            def query_selector(self, sel):
+                return None
+
+        events = _capture_forensics(MockPage(), "job-sc", "item-sc")
+        screenshot_ev = [e for e in events if e["detail"].startswith("screenshot=")][0]
+        rel_path = screenshot_ev["detail"].split("screenshot=")[1]
+        # The file should exist relative to backend/
+        full_path = ARTIFACTS_DIR.parent.parent / rel_path
+        assert full_path.exists(), f"Screenshot not found at {full_path}"
+
+        # Cleanup
+        shutil.rmtree(ARTIFACTS_DIR / "job-sc", ignore_errors=True)
+
+    def test_html_truncated_in_event(self):
+        """HTML content > 5000 chars gets truncated in the event detail."""
+
+        class MockPage:
+            url = "https://www.skool.com/test"
+            def title(self):
+                return ""
+            def content(self):
+                return "A" * 8000
+            def screenshot(self, path=None):
+                import os
+                if path:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "wb") as f:
+                        f.write(b"X")
+            def query_selector(self, sel):
+                return None
+
+        events = _capture_forensics(MockPage(), "job-tr", "item-tr")
+        html_ev = [e for e in events if "html_head=" in e["detail"]][0]
+        # The html_head portion should end with truncated marker
+        assert "...[truncated]" in html_ev["detail"]
+
+        # Cleanup
+        import shutil
+        shutil.rmtree(ARTIFACTS_DIR / "job-tr", ignore_errors=True)
+
+    def test_page_errors_handled_gracefully(self):
+        """If page methods raise, _capture_forensics still returns partial events."""
+
+        class BrokenPage:
+            url = "https://broken"
+            def title(self):
+                raise RuntimeError("no title")
+            def content(self):
+                raise RuntimeError("no content")
+            def screenshot(self, path=None):
+                raise RuntimeError("no screenshot")
+            def query_selector(self, sel):
+                raise RuntimeError("no selector")
+
+        events = _capture_forensics(BrokenPage(), "job-br", "item-br")
+        # Should not crash, may return 0-3 events depending on which try blocks succeed
+        assert isinstance(events, list)
+
+
+class TestForensicEventsInWorkerTick:
+    """Contract: forensic events from pw_fn flow through to join_events table."""
+
+    def _tick_pw(self, db_path, pw_fn):
+        get_db = _get_db_factory(db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "playwright"
+        try:
+            return worker_tick(get_db, _playwright_join_fn=pw_fn)
+        finally:
+            worker_tick._force_enabled = False
+            worker_tick._force_mode = None
+
+    def test_forensic_events_emitted_on_no_state_change(self, test_db_path):
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def forensic_fn(*args, **kwargs):
+            return {
+                "status": "FAILED",
+                "detail": "join_click_no_state_change: join_button_found",
+                "forensic_events": [
+                    {"type": "ITEM_ARTIFACT", "detail": "screenshot=artifacts/joiner/j/i/ts_no_state.png"},
+                    {"type": "ITEM_ARTIFACT", "detail": "url=https://skool.com/test title=Test html_head=<html>"},
+                    {"type": "ITEM_DEBUG", "detail": "url_after=https://skool.com/test join_btn_text=Join"},
+                ],
+            }
+
+        self._tick_pw(test_db_path, forensic_fn)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        events = conn.execute(
+            "SELECT event_type, detail FROM join_events WHERE job_id = ? ORDER BY rowid",
+            (job_id,),
+        ).fetchall()
+        types = [e["event_type"] for e in events]
+
+        # Should have ITEM_ARTIFACT and ITEM_DEBUG events
+        assert types.count("ITEM_ARTIFACT") == 2
+        assert types.count("ITEM_DEBUG") == 1
+
+        # Verify artifact details
+        artifact_events = [e for e in events if e["event_type"] == "ITEM_ARTIFACT"]
+        assert any("screenshot=" in e["detail"] for e in artifact_events)
+        assert any("html_head=" in e["detail"] for e in artifact_events)
+
+        debug_events = [e for e in events if e["event_type"] == "ITEM_DEBUG"]
+        assert any("url_after=" in e["detail"] for e in debug_events)
+        conn.close()
+
+    def test_no_forensic_events_on_normal_failure(self, test_db_path):
+        """Non-forensic failures should NOT have ITEM_ARTIFACT events."""
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def normal_fail(*args, **kwargs):
+            return {"status": "FAILED", "detail": "navigation_timeout: timed out"}
+
+        self._tick_pw(test_db_path, normal_fail)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        events = conn.execute(
+            "SELECT event_type FROM join_events WHERE job_id = ?",
+            (job_id,),
+        ).fetchall()
+        types = [e["event_type"] for e in events]
+        assert "ITEM_ARTIFACT" not in types
+        assert "ITEM_DEBUG" not in types
+        conn.close()
+
+    def test_forensic_events_emitted_after_kill_switch(self, test_db_path):
+        """Forensic events are emitted AFTER kill switch check, so auth_session_invalid
+        triggers kill switch AND forensic events still appear in the event log."""
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def auth_fail_with_forensics(*args, **kwargs):
+            return {
+                "status": "FAILED",
+                "detail": "auth_session_invalid",
+                "forensic_events": [
+                    {"type": "ITEM_ARTIFACT", "detail": "screenshot=test.png"},
+                    {"type": "ITEM_DEBUG", "detail": "url_after=https://skool.com/login"},
+                ],
+            }
+
+        self._tick_pw(test_db_path, auth_fail_with_forensics)
+
+        # Kill switch triggered via auth_session_invalid
+        assert _worker_state.disabled is True
+        assert "auth_session_invalid" in (_worker_state.disable_reason or "")
+
+        # Forensic events still emitted (after kill switch)
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        events = conn.execute(
+            "SELECT event_type FROM join_events WHERE job_id = ? ORDER BY rowid",
+            (job_id,),
+        ).fetchall()
+        types = [e["event_type"] for e in events]
+        assert "WORKER_DISABLED" in types
+        assert "ITEM_ARTIFACT" in types
+        assert "ITEM_DEBUG" in types
+
+        # ITEM_ARTIFACT comes AFTER WORKER_DISABLED in rowid order
+        wd_idx = types.index("WORKER_DISABLED")
+        art_idx = types.index("ITEM_ARTIFACT")
+        assert art_idx > wd_idx, "Forensic events should be emitted after kill switch"
+
+        conn.close()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None

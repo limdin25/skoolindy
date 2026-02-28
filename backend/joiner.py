@@ -1,7 +1,7 @@
 """
-EngageFlow Community Joiner — Phase 2+3+4+4.1
+EngageFlow Community Joiner — Phase 2+3+4+4.1+4.2
 DB tables, API routes, normalization, event audit, background worker,
-Playwright join execution (canary), post-click verification (4.1).
+Playwright join execution (canary), post-click verification (4.1), forensic capture (4.2).
 No mutation of core tables. Self-contained Playwright — no imports from automation/.
 """
 from __future__ import annotations
@@ -38,6 +38,7 @@ ITEMS_PER_CYCLE = 1                         # canary safety: 1 item per tick
 MAX_ITEM_ATTEMPTS = 3                       # retry ceiling per item
 BACKOFF_DELAYS = [900, 3600, 21600]         # 15m, 60m, 6h in seconds
 ACCOUNTS_DIR = Path(__file__).parent / "skool_accounts"
+ARTIFACTS_DIR = Path(__file__).parent / "artifacts" / "joiner"
 
 # ---------------------------------------------------------------------------
 # URL Normalization
@@ -310,6 +311,85 @@ def _parse_proxy_for_joiner(proxy_str: Optional[str]) -> Optional[dict]:
     return None
 
 
+def _sanitize_html_head(raw: str, max_len: int = 5000) -> str:
+    """Sanitize HTML for forensic logging: remove newlines, collapse whitespace, truncate."""
+    if not raw:
+        return ""
+    # Remove newlines and carriage returns
+    s = raw.replace("\n", " ").replace("\r", " ")
+    # Collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    # Truncate
+    if len(s) > max_len:
+        s = s[:max_len] + "...[truncated]"
+    return s
+
+
+def _capture_forensics(page, job_id: str, item_id: str) -> list:
+    """Capture forensic artifacts when join_click_no_state_change occurs.
+
+    Returns list of event dicts: [{"type": str, "detail": str}, ...]
+    Saves screenshot to disk. Does NOT emit DB events (caller does that).
+    """
+    events = []
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+    # --- Screenshot ---
+    try:
+        artifact_dir = ARTIFACTS_DIR / job_id / item_id
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        screenshot_path = artifact_dir / f"{ts}_no_state.png"
+        page.screenshot(path=str(screenshot_path))
+        rel_path = f"artifacts/joiner/{job_id}/{item_id}/{ts}_no_state.png"
+        events.append({"type": "ITEM_ARTIFACT", "detail": f"screenshot={rel_path}"})
+        LOGGER.info("Forensic screenshot saved: %s", rel_path)
+    except Exception as e:
+        LOGGER.warning("Forensic screenshot failed: %s", str(e)[:200])
+
+    # --- HTML head + URL + title ---
+    try:
+        page_url = page.url
+        page_title = ""
+        try:
+            page_title = page.title() or ""
+        except Exception:
+            pass
+        html_raw = ""
+        try:
+            html_raw = page.content() or ""
+        except Exception:
+            pass
+        html_head = _sanitize_html_head(html_raw)
+        events.append({
+            "type": "ITEM_ARTIFACT",
+            "detail": f"url={page_url} title={page_title} html_head={html_head}",
+        })
+    except Exception as e:
+        LOGGER.warning("Forensic HTML capture failed: %s", str(e)[:200])
+
+    # --- Post-click URL + button text ---
+    try:
+        url_after = page.url
+        btn_text = ""
+        for sel in _JOIN_BUTTON_SELECTORS:
+            btn = page.query_selector(sel)
+            if btn:
+                try:
+                    if btn.is_visible():
+                        btn_text = (btn.text_content() or "").strip()[:100]
+                        break
+                except Exception:
+                    pass
+        events.append({
+            "type": "ITEM_DEBUG",
+            "detail": f"url_after={url_after} join_btn_text={btn_text}",
+        })
+    except Exception as e:
+        LOGGER.warning("Forensic debug capture failed: %s", str(e)[:200])
+
+    return events
+
+
 def _classify_page_state(page) -> dict:
     """Classify current page state into a deterministic result.
 
@@ -381,6 +461,9 @@ def _execute_playwright_join(
     community_url: str,
     community_key: str,
     db_path: str,
+    *,
+    job_id: str = "",
+    item_id: str = "",
 ) -> dict:
     """Execute real Playwright join for one community. Returns result dict.
 
@@ -524,9 +607,19 @@ def _execute_playwright_join(
             # JOIN_VISIBLE or UNKNOWN -- keep polling
             continue
 
-        # Polling exhausted
+        # Polling exhausted — capture forensics before returning
         final_detail = last_state["detail"] if last_state else "polling_timeout"
-        return {"status": "FAILED", "detail": f"join_click_no_state_change: {final_detail}"}
+        forensic_events = []
+        if job_id and item_id:
+            try:
+                forensic_events = _capture_forensics(page, job_id, item_id)
+            except Exception as fe:
+                LOGGER.warning("Forensic capture error: %s", str(fe)[:200])
+        return {
+            "status": "FAILED",
+            "detail": f"join_click_no_state_change: {final_detail}",
+            "forensic_events": forensic_events,
+        }
 
     except Exception as exc:
         return {"status": "FAILED", "detail": f"playwright_error: {str(exc)[:300]}"}
@@ -711,7 +804,7 @@ def worker_tick(get_db_func, *, _playwright_join_fn=None) -> dict:
                                detail=community_url_str(item))
                     db.commit()
 
-                    pw_result = pw_join_fn(profile_id, item["community_url"], item["community_key"], db_path)
+                    pw_result = pw_join_fn(profile_id, item["community_url"], item["community_key"], db_path, job_id=job_id, item_id=item_id)
                     pw_status = pw_result.get("status", "FAILED")
                     pw_detail = pw_result.get("detail", "")
 
@@ -738,7 +831,7 @@ def worker_tick(get_db_func, *, _playwright_join_fn=None) -> dict:
                         _emit_event(db, job_id, "ITEM_FAILED", item_id=item_id, profile_id=profile_id,
                                    detail=pw_detail)
 
-                        # Kill switch check
+                        # Kill switch check (before forensic events to preserve consecutive-fail detection)
                         kill_reason = _check_kill_switch(db, pw_detail)
                         if kill_reason:
                             _worker_state.disabled = True
@@ -746,6 +839,12 @@ def worker_tick(get_db_func, *, _playwright_join_fn=None) -> dict:
                             _emit_event(db, job_id, "WORKER_DISABLED", profile_id=profile_id,
                                        detail=kill_reason)
                             LOGGER.error("Joiner worker kill switch triggered: %s", kill_reason)
+
+                        # Emit forensic events if present (after kill switch check)
+                        for fe in pw_result.get("forensic_events", []):
+                            _emit_event(db, job_id, fe["type"], item_id=item_id, profile_id=profile_id,
+                                       detail=fe["detail"])
+
                     else:
                         # Success states: JOINED, ALREADY_MEMBER, PENDING_APPROVAL, SKIPPED_PAID
                         db.execute(

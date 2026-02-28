@@ -1,7 +1,7 @@
 """
-EngageFlow Community Joiner — Phase 2+3+4
+EngageFlow Community Joiner — Phase 2+3+4+4.1
 DB tables, API routes, normalization, event audit, background worker,
-Playwright join execution (canary).
+Playwright join execution (canary), post-click verification (4.1).
 No mutation of core tables. Self-contained Playwright — no imports from automation/.
 """
 from __future__ import annotations
@@ -269,6 +269,20 @@ _PENDING_SELECTORS = [
     'button:has-text("Cancel membership request")',
 ]
 
+# Member-area indicators (visible only when inside the community)
+_MEMBER_AREA_KEYWORDS = ["classroom", "calendar", "members", "leaderboard"]
+_MEMBER_AREA_SELECTORS = [
+    'a[href*="/classroom"]',
+    'a[href*="/calendar"]',
+    'a[href*="/members"]',
+    'a[href*="/leaderboard"]',
+    'div[class*="PostComposer"]',
+    'textarea[placeholder*="Write"]',
+]
+
+# Paid wall indicators (near join area)
+_PAID_INDICATORS = ["$", "pricing", "payment", "subscribe", "buy now", "upgrade"]
+
 
 def _parse_proxy_for_joiner(proxy_str: Optional[str]) -> Optional[dict]:
     """Parse proxy string to Playwright proxy config. Replicated from engine pattern."""
@@ -294,6 +308,72 @@ def _parse_proxy_for_joiner(proxy_str: Optional[str]) -> Optional[dict]:
     if len(parts) == 2:
         return {"server": f"http://{parts[0]}:{parts[1]}"}
     return None
+
+
+def _classify_page_state(page) -> dict:
+    """Classify current page state into a deterministic result.
+
+    Returns: {"state": str, "detail": str}
+      state: MEMBER | PENDING | PAID | JOIN_VISIBLE | AUTH_REQUIRED | BLOCKED | UNKNOWN
+    """
+    try:
+        page_text = (page.text_content("body") or "").lower()
+    except Exception:
+        page_text = ""
+
+    page_url = page.url.lower()
+
+    # 1. Auth check
+    if "/login" in page_url or page.query_selector("input#email"):
+        return {"state": "AUTH_REQUIRED", "detail": "auth_session_invalid"}
+
+    # 2. Block/captcha check
+    for kw in _BLOCK_KEYWORDS:
+        if kw in page_text:
+            return {"state": "BLOCKED", "detail": f"blocked_or_captcha: {kw}"}
+    if page.query_selector('iframe[src*="captcha"]'):
+        return {"state": "BLOCKED", "detail": "blocked_or_captcha: captcha_iframe"}
+
+    # 3. Auth markers
+    has_auth = any(page.query_selector(sel) for sel in _AUTH_SELECTORS)
+
+    # 4. Membership pending
+    is_pending = (
+        ("membership pending" in page_text)
+        or any(page.query_selector(sel) for sel in _PENDING_SELECTORS)
+    )
+    if is_pending:
+        return {"state": "PENDING", "detail": "membership_pending_detected"}
+
+    # 5. Member area indicators (Classroom, Calendar, Members, Leaderboard, post composer)
+    member_signals = sum(1 for kw in _MEMBER_AREA_KEYWORDS if kw in page_text)
+    member_selectors = sum(1 for sel in _MEMBER_AREA_SELECTORS if page.query_selector(sel))
+    is_member_area = member_signals >= 2 or member_selectors >= 2
+
+    # 6. Join button visible?
+    join_btn = None
+    for sel in _JOIN_BUTTON_SELECTORS:
+        btn = page.query_selector(sel)
+        if btn and btn.is_visible():
+            join_btn = btn
+            break
+
+    # 7. Already a member: auth markers + member area signals + no join button
+    if (has_auth or is_member_area) and join_btn is None:
+        return {"state": "MEMBER", "detail": "member_ui_detected"}
+
+    # 8. Paid wall: no join button, no auth, pricing text
+    if join_btn is None and not has_auth and not is_member_area:
+        for indicator in _PAID_INDICATORS:
+            if indicator in page_text:
+                return {"state": "PAID", "detail": f"paid_wall_detected: {indicator}"}
+
+    # 9. Join button visible
+    if join_btn is not None:
+        return {"state": "JOIN_VISIBLE", "detail": "join_button_found"}
+
+    # 10. Fallback
+    return {"state": "UNKNOWN", "detail": "unknown_page_state"}
 
 
 def _execute_playwright_join(
@@ -359,94 +439,94 @@ def _execute_playwright_join(
         except Exception as nav_err:
             return {"status": "FAILED", "detail": f"navigation_timeout: {str(nav_err)[:200]}"}
 
-        page_text = ""
-        try:
-            page_text = (page.text_content("body") or "").lower()
-        except Exception:
-            pass
+        # --- Use classifier for initial state detection ---
+        pre_state = _classify_page_state(page)
+        LOGGER.debug("Pre-click classify: %s", pre_state)
 
-        page_url = page.url.lower()
+        state = pre_state["state"]
+        detail = pre_state["detail"]
 
-        # 1. Auth check — redirected to login?
-        if "/login" in page_url or page.query_selector("input#email"):
-            return {"status": "FAILED", "detail": "auth_session_invalid"}
+        if state == "AUTH_REQUIRED":
+            return {"status": "FAILED", "detail": detail}
+        if state == "BLOCKED":
+            return {"status": "FAILED", "detail": detail}
+        if state == "PENDING":
+            return {"status": "PENDING_APPROVAL", "detail": detail}
+        if state == "MEMBER":
+            return {"status": "ALREADY_MEMBER", "detail": detail}
+        if state == "PAID":
+            return {"status": "SKIPPED_PAID", "detail": detail}
+        if state == "UNKNOWN":
+            return {"status": "FAILED", "detail": detail}
 
-        # 2. Block/captcha check
-        for kw in _BLOCK_KEYWORDS:
-            if kw in page_text:
-                return {"status": "FAILED", "detail": f"blocked_or_captcha: {kw}"}
-        if page.query_selector('iframe[src*="captcha"]'):
-            return {"status": "FAILED", "detail": "blocked_or_captcha: captcha_iframe"}
-
-        # 3. Check if already a member (auth markers present + no join button)
-        has_auth = any(page.query_selector(sel) for sel in _AUTH_SELECTORS)
-        has_join_button = None
+        # --- JOIN_VISIBLE: click with robustness ---
+        join_btn = None
         for sel in _JOIN_BUTTON_SELECTORS:
             btn = page.query_selector(sel)
             if btn and btn.is_visible():
-                has_join_button = btn
+                join_btn = btn
                 break
 
-        # 4. Membership pending
-        is_pending = (
-            ("membership pending" in page_text)
-            or any(page.query_selector(sel) for sel in _PENDING_SELECTORS)
-        )
-        if is_pending:
-            return {"status": "PENDING_APPROVAL", "detail": "membership_pending_detected"}
+        if join_btn is None:
+            return {"status": "FAILED", "detail": "join_button_lost_before_click"}
 
-        # 5. Paid group detection
-        if has_join_button is None and not has_auth:
-            # Check for pricing indicators near the page
-            paid_indicators = ["$", "pricing", "payment", "subscribe", "buy now", "upgrade"]
-            for indicator in paid_indicators:
-                if indicator in page_text:
-                    return {"status": "SKIPPED_PAID", "detail": f"paid_wall_detected: {indicator}"}
-
-        # 6. Already a member (has auth markers, no join button, not pending)
-        if has_auth and has_join_button is None:
-            return {"status": "ALREADY_MEMBER", "detail": "member_ui_detected"}
-
-        # 7. Join button visible — click it
-        if has_join_button is not None:
+        click_success = False
+        for click_attempt in range(1, 3):  # max 2 attempts
             try:
-                has_join_button.click()
-                page.wait_for_timeout(5000)  # wait for join to process
+                # Scroll into view
+                join_btn.scroll_into_view_if_needed()
+                page.wait_for_timeout(300)
+
+                if click_attempt == 1:
+                    join_btn.click()
+                else:
+                    # Force click fallback on retry
+                    join_btn.click(force=True)
+
+                click_success = True
+                break
             except Exception as click_err:
-                return {"status": "FAILED", "detail": f"join_click_failed: {str(click_err)[:200]}"}
+                LOGGER.warning("Join click attempt %d failed: %s", click_attempt, str(click_err)[:200])
+                if click_attempt >= 2:
+                    return {"status": "FAILED", "detail": f"join_click_failed: {str(click_err)[:200]}"}
+                # Re-find the button for retry
+                join_btn = None
+                for sel in _JOIN_BUTTON_SELECTORS:
+                    btn = page.query_selector(sel)
+                    if btn and btn.is_visible():
+                        join_btn = btn
+                        break
+                if join_btn is None:
+                    return {"status": "FAILED", "detail": "join_button_lost_during_retry"}
 
-            # Re-detect state after click
-            post_page_text = ""
-            try:
-                post_page_text = (page.text_content("body") or "").lower()
-            except Exception:
-                pass
+        if not click_success:
+            return {"status": "FAILED", "detail": "join_click_failed_all_attempts"}
 
-            # Check if now pending approval
-            post_pending = (
-                ("membership pending" in post_page_text)
-                or any(page.query_selector(sel) for sel in _PENDING_SELECTORS)
-            )
-            if post_pending:
-                return {"status": "PENDING_APPROVAL", "detail": "pending_after_join_click"}
+        # --- Post-click: 15s polling loop (500ms intervals) ---
+        poll_end = time.time() + 15
+        last_state = None
+        while time.time() < poll_end:
+            page.wait_for_timeout(500)
+            post_state = _classify_page_state(page)
+            last_state = post_state
 
-            # Check if now a member (auth markers should still be present, join button gone)
-            post_join_btn = None
-            for sel in _JOIN_BUTTON_SELECTORS:
-                btn = page.query_selector(sel)
-                if btn and btn.is_visible():
-                    post_join_btn = btn
-                    break
-
-            if post_join_btn is None:
-                # Join button gone = likely joined successfully
+            s = post_state["state"]
+            if s == "MEMBER":
                 return {"status": "JOINED", "detail": f"joined {community_key}"}
+            if s == "PENDING":
+                return {"status": "PENDING_APPROVAL", "detail": "pending_after_join_click"}
+            if s == "PAID":
+                return {"status": "SKIPPED_PAID", "detail": "paid_wall_after_join_click"}
+            if s == "AUTH_REQUIRED":
+                return {"status": "FAILED", "detail": "auth_lost_after_click"}
+            if s == "BLOCKED":
+                return {"status": "FAILED", "detail": post_state["detail"]}
+            # JOIN_VISIBLE or UNKNOWN -- keep polling
+            continue
 
-            # Join button still visible — something didn't work
-            return {"status": "FAILED", "detail": "join_button_still_visible_after_click"}
-
-        # 8. No join button, no auth, not paid — unknown state
-        return {"status": "FAILED", "detail": "unknown_page_state"}
+        # Polling exhausted
+        final_detail = last_state["detail"] if last_state else "polling_timeout"
+        return {"status": "FAILED", "detail": f"join_click_no_state_change: {final_detail}"}
 
     except Exception as exc:
         return {"status": "FAILED", "detail": f"playwright_error: {str(exc)[:300]}"}

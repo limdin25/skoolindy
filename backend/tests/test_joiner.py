@@ -1352,3 +1352,296 @@ class TestProxyParser:
         assert _parse_proxy_for_joiner(None) is None
         assert _parse_proxy_for_joiner("") is None
         assert _parse_proxy_for_joiner("  ") is None
+
+
+# =========================================================================
+# PHASE 4.1: Classifier + Click Verification Tests
+# =========================================================================
+
+from joiner import (
+    _classify_page_state,
+    _MEMBER_AREA_KEYWORDS,
+    _MEMBER_AREA_SELECTORS,
+    _PAID_INDICATORS,
+    _BLOCK_KEYWORDS,
+    _AUTH_SELECTORS,
+    _JOIN_BUTTON_SELECTORS,
+    _PENDING_SELECTORS,
+)
+
+
+class _MockElement:
+    """Minimal mock for a Playwright element."""
+    def __init__(self, visible=True):
+        self._visible = visible
+    def is_visible(self):
+        return self._visible
+
+
+class _MockPage:
+    """Minimal mock for a Playwright page with configurable state."""
+    def __init__(
+        self,
+        url="https://www.skool.com/test-group",
+        body_text="",
+        selectors=None,
+    ):
+        self._url = url
+        self._body_text = body_text
+        # selectors: dict mapping CSS selector -> MockElement or None
+        self._selectors = selectors or {}
+
+    @property
+    def url(self):
+        return self._url
+
+    def text_content(self, selector):
+        if selector == "body":
+            return self._body_text
+        return ""
+
+    def query_selector(self, selector):
+        return self._selectors.get(selector)
+
+
+class TestClassifyPageState:
+    """Unit tests for _classify_page_state classifier."""
+
+    def test_auth_required_login_url(self):
+        page = _MockPage(url="https://www.skool.com/login?redirect=/test")
+        result = _classify_page_state(page)
+        assert result["state"] == "AUTH_REQUIRED"
+        assert "auth_session_invalid" in result["detail"]
+
+    def test_auth_required_email_input(self):
+        page = _MockPage(
+            selectors={"input#email": _MockElement()}
+        )
+        result = _classify_page_state(page)
+        assert result["state"] == "AUTH_REQUIRED"
+
+    def test_blocked_keyword(self):
+        page = _MockPage(body_text="Your account has been temporarily blocked for unusual activity")
+        result = _classify_page_state(page)
+        assert result["state"] == "BLOCKED"
+        assert "temporarily blocked" in result["detail"]
+
+    def test_blocked_captcha_iframe(self):
+        page = _MockPage(
+            selectors={'iframe[src*="captcha"]': _MockElement()}
+        )
+        result = _classify_page_state(page)
+        assert result["state"] == "BLOCKED"
+        assert "captcha" in result["detail"]
+
+    def test_pending_text(self):
+        page = _MockPage(body_text="Your membership pending approval by admins")
+        result = _classify_page_state(page)
+        assert result["state"] == "PENDING"
+
+    def test_pending_selector(self):
+        page = _MockPage(
+            selectors={'button:has-text("Cancel membership request")': _MockElement()}
+        )
+        result = _classify_page_state(page)
+        assert result["state"] == "PENDING"
+
+    def test_member_via_auth_markers(self):
+        # Has auth markers (TopNav) but no join button = member
+        page = _MockPage(
+            selectors={'div[class*="TopNav"]': _MockElement()}
+        )
+        result = _classify_page_state(page)
+        assert result["state"] == "MEMBER"
+
+    def test_member_via_area_keywords(self):
+        # Has 2+ member area keywords = member (even without auth selectors)
+        page = _MockPage(body_text="classroom calendar members leaderboard")
+        result = _classify_page_state(page)
+        assert result["state"] == "MEMBER"
+
+    def test_member_via_area_selectors(self):
+        page = _MockPage(
+            selectors={
+                'a[href*="/classroom"]': _MockElement(),
+                'a[href*="/calendar"]': _MockElement(),
+            }
+        )
+        result = _classify_page_state(page)
+        assert result["state"] == "MEMBER"
+
+    def test_join_visible(self):
+        page = _MockPage(
+            selectors={'button:has-text("Join for Free")': _MockElement(visible=True)}
+        )
+        result = _classify_page_state(page)
+        assert result["state"] == "JOIN_VISIBLE"
+
+    def test_join_invisible_not_counted(self):
+        page = _MockPage(
+            selectors={'button:has-text("Join for Free")': _MockElement(visible=False)}
+        )
+        result = _classify_page_state(page)
+        # Invisible join button should not be detected
+        assert result["state"] != "JOIN_VISIBLE"
+
+    def test_paid_wall(self):
+        page = _MockPage(body_text="Join this community for $49/month pricing plan")
+        result = _classify_page_state(page)
+        assert result["state"] == "PAID"
+        assert "paid_wall" in result["detail"]
+
+    def test_unknown_fallback(self):
+        # Empty page with nothing detectable
+        page = _MockPage(body_text="some random content without indicators")
+        result = _classify_page_state(page)
+        assert result["state"] == "UNKNOWN"
+
+    def test_auth_takes_precedence_over_join_button(self):
+        # Login page that also happens to have a join button text
+        page = _MockPage(
+            url="https://www.skool.com/login",
+            selectors={'button:has-text("Join")': _MockElement(visible=True)},
+        )
+        result = _classify_page_state(page)
+        assert result["state"] == "AUTH_REQUIRED"
+
+    def test_pending_takes_precedence_over_member(self):
+        # Page with both pending and auth markers
+        page = _MockPage(
+            body_text="membership pending",
+            selectors={'div[class*="TopNav"]': _MockElement()},
+        )
+        result = _classify_page_state(page)
+        assert result["state"] == "PENDING"
+
+    def test_member_with_single_keyword_not_enough(self):
+        # Only 1 keyword, no auth markers, no selectors = not MEMBER
+        page = _MockPage(body_text="classroom only one keyword")
+        result = _classify_page_state(page)
+        assert result["state"] != "MEMBER"
+
+
+class TestClickVerificationIntegration:
+    """Integration tests: Playwright mock fn returns results that map correctly through worker_tick."""
+
+    def _tick_pw(self, db_path, pw_fn):
+        get_db = _get_db_factory(db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "playwright"
+        try:
+            return worker_tick(get_db, _playwright_join_fn=pw_fn)
+        finally:
+            worker_tick._force_enabled = False
+            worker_tick._force_mode = None
+
+    def test_join_click_no_state_change_maps_to_failed(self, test_db_path):
+        """When pw fn returns FAILED with join_click_no_state_change, item is retryable PENDING."""
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def no_change_fn(*args, **kwargs):
+            return {"status": "FAILED", "detail": "join_click_no_state_change: join_button_found"}
+
+        self._tick_pw(test_db_path, no_change_fn)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT * FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        assert item["status"] == "PENDING"  # retryable
+        assert "join_click_no_state_change" in (item["fail_reason"] or "")
+        assert item["next_attempt_at"] is not None
+        conn.close()
+
+    def test_join_click_failed_maps_correctly(self, test_db_path):
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def click_fail_fn(*args, **kwargs):
+            return {"status": "FAILED", "detail": "join_click_failed: element not interactable"}
+
+        self._tick_pw(test_db_path, click_fail_fn)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT * FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        assert item["status"] == "PENDING"
+        assert "join_click_failed" in (item["fail_reason"] or "")
+        conn.close()
+
+    def test_auth_lost_after_click_triggers_kill_switch(self, test_db_path):
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def auth_lost_fn(*args, **kwargs):
+            return {"status": "FAILED", "detail": "auth_session_invalid"}
+
+        self._tick_pw(test_db_path, auth_lost_fn)
+        assert _worker_state.disabled is True
+        assert "auth_session_invalid" in (_worker_state.disable_reason or "")
+
+        # Reset
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+    def test_paid_wall_after_click_skipped(self, test_db_path):
+        _worker_state.disabled = False
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def paid_fn(*args, **kwargs):
+            return {"status": "SKIPPED_PAID", "detail": "paid_wall_after_join_click"}
+
+        self._tick_pw(test_db_path, paid_fn)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT * FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        assert item["status"] == "SKIPPED_PAID"
+        conn.close()
+
+
+class TestPhase41CoreTableInvariant:
+    """Phase 4.1 changes do NOT affect core tables."""
+
+    CORE_TABLES = ["communities", "scheduler_queue", "community_messages"]
+
+    def _ensure_core_tables(self, db_path):
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        conn.execute("CREATE TABLE IF NOT EXISTS communities (id TEXT PRIMARY KEY, name TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS scheduler_queue (id TEXT PRIMARY KEY, profile_id TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS community_messages (id TEXT PRIMARY KEY, body TEXT)")
+        conn.commit()
+        conn.close()
+
+    def _snapshot(self, db_path):
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        result = {}
+        for t in self.CORE_TABLES + ["profiles"]:
+            result[t] = conn.execute(f"SELECT COUNT(*) as c FROM {t}").fetchone()[0]
+        conn.close()
+        return result
+
+    def test_phase41_no_core_writes(self, test_db_path):
+        _worker_state.disabled = False
+        self._ensure_core_tables(test_db_path)
+        _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+        before = self._snapshot(test_db_path)
+
+        def mock_join(*args, **kwargs):
+            return {"status": "JOINED", "detail": "mock"}
+
+        get_db = _get_db_factory(test_db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "playwright"
+        try:
+            worker_tick(get_db, _playwright_join_fn=mock_join)
+        finally:
+            worker_tick._force_enabled = False
+            worker_tick._force_mode = None
+
+        after = self._snapshot(test_db_path)
+        for table in self.CORE_TABLES + ["profiles"]:
+            assert before[table] == after[table], f"core table {table} changed"

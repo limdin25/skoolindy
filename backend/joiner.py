@@ -1,7 +1,7 @@
 """
-EngageFlow Community Joiner — Phase 2+3+4+4.1+4.2
+EngageFlow Community Joiner — Phase 2+3+4+4.1+4.2+4.3a
 DB tables, API routes, normalization, event audit, background worker,
-Playwright join execution (canary), post-click verification (4.1), forensic capture (4.2).
+Playwright join execution (canary), post-click verification (4.1), forensic capture (4.2), WAF detection (4.3a).
 No mutation of core tables. Self-contained Playwright — no imports from automation/.
 """
 from __future__ import annotations
@@ -248,6 +248,15 @@ _BLOCK_KEYWORDS = [
     "unusual activity", "verify you are human",
 ]
 
+# AWS WAF / bot challenge markers
+_WAF_URL_MARKERS = ["challenge"]
+_WAF_HTML_MARKERS = ["edge.sdk.awswaf.com", "challenge.js"]
+_WAF_TITLE_MARKERS = ["attention required", "request blocked"]
+
+# Per-profile cooldown: blocked_profiles[profile_id] = timestamp (6h TTL)
+PROFILE_BLOCK_COOLDOWN_SECONDS = 6 * 3600  # 6 hours
+_blocked_profiles: Dict[str, float] = {}
+
 # Auth markers — presence indicates logged-in state
 _AUTH_SELECTORS = [
     'button[class*="ChatNotificationsIconButton"]',
@@ -414,6 +423,27 @@ def _classify_page_state(page) -> dict:
     if page.query_selector('iframe[src*="captcha"]'):
         return {"state": "BLOCKED", "detail": "blocked_or_captcha: captcha_iframe"}
 
+    # 2b. AWS WAF / bot challenge detection
+    for marker in _WAF_URL_MARKERS:
+        if marker in page_url:
+            return {"state": "BLOCKED", "detail": "aws_waf_challenge"}
+    try:
+        html_src = page.content() or ""
+    except Exception:
+        html_src = ""
+    html_src_lower = html_src.lower()
+    for marker in _WAF_HTML_MARKERS:
+        if marker in html_src_lower:
+            return {"state": "BLOCKED", "detail": "aws_waf_challenge"}
+    page_title = ""
+    try:
+        page_title = (page.title() or "").lower()
+    except Exception:
+        pass
+    for marker in _WAF_TITLE_MARKERS:
+        if marker in page_title or marker in page_text:
+            return {"state": "BLOCKED", "detail": "aws_waf_challenge"}
+
     # 3. Auth markers
     has_auth = any(page.query_selector(sel) for sel in _AUTH_SELECTORS)
 
@@ -532,7 +562,15 @@ def _execute_playwright_join(
         if state == "AUTH_REQUIRED":
             return {"status": "FAILED", "detail": detail}
         if state == "BLOCKED":
-            return {"status": "FAILED", "detail": detail}
+            # Capture forensics for blocked pages (WAF, captcha, etc.)
+            forensic_events = []
+            if job_id and item_id:
+                try:
+                    forensic_events = _capture_forensics(page, job_id, item_id)
+                except Exception as fe:
+                    LOGGER.warning("Forensic capture on BLOCKED: %s", str(fe)[:200])
+            return {"status": "FAILED", "detail": detail, "blocked_terminal": True,
+                    "forensic_events": forensic_events}
         if state == "PENDING":
             return {"status": "PENDING_APPROVAL", "detail": detail}
         if state == "MEMBER":
@@ -639,6 +677,22 @@ def _execute_playwright_join(
 # ---------------------------------------------------------------------------
 # Rate limiting helpers (Phase 4 — canary limits)
 # ---------------------------------------------------------------------------
+
+def _is_profile_blocked(profile_id: str) -> bool:
+    """Check if profile is in WAF/block cooldown (6h in-memory TTL)."""
+    blocked_ts = _blocked_profiles.get(profile_id)
+    if blocked_ts is None:
+        return False
+    if time.time() - blocked_ts > PROFILE_BLOCK_COOLDOWN_SECONDS:
+        del _blocked_profiles[profile_id]
+        return False
+    return True
+
+
+def _set_profile_blocked(profile_id: str) -> None:
+    """Mark profile as blocked with current timestamp."""
+    _blocked_profiles[profile_id] = time.time()
+
 
 def _get_rate_limited_profile(db: sqlite3.Connection, job_id: str) -> Optional[str]:
     """Pick a profile that hasn't exceeded hourly rate limit.
@@ -771,6 +825,14 @@ def worker_tick(get_db_func, *, _playwright_join_fn=None) -> dict:
                     result["skipped_rate_limit"] = True
                     continue
 
+                # Per-profile blocked cooldown check
+                if _is_profile_blocked(profile_id):
+                    _emit_event(db, job_id, "ITEM_SKIPPED", profile_id=profile_id,
+                               detail="profile_blocked_cooldown")
+                    db.commit()
+                    result["skipped_rate_limit"] = True
+                    continue
+
                 # Pick one PENDING item for this profile (respecting backoff)
                 now_iso = _now_iso()
                 item = db.execute(
@@ -815,19 +877,32 @@ def worker_tick(get_db_func, *, _playwright_join_fn=None) -> dict:
                     new_attempt_count = item["attempt_count"] + 1
 
                     if pw_status == "FAILED":
-                        next_at = _compute_next_attempt_at(new_attempt_count)
-                        db.execute(
-                            "UPDATE join_job_items SET status = 'FAILED', attempt_count = ?, "
-                            "last_attempt_at = ?, fail_reason = ?, next_attempt_at = ?, updated_at = ? "
-                            "WHERE id = ?",
-                            (new_attempt_count, now, pw_detail, next_at, now, item_id),
-                        )
-                        # If retryable, set back to PENDING for next attempt
-                        if next_at is not None:
+                        is_terminal_block = pw_result.get("blocked_terminal", False)
+                        if is_terminal_block:
+                            # Terminal block (WAF/captcha): no retries
                             db.execute(
-                                "UPDATE join_job_items SET status = 'PENDING' WHERE id = ? AND attempt_count < ?",
-                                (item_id, MAX_ITEM_ATTEMPTS),
+                                "UPDATE join_job_items SET status = 'FAILED', attempt_count = ?, "
+                                "last_attempt_at = ?, fail_reason = ?, next_attempt_at = NULL, updated_at = ? "
+                                "WHERE id = ?",
+                                (new_attempt_count, now, pw_detail, now, item_id),
                             )
+                            # Set per-profile cooldown (6h)
+                            _set_profile_blocked(profile_id)
+                            LOGGER.warning("Profile %s blocked (WAF/captcha), cooldown 6h", profile_id)
+                        else:
+                            next_at = _compute_next_attempt_at(new_attempt_count)
+                            db.execute(
+                                "UPDATE join_job_items SET status = 'FAILED', attempt_count = ?, "
+                                "last_attempt_at = ?, fail_reason = ?, next_attempt_at = ?, updated_at = ? "
+                                "WHERE id = ?",
+                                (new_attempt_count, now, pw_detail, next_at, now, item_id),
+                            )
+                            # If retryable, set back to PENDING for next attempt
+                            if next_at is not None:
+                                db.execute(
+                                    "UPDATE join_job_items SET status = 'PENDING' WHERE id = ? AND attempt_count < ?",
+                                    (item_id, MAX_ITEM_ATTEMPTS),
+                                )
                         _emit_event(db, job_id, "ITEM_FAILED", item_id=item_id, profile_id=profile_id,
                                    detail=pw_detail)
 

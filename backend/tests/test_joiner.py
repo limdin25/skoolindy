@@ -1941,3 +1941,276 @@ class TestForensicEventsInWorkerTick:
         conn.close()
         _worker_state.disabled = False
         _worker_state.disable_reason = None
+
+
+# =========================================================================
+# PHASE 4.3a: WAF / Bot Challenge Detection Tests
+# =========================================================================
+
+from joiner import (
+    _is_profile_blocked,
+    _set_profile_blocked,
+    _blocked_profiles,
+    _WAF_URL_MARKERS,
+    _WAF_HTML_MARKERS,
+    _WAF_TITLE_MARKERS,
+    PROFILE_BLOCK_COOLDOWN_SECONDS,
+)
+
+
+class TestClassifyWAFDetection:
+    """Unit tests: classifier detects AWS WAF challenge markers."""
+
+    def test_waf_url_challenge(self):
+        """URL containing 'challenge' triggers WAF detection."""
+        page = _MockPage(url="https://www.skool.com/challenge?token=abc123")
+        result = _classify_page_state(page)
+        assert result["state"] == "BLOCKED"
+        assert result["detail"] == "aws_waf_challenge"
+
+    def test_waf_html_awswaf_sdk(self):
+        """HTML containing edge.sdk.awswaf.com triggers WAF detection."""
+        page = _MockPage(
+            body_text="loading security check",
+            selectors={},
+        )
+        # _MockPage.text_content returns body_text but classifier also calls page.content()
+        # We need a page that returns WAF HTML from content()
+        class WAFPage(_MockPage):
+            def content(self):
+                return '<html><head><script src="https://edge.sdk.awswaf.com/captcha.js"></script></head><body>Please wait</body></html>'
+        page = WAFPage(body_text="please wait")
+        result = _classify_page_state(page)
+        assert result["state"] == "BLOCKED"
+        assert result["detail"] == "aws_waf_challenge"
+
+    def test_waf_html_challenge_js(self):
+        """HTML containing challenge.js triggers WAF detection."""
+        class ChallengeJSPage(_MockPage):
+            def content(self):
+                return '<html><script src="/challenge.js"></script></html>'
+        page = ChallengeJSPage(body_text="verifying")
+        result = _classify_page_state(page)
+        assert result["state"] == "BLOCKED"
+        assert result["detail"] == "aws_waf_challenge"
+
+    def test_waf_title_attention_required(self):
+        """Title 'Attention Required' triggers WAF detection."""
+        class AttentionPage(_MockPage):
+            def title(self):
+                return "Attention Required | Cloudflare"
+            def content(self):
+                return "<html></html>"
+        page = AttentionPage(body_text="checking your browser")
+        result = _classify_page_state(page)
+        assert result["state"] == "BLOCKED"
+        assert result["detail"] == "aws_waf_challenge"
+
+    def test_waf_body_request_blocked(self):
+        """Body containing 'request blocked' triggers WAF detection."""
+        class BlockedBodyPage(_MockPage):
+            def content(self):
+                return "<html></html>"
+            def title(self):
+                return ""
+        page = BlockedBodyPage(body_text="your request blocked by security policy")
+        result = _classify_page_state(page)
+        assert result["state"] == "BLOCKED"
+        assert result["detail"] == "aws_waf_challenge"
+
+    def test_normal_page_not_waf(self):
+        """Normal Skool page should NOT trigger WAF detection."""
+        class NormalPage(_MockPage):
+            def content(self):
+                return "<html><body>Welcome to my group</body></html>"
+            def title(self):
+                return "My Awesome Group"
+        page = NormalPage(
+            body_text="welcome to my group classroom calendar members leaderboard",
+            selectors={'div[class*="TopNav"]': _MockElement()},
+        )
+        result = _classify_page_state(page)
+        assert result["state"] != "BLOCKED"
+
+    def test_existing_block_keywords_still_work(self):
+        """Original block keywords (account suspended, etc.) still detected."""
+        page = _MockPage(body_text="your account suspended for violating terms")
+        result = _classify_page_state(page)
+        assert result["state"] == "BLOCKED"
+        assert "account suspended" in result["detail"]
+
+    def test_waf_takes_precedence_over_join_button(self):
+        """WAF challenge page with join button text should still be BLOCKED."""
+        class WAFWithJoinPage(_MockPage):
+            def content(self):
+                return '<html><script src="https://edge.sdk.awswaf.com/token.js"></script></html>'
+            def title(self):
+                return ""
+        page = WAFWithJoinPage(
+            body_text="join for free",
+            selectors={'button:has-text("Join for Free")': _MockElement(visible=True)},
+        )
+        result = _classify_page_state(page)
+        assert result["state"] == "BLOCKED"
+
+
+class TestProfileBlockedCooldown:
+    """Unit tests: per-profile blocked cooldown."""
+
+    def setup_method(self):
+        _blocked_profiles.clear()
+
+    def test_not_blocked_by_default(self):
+        assert _is_profile_blocked("p-fresh") is False
+
+    def test_blocked_after_set(self):
+        _set_profile_blocked("p-block")
+        assert _is_profile_blocked("p-block") is True
+
+    def test_other_profile_not_affected(self):
+        _set_profile_blocked("p-block")
+        assert _is_profile_blocked("p-other") is False
+
+    def test_expired_cooldown_clears(self):
+        _blocked_profiles["p-old"] = time.time() - PROFILE_BLOCK_COOLDOWN_SECONDS - 1
+        assert _is_profile_blocked("p-old") is False
+        assert "p-old" not in _blocked_profiles  # cleaned up
+
+    def teardown_method(self):
+        _blocked_profiles.clear()
+
+
+class TestWAFBlockTerminal:
+    """Integration: WAF block -> terminal FAILED, no retries, per-profile cooldown."""
+
+    def _tick_pw(self, db_path, pw_fn):
+        get_db = _get_db_factory(db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "playwright"
+        try:
+            return worker_tick(get_db, _playwright_join_fn=pw_fn)
+        finally:
+            worker_tick._force_enabled = False
+            worker_tick._force_mode = None
+
+    def setup_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+    def test_waf_block_makes_item_terminal(self, test_db_path):
+        """WAF blocked item is FAILED with next_attempt_at=NULL (terminal)."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def waf_fn(*args, **kwargs):
+            return {
+                "status": "FAILED",
+                "detail": "aws_waf_challenge",
+                "blocked_terminal": True,
+                "forensic_events": [
+                    {"type": "ITEM_ARTIFACT", "detail": "screenshot=test.png"},
+                ],
+            }
+
+        self._tick_pw(test_db_path, waf_fn)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT * FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        assert item["status"] == "FAILED"
+        assert item["next_attempt_at"] is None  # terminal, no retry
+        assert "aws_waf_challenge" in (item["fail_reason"] or "")
+        conn.close()
+
+    def test_waf_block_does_not_disable_worker(self, test_db_path):
+        """WAF block should NOT globally disable the worker."""
+        _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def waf_fn(*args, **kwargs):
+            return {"status": "FAILED", "detail": "aws_waf_challenge", "blocked_terminal": True}
+
+        self._tick_pw(test_db_path, waf_fn)
+        assert _worker_state.disabled is False
+
+    def test_waf_block_sets_profile_cooldown(self, test_db_path):
+        """WAF block sets per-profile cooldown."""
+        _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def waf_fn(*args, **kwargs):
+            return {"status": "FAILED", "detail": "aws_waf_challenge", "blocked_terminal": True}
+
+        self._tick_pw(test_db_path, waf_fn)
+        assert _is_profile_blocked("p1") is True
+
+    def test_blocked_profile_items_skipped(self, test_db_path):
+        """Items for blocked profile are skipped with ITEM_SKIPPED event."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=2)
+
+        # Block p1 first
+        _set_profile_blocked("p1")
+
+        result = self._tick_pw(test_db_path, lambda *a, **k: {"status": "JOINED", "detail": "ok"})
+        assert result["processed"] == 0
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        events = conn.execute(
+            "SELECT event_type, detail FROM join_events WHERE job_id = ?",
+            (job_id,),
+        ).fetchall()
+        skip_events = [e for e in events if e["event_type"] == "ITEM_SKIPPED"]
+        assert len(skip_events) >= 1
+        assert "profile_blocked_cooldown" in skip_events[0]["detail"]
+        conn.close()
+
+    def test_waf_forensic_events_emitted(self, test_db_path):
+        """Forensic events are emitted for WAF blocks."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def waf_with_forensics(*args, **kwargs):
+            return {
+                "status": "FAILED",
+                "detail": "aws_waf_challenge",
+                "blocked_terminal": True,
+                "forensic_events": [
+                    {"type": "ITEM_ARTIFACT", "detail": "screenshot=waf.png"},
+                    {"type": "ITEM_ARTIFACT", "detail": "url=https://skool.com html_head=<waf>"},
+                ],
+            }
+
+        self._tick_pw(test_db_path, waf_with_forensics)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        events = conn.execute(
+            "SELECT event_type FROM join_events WHERE job_id = ?",
+            (job_id,),
+        ).fetchall()
+        types = [e["event_type"] for e in events]
+        assert "ITEM_ARTIFACT" in types
+        assert "ITEM_FAILED" in types
+        conn.close()
+
+    def test_non_waf_failure_still_retries(self, test_db_path):
+        """Normal failures (no blocked_terminal) still get backoff retries."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def normal_fail(*args, **kwargs):
+            return {"status": "FAILED", "detail": "navigation_timeout: timed out"}
+
+        self._tick_pw(test_db_path, normal_fail)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT * FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        assert item["status"] == "PENDING"  # retryable
+        assert item["next_attempt_at"] is not None  # has backoff
+        conn.close()
+
+        # Profile should NOT be blocked
+        assert _is_profile_blocked("p1") is False
+
+    def teardown_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None

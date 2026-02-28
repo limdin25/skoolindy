@@ -27,7 +27,7 @@ from pydantic import BaseModel
 
 from security_utils import decrypt_secret, encrypt_secret, is_encrypted_secret, mask_secret
 from proxy_slots import acquire_proxy_slot, release_proxy_slot
-from joiner import ensure_joiner_tables, create_joiner_router
+from joiner import ensure_joiner_tables, create_joiner_router, joiner_worker_loop
 
 
 def _load_local_env_file() -> None:
@@ -196,6 +196,11 @@ async def lifespan(app: FastAPI):
             _skool_chat_sync_loop(),
             name="skool-chat-sync",
         )
+    # Phase 3 — Joiner background worker (no-op when JOINER_ENABLED=false)
+    app.state.joiner_worker_task = asyncio.create_task(
+        joiner_worker_loop(get_db),
+        name="joiner-worker",
+    )
     try:
         yield
     finally:
@@ -211,6 +216,13 @@ async def lifespan(app: FastAPI):
             monitor_task.cancel()
             try:
                 await monitor_task
+            except asyncio.CancelledError:
+                pass
+        joiner_task = getattr(app.state, "joiner_worker_task", None)
+        if joiner_task:
+            joiner_task.cancel()
+            try:
+                await joiner_task
             except asyncio.CancelledError:
                 pass
         try:

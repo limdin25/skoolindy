@@ -528,3 +528,363 @@ class TestIntegrityEndpoint:
         assert "join_job_items_reachable" in check_names
         assert "job_counters_match" in check_names
         assert "no_orphan_profile_refs" in check_names
+
+
+
+
+# =========================================================================
+# PHASE 3: Worker Loop Tests
+# =========================================================================
+
+import time
+from unittest.mock import patch
+from joiner import (
+    worker_tick,
+    _WorkerState,
+    _worker_state,
+    JOINER_ENABLED,
+    MAX_JOIN_ATTEMPTS_PER_PROFILE_PER_HOUR,
+    ITEMS_PER_CYCLE,
+    _uuid,
+    _now_iso,
+    _emit_event,
+)
+
+
+def _get_db_factory(db_path: str):
+    """Return a get_db context-manager factory for a given DB path."""
+    @contextmanager
+    def get_db():
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+    return get_db
+
+
+def _create_test_job(db_path: str, profile_ids=None, num_urls=1) -> str:
+    """Create a CREATED job with PENDING items and return job_id."""
+    if profile_ids is None:
+        profile_ids = ["p1"]
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    job_id = _uuid()
+    now = _now_iso()
+    total = len(profile_ids) * num_urls
+    conn.execute(
+        "INSERT INTO join_jobs (id, created_at, status, total_items, completed_items, failed_items, paused) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (job_id, now, "CREATED", total, 0, 0, 0),
+    )
+    for i in range(num_urls):
+        for pid in profile_ids:
+            conn.execute(
+                "INSERT INTO join_job_items (id, job_id, profile_id, community_url, community_key, status, attempt_count, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (_uuid(), job_id, pid, f"https://www.skool.com/test-{i}-{pid}", f"www.skool.com/test-{i}-{pid}", "PENDING", 0, now, now),
+            )
+    conn.commit()
+    conn.close()
+    return job_id
+
+
+class TestWorkerTickDisabled:
+    """Worker does nothing when JOINER_ENABLED=false."""
+
+    def test_skip_when_disabled(self, test_db_path):
+        get_db = _get_db_factory(test_db_path)
+        _create_test_job(test_db_path)
+
+        # Ensure _force_enabled is not set
+        worker_tick._force_enabled = False
+        result = worker_tick(get_db)
+        assert result["skipped_no_work"] is True
+        assert result["processed"] == 0
+
+    def test_force_enabled_overrides(self, test_db_path):
+        get_db = _get_db_factory(test_db_path)
+        _create_test_job(test_db_path)
+
+        worker_tick._force_enabled = True
+        try:
+            result = worker_tick(get_db)
+            assert result["processed"] == 1
+        finally:
+            worker_tick._force_enabled = False
+
+
+class TestWorkerTickProcessing:
+    """Worker processes items correctly in simulation mode."""
+
+    def _force_tick(self, db_path, **kwargs):
+        """Run one tick with _force_enabled=True."""
+        get_db = _get_db_factory(db_path)
+        worker_tick._force_enabled = True
+        try:
+            return worker_tick(get_db)
+        finally:
+            worker_tick._force_enabled = False
+
+    def test_processes_one_item_per_cycle(self, test_db_path):
+        _create_test_job(test_db_path, profile_ids=["p1", "p2"])
+        result = self._force_tick(test_db_path)
+        assert result["processed"] == ITEMS_PER_CYCLE  # Should be 1
+
+    def test_item_transitions_to_joined(self, test_db_path):
+        job_id = _create_test_job(test_db_path)
+        self._force_tick(test_db_path)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        items = conn.execute("SELECT status FROM join_job_items WHERE job_id = ?", (job_id,)).fetchall()
+        statuses = [r["status"] for r in items]
+        assert "JOINED" in statuses
+        conn.close()
+
+    def test_events_emitted_for_ready_and_joined(self, test_db_path):
+        job_id = _create_test_job(test_db_path)
+        self._force_tick(test_db_path)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        events = conn.execute(
+            "SELECT event_type FROM join_events WHERE job_id = ? ORDER BY rowid",
+            (job_id,),
+        ).fetchall()
+        event_types = [e["event_type"] for e in events]
+        assert "ITEM_READY" in event_types
+        assert "ITEM_JOINED" in event_types
+        conn.close()
+
+    def test_job_auto_completes_when_all_items_done(self, test_db_path):
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+        self._force_tick(test_db_path)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        job = conn.execute("SELECT status FROM join_jobs WHERE id = ?", (job_id,)).fetchone()
+        assert job["status"] == "COMPLETED"
+        conn.close()
+
+    def test_job_not_completed_when_items_remain(self, test_db_path):
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=3)
+        self._force_tick(test_db_path)  # processes 1 of 3
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        job = conn.execute("SELECT status FROM join_jobs WHERE id = ?", (job_id,)).fetchone()
+        assert job["status"] == "CREATED"  # still active
+        items = conn.execute("SELECT status FROM join_job_items WHERE job_id = ?", (job_id,)).fetchall()
+        joined = sum(1 for r in items if r["status"] == "JOINED")
+        pending = sum(1 for r in items if r["status"] == "PENDING")
+        assert joined == 1
+        assert pending == 2
+        conn.close()
+
+    def test_paused_job_skipped(self, test_db_path):
+        job_id = _create_test_job(test_db_path)
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("UPDATE join_jobs SET paused = 1 WHERE id = ?", (job_id,))
+        conn.commit()
+        conn.close()
+
+        result = self._force_tick(test_db_path)
+        assert result["skipped_no_work"] is True
+        assert result["processed"] == 0
+
+    def test_counters_updated_after_tick(self, test_db_path):
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=2)
+        self._force_tick(test_db_path)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        job = conn.execute("SELECT completed_items, total_items FROM join_jobs WHERE id = ?", (job_id,)).fetchone()
+        assert job["completed_items"] == 1
+        assert job["total_items"] == 2
+        conn.close()
+
+
+class TestWorkerRateLimit:
+    """Rate limiting: max 6 joins per profile per hour."""
+
+    def _force_tick(self, db_path):
+        get_db = _get_db_factory(db_path)
+        worker_tick._force_enabled = True
+        try:
+            return worker_tick(get_db)
+        finally:
+            worker_tick._force_enabled = False
+
+    def test_rate_limit_blocks_profile(self, test_db_path):
+        # Create a job with many items for p1
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=MAX_JOIN_ATTEMPTS_PER_PROFILE_PER_HOUR + 2)
+
+        # Run ticks up to the limit
+        for i in range(MAX_JOIN_ATTEMPTS_PER_PROFILE_PER_HOUR):
+            result = self._force_tick(test_db_path)
+            assert result["processed"] == 1, f"tick {i} should have processed 1"
+
+        # Next tick should hit rate limit
+        result = self._force_tick(test_db_path)
+        assert result["processed"] == 0
+        assert result["skipped_rate_limit"] is True
+
+    def test_different_profile_not_rate_limited(self, test_db_path):
+        # Create job with p1 and p2
+        job_id = _create_test_job(test_db_path, profile_ids=["p1", "p2"], num_urls=MAX_JOIN_ATTEMPTS_PER_PROFILE_PER_HOUR + 1)
+
+        # Exhaust p1 rate limit
+        for i in range(MAX_JOIN_ATTEMPTS_PER_PROFILE_PER_HOUR):
+            self._force_tick(test_db_path)
+
+        # p2 should still be eligible
+        result = self._force_tick(test_db_path)
+        assert result["processed"] == 1
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        joined_p2 = conn.execute(
+            "SELECT COUNT(*) as c FROM join_job_items WHERE job_id = ? AND profile_id = ? AND status = ?",
+            (job_id, "p2", "JOINED"),
+        ).fetchone()["c"]
+        assert joined_p2 >= 1
+        conn.close()
+
+
+class TestWorkerRestartSafety:
+    """Worker rebuilds state from DB on restart - no in-memory assumptions."""
+
+    def _force_tick(self, db_path):
+        get_db = _get_db_factory(db_path)
+        worker_tick._force_enabled = True
+        try:
+            return worker_tick(get_db)
+        finally:
+            worker_tick._force_enabled = False
+
+    def test_restart_continues_from_db(self, test_db_path):
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=3)
+
+        # Process 1 item
+        self._force_tick(test_db_path)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        joined_before = conn.execute(
+            "SELECT COUNT(*) as c FROM join_job_items WHERE job_id = ? AND status = ?",
+            (job_id, "JOINED"),
+        ).fetchone()["c"]
+        assert joined_before == 1
+
+        # Simulate restart: create a NEW get_db factory (new connection)
+        new_get_db = _get_db_factory(test_db_path)
+        worker_tick._force_enabled = True
+        try:
+            result = worker_tick(new_get_db)
+        finally:
+            worker_tick._force_enabled = False
+
+        assert result["processed"] == 1
+
+        joined_after = conn.execute(
+            "SELECT COUNT(*) as c FROM join_job_items WHERE job_id = ? AND status = ?",
+            (job_id, "JOINED"),
+        ).fetchone()["c"]
+        assert joined_after == 2
+        conn.close()
+
+
+class TestWorkerSelfDisable:
+    """Worker self-disables on unhandled exception."""
+
+    def test_self_disable_on_error(self, test_db_path):
+        # Create a broken get_db that raises
+        @contextmanager
+        def broken_get_db():
+            raise RuntimeError("DB connection failed")
+            yield  # pragma: no cover
+
+        worker_tick._force_enabled = True
+        try:
+            result = worker_tick(broken_get_db)
+        finally:
+            worker_tick._force_enabled = False
+
+        assert result["error"] is not None
+        assert "DB connection failed" in result["error"]
+
+
+class TestWorkerCoreTableInvariant:
+    """Worker tick does NOT write to core EngageFlow tables."""
+
+    CORE_TABLES = ["communities", "scheduler_queue", "community_messages"]
+
+    def _ensure_core_tables(self, db_path):
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        conn.execute("CREATE TABLE IF NOT EXISTS communities (id TEXT PRIMARY KEY, name TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS scheduler_queue (id TEXT PRIMARY KEY, profile_id TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS community_messages (id TEXT PRIMARY KEY, body TEXT)")
+        conn.commit()
+        conn.close()
+
+    def _snapshot(self, db_path):
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        result = {}
+        for t in self.CORE_TABLES + ["profiles"]:
+            result[t] = conn.execute(f"SELECT COUNT(*) as c FROM {t}").fetchone()[0]
+        conn.close()
+        return result
+
+    def test_worker_no_core_writes(self, test_db_path):
+        self._ensure_core_tables(test_db_path)
+        _create_test_job(test_db_path, profile_ids=["p1"], num_urls=3)
+
+        before = self._snapshot(test_db_path)
+
+        get_db = _get_db_factory(test_db_path)
+        worker_tick._force_enabled = True
+        try:
+            for _ in range(3):
+                worker_tick(get_db)
+        finally:
+            worker_tick._force_enabled = False
+
+        after = self._snapshot(test_db_path)
+        for table in self.CORE_TABLES + ["profiles"]:
+            assert before[table] == after[table], f"core table {table} changed: {before[table]} -> {after[table]}"
+
+
+class TestWorkerIntegrityExtensions:
+    """Phase 3 integrity checks appear in /joiner/integrity."""
+
+    def test_integrity_has_worker_checks(self, client):
+        resp = client.get("/joiner/integrity")
+        assert resp.status_code == 200
+        data = resp.json()
+        check_names = [c["check"] for c in data["checks"]]
+        assert "joiner_enabled" in check_names
+        assert "worker_running" in check_names
+        assert "last_worker_tick" in check_names
+        assert "processed_last_hour" in check_names
+
+
+class TestItemTransitionsPhase3:
+    """READY state added in Phase 3."""
+
+    def test_pending_to_ready(self):
+        validate_item_transition("PENDING", "READY")  # no raise = pass
+
+    def test_ready_to_running(self):
+        validate_item_transition("READY", "RUNNING")  # no raise = pass
+
+    def test_ready_to_joined(self):
+        validate_item_transition("READY", "JOINED")  # no raise = pass
+
+    def test_ready_to_failed(self):
+        validate_item_transition("READY", "FAILED")  # no raise = pass
+
+    def test_ready_to_cancelled(self):
+        validate_item_transition("READY", "CANCELLED")  # no raise = pass

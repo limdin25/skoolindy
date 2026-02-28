@@ -1,7 +1,8 @@
 """
-EngageFlow Community Joiner — Phase 2+3
-DB tables, API routes, normalization, event audit, background worker.
-No Playwright, no browser automation, no mutation of core tables.
+EngageFlow Community Joiner — Phase 2+3+4
+DB tables, API routes, normalization, event audit, background worker,
+Playwright join execution (canary).
+No mutation of core tables. Self-contained Playwright — no imports from automation/.
 """
 from __future__ import annotations
 
@@ -12,7 +13,9 @@ import re
 import sqlite3
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, urlunparse
 
@@ -26,10 +29,15 @@ LOGGER = logging.getLogger("engageflow.joiner")
 # ---------------------------------------------------------------------------
 
 JOINER_ENABLED = os.environ.get("JOINER_ENABLED", "false").lower() in ("1", "true", "yes")
-MAX_JOIN_ATTEMPTS_PER_PROFILE_PER_HOUR = 6
+JOINER_MODE = os.environ.get("JOINER_MODE", "simulate").lower()  # "simulate" | "playwright"
+MAX_JOIN_ATTEMPTS_PER_PROFILE_PER_HOUR = 1  # CANARY: was 6 in Phase 3
+MAX_GLOBAL_JOINS_PER_HOUR = 2               # CANARY: system-wide ceiling
 MAX_CONCURRENT_PROFILES = 1
-WORKER_INTERVAL_SECONDS = 30
-ITEMS_PER_CYCLE = 1  # canary safety: process at most 1 item per loop tick
+WORKER_INTERVAL_SECONDS = 60                # was 30 in Phase 3
+ITEMS_PER_CYCLE = 1                         # canary safety: 1 item per tick
+MAX_ITEM_ATTEMPTS = 3                       # retry ceiling per item
+BACKOFF_DELAYS = [900, 3600, 21600]         # 15m, 60m, 6h in seconds
+ACCOUNTS_DIR = Path(__file__).parent / "skool_accounts"
 
 # ---------------------------------------------------------------------------
 # URL Normalization
@@ -149,6 +157,11 @@ def ensure_joiner_tables(db: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL
         )
     """)
+    # Phase 4 migration: add next_attempt_at column
+    try:
+        db.execute("ALTER TABLE join_job_items ADD COLUMN next_attempt_at TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     db.commit()
 
 
@@ -207,7 +220,7 @@ class _WorkerState:
         self.disable_reason: Optional[str] = None
         self.last_tick_ts: float = 0.0
         self.processed_last_hour: int = 0
-        self._hourly_counts: list[float] = []  # timestamps of processed items
+        self._hourly_counts: list[float] = []
 
     def record_processed(self) -> None:
         now = time.time()
@@ -225,28 +238,254 @@ _worker_state = _WorkerState()
 
 
 # ---------------------------------------------------------------------------
-# Worker loop (Phase 3 — simulation only, no Playwright)
+# Playwright join execution (Phase 4 — canary, self-contained)
+# ---------------------------------------------------------------------------
+
+# Block/captcha keywords (replicated from automation patterns, NOT imported)
+_BLOCK_KEYWORDS = [
+    "account suspended", "temporarily blocked", "access denied",
+    "unusual activity", "verify you are human",
+]
+
+# Auth markers — presence indicates logged-in state
+_AUTH_SELECTORS = [
+    'button[class*="ChatNotificationsIconButton"]',
+    'a[href*="/chat?ch="]',
+    'a[href^="/@"]',
+    'div[class*="TopNav"]',
+]
+
+# Join button selectors (tried in order)
+_JOIN_BUTTON_SELECTORS = [
+    'button:has-text("Join for Free")',
+    'button:has-text("Join Group")',
+    'button:has-text("Join")',
+]
+
+# Membership pending selectors
+_PENDING_SELECTORS = [
+    'h2:has-text("Membership pending")',
+    'button:has-text("Membership Pending")',
+    'button:has-text("Cancel membership request")',
+]
+
+
+def _parse_proxy_for_joiner(proxy_str: Optional[str]) -> Optional[dict]:
+    """Parse proxy string to Playwright proxy config. Replicated from engine pattern."""
+    if not proxy_str or not proxy_str.strip():
+        return None
+    proxy_str = proxy_str.strip()
+    # Format: protocol://user:pass@host:port or host:port:user:pass
+    if "://" in proxy_str:
+        parsed = urlparse(proxy_str)
+        result: dict = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+        if parsed.username:
+            result["username"] = parsed.username
+        if parsed.password:
+            result["password"] = parsed.password
+        return result
+    parts = proxy_str.split(":")
+    if len(parts) == 4:
+        return {
+            "server": f"http://{parts[0]}:{parts[1]}",
+            "username": parts[2],
+            "password": parts[3],
+        }
+    if len(parts) == 2:
+        return {"server": f"http://{parts[0]}:{parts[1]}"}
+    return None
+
+
+def _execute_playwright_join(
+    profile_id: str,
+    community_url: str,
+    community_key: str,
+    db_path: str,
+) -> dict:
+    """Execute real Playwright join for one community. Returns result dict.
+
+    Self-contained: creates own Playwright instance, does NOT import from automation/.
+    Uses existing persistent browser profile at skool_accounts/<profile_id>/browser/.
+
+    Returns: {"status": str, "detail": str}
+      status: JOINED | ALREADY_MEMBER | PENDING_APPROVAL | SKIPPED_PAID | FAILED
+      detail: human-readable explanation
+    """
+    from playwright.sync_api import sync_playwright
+
+    profile_path = ACCOUNTS_DIR / profile_id / "browser"
+    if not profile_path.exists():
+        return {"status": "FAILED", "detail": f"profile browser dir not found: {profile_path}"}
+
+    # Look up proxy from profiles table
+    proxy_str = None
+    try:
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT proxy FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+        if row:
+            proxy_str = row["proxy"]
+        conn.close()
+    except Exception:
+        pass  # proceed without proxy
+
+    pw = None
+    context = None
+    try:
+        pw = sync_playwright().start()
+
+        launch_kwargs: Dict[str, Any] = {
+            "user_data_dir": str(profile_path),
+            "headless": True,
+            "viewport": {"width": 1600, "height": 1100},
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        }
+        proxy_cfg = _parse_proxy_for_joiner(proxy_str)
+        if proxy_cfg:
+            launch_kwargs["proxy"] = proxy_cfg
+
+        context = pw.chromium.launch_persistent_context(**launch_kwargs)
+        page = context.pages[0] if context.pages else context.new_page()
+        page.set_default_timeout(30000)
+
+        # Navigate to community
+        try:
+            page.goto(community_url, timeout=45000, wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)  # let JS settle
+        except Exception as nav_err:
+            return {"status": "FAILED", "detail": f"navigation_timeout: {str(nav_err)[:200]}"}
+
+        page_text = ""
+        try:
+            page_text = (page.text_content("body") or "").lower()
+        except Exception:
+            pass
+
+        page_url = page.url.lower()
+
+        # 1. Auth check — redirected to login?
+        if "/login" in page_url or page.query_selector("input#email"):
+            return {"status": "FAILED", "detail": "auth_session_invalid"}
+
+        # 2. Block/captcha check
+        for kw in _BLOCK_KEYWORDS:
+            if kw in page_text:
+                return {"status": "FAILED", "detail": f"blocked_or_captcha: {kw}"}
+        if page.query_selector('iframe[src*="captcha"]'):
+            return {"status": "FAILED", "detail": "blocked_or_captcha: captcha_iframe"}
+
+        # 3. Check if already a member (auth markers present + no join button)
+        has_auth = any(page.query_selector(sel) for sel in _AUTH_SELECTORS)
+        has_join_button = None
+        for sel in _JOIN_BUTTON_SELECTORS:
+            btn = page.query_selector(sel)
+            if btn and btn.is_visible():
+                has_join_button = btn
+                break
+
+        # 4. Membership pending
+        is_pending = (
+            ("membership pending" in page_text)
+            or any(page.query_selector(sel) for sel in _PENDING_SELECTORS)
+        )
+        if is_pending:
+            return {"status": "PENDING_APPROVAL", "detail": "membership_pending_detected"}
+
+        # 5. Paid group detection
+        if has_join_button is None and not has_auth:
+            # Check for pricing indicators near the page
+            paid_indicators = ["$", "pricing", "payment", "subscribe", "buy now", "upgrade"]
+            for indicator in paid_indicators:
+                if indicator in page_text:
+                    return {"status": "SKIPPED_PAID", "detail": f"paid_wall_detected: {indicator}"}
+
+        # 6. Already a member (has auth markers, no join button, not pending)
+        if has_auth and has_join_button is None:
+            return {"status": "ALREADY_MEMBER", "detail": "member_ui_detected"}
+
+        # 7. Join button visible — click it
+        if has_join_button is not None:
+            try:
+                has_join_button.click()
+                page.wait_for_timeout(5000)  # wait for join to process
+            except Exception as click_err:
+                return {"status": "FAILED", "detail": f"join_click_failed: {str(click_err)[:200]}"}
+
+            # Re-detect state after click
+            post_page_text = ""
+            try:
+                post_page_text = (page.text_content("body") or "").lower()
+            except Exception:
+                pass
+
+            # Check if now pending approval
+            post_pending = (
+                ("membership pending" in post_page_text)
+                or any(page.query_selector(sel) for sel in _PENDING_SELECTORS)
+            )
+            if post_pending:
+                return {"status": "PENDING_APPROVAL", "detail": "pending_after_join_click"}
+
+            # Check if now a member (auth markers should still be present, join button gone)
+            post_join_btn = None
+            for sel in _JOIN_BUTTON_SELECTORS:
+                btn = page.query_selector(sel)
+                if btn and btn.is_visible():
+                    post_join_btn = btn
+                    break
+
+            if post_join_btn is None:
+                # Join button gone = likely joined successfully
+                return {"status": "JOINED", "detail": f"joined {community_key}"}
+
+            # Join button still visible — something didn't work
+            return {"status": "FAILED", "detail": "join_button_still_visible_after_click"}
+
+        # 8. No join button, no auth, not paid — unknown state
+        return {"status": "FAILED", "detail": "unknown_page_state"}
+
+    except Exception as exc:
+        return {"status": "FAILED", "detail": f"playwright_error: {str(exc)[:300]}"}
+    finally:
+        try:
+            if context:
+                context.close()
+        except Exception:
+            pass
+        try:
+            if pw:
+                pw.stop()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting helpers (Phase 4 — canary limits)
 # ---------------------------------------------------------------------------
 
 def _get_rate_limited_profile(db: sqlite3.Connection, job_id: str) -> Optional[str]:
     """Pick a profile that hasn't exceeded hourly rate limit.
 
-    Checks join_events for ITEM_JOINED events in the last hour per profile.
-    Returns the first eligible profile_id or None.
+    Phase 4 canary: MAX_JOIN_ATTEMPTS_PER_PROFILE_PER_HOUR = 1
     """
     cutoff_iso = datetime.fromtimestamp(
         time.time() - 3600, tz=timezone.utc
     ).isoformat(timespec="seconds")
 
-    # Get profiles with PENDING items for this job
+    now_iso = _now_iso()
     candidates = db.execute(
-        "SELECT DISTINCT profile_id FROM join_job_items WHERE job_id = ? AND status = 'PENDING' ORDER BY rowid",
-        (job_id,),
+        "SELECT DISTINCT profile_id FROM join_job_items "
+        "WHERE job_id = ? AND status = 'PENDING' AND (next_attempt_at IS NULL OR next_attempt_at <= ?) "
+        "ORDER BY rowid",
+        (job_id, now_iso),
     ).fetchall()
 
     for row in candidates:
         pid = row["profile_id"]
-        # Count joins in last hour across ALL jobs for this profile
         count = db.execute(
             "SELECT COUNT(*) as c FROM join_events WHERE profile_id = ? AND event_type = 'ITEM_JOINED' AND created_at > ?",
             (pid, cutoff_iso),
@@ -256,20 +495,87 @@ def _get_rate_limited_profile(db: sqlite3.Connection, job_id: str) -> Optional[s
     return None
 
 
-def worker_tick(get_db_func) -> dict:
+def _check_global_rate_limit(db: sqlite3.Connection) -> bool:
+    """Return True if global rate limit exceeded (>= MAX_GLOBAL_JOINS_PER_HOUR)."""
+    cutoff_iso = datetime.fromtimestamp(
+        time.time() - 3600, tz=timezone.utc
+    ).isoformat(timespec="seconds")
+    count = db.execute(
+        "SELECT COUNT(*) as c FROM join_events WHERE event_type IN ('ITEM_JOINED', 'ITEM_COMPLETED') AND created_at > ?",
+        (cutoff_iso,),
+    ).fetchone()["c"]
+    return count >= MAX_GLOBAL_JOINS_PER_HOUR
+
+
+def _check_kill_switch(db: sqlite3.Connection, latest_detail: Optional[str] = None) -> Optional[str]:
+    """Check if kill switch should trigger. Returns reason or None."""
+    # Immediate kill: auth/session invalid
+    if latest_detail and "auth_session_invalid" in latest_detail:
+        return f"auth_session_invalid: {latest_detail}"
+
+    # 3 consecutive failures in last hour
+    cutoff_iso = datetime.fromtimestamp(
+        time.time() - 3600, tz=timezone.utc
+    ).isoformat(timespec="seconds")
+    recent = db.execute(
+        "SELECT event_type FROM join_events WHERE created_at > ? ORDER BY rowid DESC LIMIT 3",
+        (cutoff_iso,),
+    ).fetchall()
+    if len(recent) >= 3 and all(r["event_type"] == "ITEM_FAILED" for r in recent):
+        return "3_consecutive_failures_in_last_hour"
+
+    return None
+
+
+def _compute_next_attempt_at(attempt_count: int) -> Optional[str]:
+    """Compute next_attempt_at based on attempt count. None if max reached."""
+    if attempt_count >= MAX_ITEM_ATTEMPTS:
+        return None  # terminal
+    idx = min(attempt_count - 1, len(BACKOFF_DELAYS) - 1)
+    if idx < 0:
+        idx = 0
+    delay = BACKOFF_DELAYS[idx]
+    next_ts = datetime.fromtimestamp(
+        time.time() + delay, tz=timezone.utc
+    ).isoformat(timespec="seconds")
+    return next_ts
+
+
+# ---------------------------------------------------------------------------
+# Worker loop (Phase 4 — simulate or playwright mode)
+# ---------------------------------------------------------------------------
+
+def worker_tick(get_db_func, *, _playwright_join_fn=None) -> dict:
     """Execute one worker cycle. Returns summary dict for testing/logging.
 
     Processes at most ITEMS_PER_CYCLE items. DB is sole source of truth.
-    No Playwright. No browser automation.
+    In playwright mode, executes real browser joins.
+    In simulate mode, performs Phase 3 simulation (PENDING->READY->JOINED).
+
+    _playwright_join_fn: injectable for testing (default: _execute_playwright_join)
     """
-    result = {"processed": 0, "skipped_rate_limit": False, "skipped_no_work": False, "error": None}
+    result = {
+        "processed": 0,
+        "skipped_rate_limit": False,
+        "skipped_no_work": False,
+        "skipped_global_limit": False,
+        "error": None,
+    }
 
     if not JOINER_ENABLED and not getattr(worker_tick, "_force_enabled", False):
         result["skipped_no_work"] = True
         return result
 
+    pw_join_fn = _playwright_join_fn or _execute_playwright_join
+    effective_mode = getattr(worker_tick, "_force_mode", None) or JOINER_MODE
+
     try:
         with get_db_func() as db:
+            # Global rate limit check
+            if _check_global_rate_limit(db):
+                result["skipped_global_limit"] = True
+                return result
+
             # Find active jobs (CREATED and not paused)
             jobs = db.execute(
                 "SELECT id FROM join_jobs WHERE status = 'CREATED' AND paused = 0 ORDER BY rowid"
@@ -292,10 +598,12 @@ def worker_tick(get_db_func) -> dict:
                     result["skipped_rate_limit"] = True
                     continue
 
-                # Pick one PENDING item for this profile in this job
+                # Pick one PENDING item for this profile (respecting backoff)
+                now_iso = _now_iso()
                 item = db.execute(
-                    "SELECT * FROM join_job_items WHERE job_id = ? AND profile_id = ? AND status = 'PENDING' ORDER BY rowid LIMIT 1",
-                    (job_id, profile_id),
+                    "SELECT * FROM join_job_items WHERE job_id = ? AND profile_id = ? AND status = 'PENDING' "
+                    "AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY rowid LIMIT 1",
+                    (job_id, profile_id, now_iso),
                 ).fetchone()
 
                 if not item:
@@ -304,22 +612,90 @@ def worker_tick(get_db_func) -> dict:
                 item_id = item["id"]
                 now = _now_iso()
 
-                # PENDING -> READY
-                db.execute(
-                    "UPDATE join_job_items SET status = 'READY', updated_at = ? WHERE id = ? AND status = 'PENDING'",
-                    (now, item_id),
-                )
-                _emit_event(db, job_id, "ITEM_READY", item_id=item_id, profile_id=profile_id,
-                           detail=f"community={item['community_key']}")
+                if effective_mode == "playwright":
+                    # ----- PLAYWRIGHT MODE -----
+                    # PENDING -> READY
+                    db.execute(
+                        "UPDATE join_job_items SET status = 'READY', updated_at = ? WHERE id = ? AND status = 'PENDING'",
+                        (now, item_id),
+                    )
+                    _emit_event(db, job_id, "ITEM_STARTED", item_id=item_id, profile_id=profile_id,
+                               detail=f"community={item['community_key']}")
+                    db.commit()
 
-                # READY -> JOINED (Phase 3 simulation — no actual browser action)
-                db.execute(
-                    "UPDATE join_job_items SET status = 'JOINED', attempt_count = attempt_count + 1, "
-                    "last_attempt_at = ?, updated_at = ? WHERE id = ? AND status = 'READY'",
-                    (now, now, item_id),
-                )
-                _emit_event(db, job_id, "ITEM_JOINED", item_id=item_id, profile_id=profile_id,
-                           detail=f"simulated join for {item['community_key']}")
+                    # Get DB path for Playwright function
+                    db_path = db.execute("PRAGMA database_list").fetchone()[2]
+
+                    # Execute Playwright join (runs outside DB transaction)
+                    _emit_event(db, job_id, "ITEM_NAVIGATED", item_id=item_id, profile_id=profile_id,
+                               detail=community_url_str(item))
+                    db.commit()
+
+                    pw_result = pw_join_fn(profile_id, item["community_url"], item["community_key"], db_path)
+                    pw_status = pw_result.get("status", "FAILED")
+                    pw_detail = pw_result.get("detail", "")
+
+                    _emit_event(db, job_id, "ITEM_DETECTED_STATE", item_id=item_id, profile_id=profile_id,
+                               detail=f"status={pw_status} detail={pw_detail}")
+
+                    now = _now_iso()
+                    new_attempt_count = item["attempt_count"] + 1
+
+                    if pw_status == "FAILED":
+                        next_at = _compute_next_attempt_at(new_attempt_count)
+                        db.execute(
+                            "UPDATE join_job_items SET status = 'FAILED', attempt_count = ?, "
+                            "last_attempt_at = ?, fail_reason = ?, next_attempt_at = ?, updated_at = ? "
+                            "WHERE id = ?",
+                            (new_attempt_count, now, pw_detail, next_at, now, item_id),
+                        )
+                        # If retryable, set back to PENDING for next attempt
+                        if next_at is not None:
+                            db.execute(
+                                "UPDATE join_job_items SET status = 'PENDING' WHERE id = ? AND attempt_count < ?",
+                                (item_id, MAX_ITEM_ATTEMPTS),
+                            )
+                        _emit_event(db, job_id, "ITEM_FAILED", item_id=item_id, profile_id=profile_id,
+                                   detail=pw_detail)
+
+                        # Kill switch check
+                        kill_reason = _check_kill_switch(db, pw_detail)
+                        if kill_reason:
+                            _worker_state.disabled = True
+                            _worker_state.disable_reason = kill_reason
+                            _emit_event(db, job_id, "WORKER_DISABLED", profile_id=profile_id,
+                                       detail=kill_reason)
+                            LOGGER.error("Joiner worker kill switch triggered: %s", kill_reason)
+                    else:
+                        # Success states: JOINED, ALREADY_MEMBER, PENDING_APPROVAL, SKIPPED_PAID
+                        db.execute(
+                            "UPDATE join_job_items SET status = ?, attempt_count = ?, "
+                            "last_attempt_at = ?, updated_at = ?, next_attempt_at = NULL WHERE id = ?",
+                            (pw_status, new_attempt_count, now, now, item_id),
+                        )
+                        event_type = "ITEM_COMPLETED" if pw_status == "JOINED" else f"ITEM_{pw_status}"
+                        _emit_event(db, job_id, event_type, item_id=item_id, profile_id=profile_id,
+                                   detail=pw_detail)
+                        if pw_status == "JOINED":
+                            _emit_event(db, job_id, "ITEM_JOINED", item_id=item_id, profile_id=profile_id,
+                                       detail=pw_detail)
+
+                else:
+                    # ----- SIMULATE MODE (Phase 3 behavior) -----
+                    db.execute(
+                        "UPDATE join_job_items SET status = 'READY', updated_at = ? WHERE id = ? AND status = 'PENDING'",
+                        (now, item_id),
+                    )
+                    _emit_event(db, job_id, "ITEM_READY", item_id=item_id, profile_id=profile_id,
+                               detail=f"community={item['community_key']}")
+
+                    db.execute(
+                        "UPDATE join_job_items SET status = 'JOINED', attempt_count = attempt_count + 1, "
+                        "last_attempt_at = ?, updated_at = ? WHERE id = ? AND status = 'READY'",
+                        (now, now, item_id),
+                    )
+                    _emit_event(db, job_id, "ITEM_JOINED", item_id=item_id, profile_id=profile_id,
+                               detail=f"simulated join for {item['community_key']}")
 
                 _update_job_counters(db, job_id)
 
@@ -337,7 +713,7 @@ def worker_tick(get_db_func) -> dict:
                 _worker_state.record_processed()
 
             result["processed"] = processed
-            if processed == 0 and not result["skipped_rate_limit"]:
+            if processed == 0 and not result["skipped_rate_limit"] and not result["skipped_global_limit"]:
                 result["skipped_no_work"] = True
 
     except Exception as e:
@@ -347,10 +723,21 @@ def worker_tick(get_db_func) -> dict:
     return result
 
 
+def community_url_str(item) -> str:
+    """Extract community_url from item row safely."""
+    try:
+        return str(item["community_url"])
+    except Exception:
+        return "unknown"
+
+
 async def joiner_worker_loop(get_db_func) -> None:
     """Async background loop. Calls worker_tick every WORKER_INTERVAL_SECONDS."""
     _worker_state.running = True
-    LOGGER.info("Joiner worker loop started (enabled=%s, interval=%ds)", JOINER_ENABLED, WORKER_INTERVAL_SECONDS)
+    LOGGER.info(
+        "Joiner worker loop started (enabled=%s, mode=%s, interval=%ds)",
+        JOINER_ENABLED, JOINER_MODE, WORKER_INTERVAL_SECONDS,
+    )
 
     while True:
         try:
@@ -362,7 +749,6 @@ async def joiner_worker_loop(get_db_func) -> None:
             _worker_state.last_tick_ts = time.time()
             _worker_state.refresh_hourly_count()
 
-            # Run synchronous DB work in thread pool to avoid blocking event loop
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(None, worker_tick, get_db_func)
 
@@ -633,13 +1019,38 @@ def create_joiner_router(get_db_func) -> APIRouter:
             ).fetchone()["c"]
             checks.append({"check": "no_orphan_profile_refs", "ok": orphan_count == 0, "detail": f"orphans={orphan_count}"})
 
-        # 5. Worker status (Phase 3)
+            # 5. Global joins last hour (Phase 4)
+            cutoff_iso = datetime.fromtimestamp(
+                time.time() - 3600, tz=timezone.utc
+            ).isoformat(timespec="seconds")
+            global_joins = db.execute(
+                "SELECT COUNT(*) as c FROM join_events WHERE event_type IN ('ITEM_JOINED','ITEM_COMPLETED') AND created_at > ?",
+                (cutoff_iso,),
+            ).fetchone()["c"]
+            checks.append({"check": "global_joins_last_hour", "ok": True, "detail": str(global_joins)})
+
+            # 6. Consecutive failures (Phase 4)
+            recent_events = db.execute(
+                "SELECT event_type FROM join_events WHERE created_at > ? ORDER BY rowid DESC LIMIT 10",
+                (cutoff_iso,),
+            ).fetchall()
+            consec_fails = 0
+            for ev in recent_events:
+                if ev["event_type"] == "ITEM_FAILED":
+                    consec_fails += 1
+                else:
+                    break
+            checks.append({"check": "consecutive_failures", "ok": consec_fails < 3, "detail": str(consec_fails)})
+
+        # 7. Worker status
         checks.append({"check": "joiner_enabled", "ok": True, "detail": str(JOINER_ENABLED)})
+        checks.append({"check": "joiner_mode", "ok": True, "detail": JOINER_MODE})
         checks.append({"check": "worker_running", "ok": _worker_state.running, "detail": f"disabled={_worker_state.disabled}, reason={_worker_state.disable_reason}"})
         checks.append({"check": "last_worker_tick", "ok": True, "detail": f"ts={_worker_state.last_tick_ts:.0f}"})
         checks.append({"check": "processed_last_hour", "ok": True, "detail": str(_worker_state.processed_last_hour)})
 
-        all_ok = all(c["ok"] for c in checks if c["check"] not in ("joiner_enabled", "worker_running", "last_worker_tick", "processed_last_hour"))
+        informational = {"joiner_enabled", "joiner_mode", "worker_running", "last_worker_tick", "processed_last_hour", "global_joins_last_hour"}
+        all_ok = all(c["ok"] for c in checks if c["check"] not in informational)
         return {"ok": all_ok, "checks": checks}
 
     return router

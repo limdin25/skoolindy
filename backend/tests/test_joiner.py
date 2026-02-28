@@ -766,9 +766,10 @@ class TestWorkerRestartSafety:
             worker_tick._force_enabled = False
 
     def test_restart_continues_from_db(self, test_db_path):
-        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=3)
+        # Use 2 profiles so second tick can use p2 (p1 hits rate limit at 1/hour)
+        job_id = _create_test_job(test_db_path, profile_ids=["p1", "p2"], num_urls=2)
 
-        # Process 1 item
+        # Process 1 item (p1)
         self._force_tick(test_db_path)
 
         conn = sqlite3.connect(test_db_path, check_same_thread=False)
@@ -888,3 +889,466 @@ class TestItemTransitionsPhase3:
 
     def test_ready_to_cancelled(self):
         validate_item_transition("READY", "CANCELLED")  # no raise = pass
+
+
+
+# =========================================================================
+# PHASE 4: Playwright Join Execution Tests (all Playwright mocked)
+# =========================================================================
+
+from joiner import (
+    _check_global_rate_limit,
+    _check_kill_switch,
+    _compute_next_attempt_at,
+    _parse_proxy_for_joiner,
+    JOINER_MODE,
+    MAX_GLOBAL_JOINS_PER_HOUR,
+    MAX_ITEM_ATTEMPTS,
+    BACKOFF_DELAYS,
+)
+
+
+class TestJoinerModeRouting:
+    """Worker correctly dispatches based on JOINER_MODE."""
+
+    def _tick(self, db_path, mode="simulate", pw_fn=None):
+        get_db = _get_db_factory(db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = mode
+        try:
+            return worker_tick(get_db, _playwright_join_fn=pw_fn)
+        finally:
+            worker_tick._force_enabled = False
+            worker_tick._force_mode = None
+
+    def test_simulate_mode_unchanged(self, test_db_path):
+        _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+        result = self._tick(test_db_path, mode="simulate")
+        assert result["processed"] == 1
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        items = conn.execute("SELECT status FROM join_job_items").fetchall()
+        assert any(r["status"] == "JOINED" for r in items)
+        conn.close()
+
+    def test_playwright_mode_calls_pw_fn(self, test_db_path):
+        calls = []
+        def mock_pw_join(profile_id, community_url, community_key, db_path):
+            calls.append({"profile_id": profile_id, "url": community_url})
+            return {"status": "JOINED", "detail": "mock joined"}
+
+        _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+        result = self._tick(test_db_path, mode="playwright", pw_fn=mock_pw_join)
+        assert result["processed"] == 1
+        assert len(calls) == 1
+        assert calls[0]["profile_id"] == "p1"
+
+    def test_default_mode_is_simulate(self, test_db_path):
+        import joiner
+        assert joiner.JOINER_MODE == "simulate"
+
+
+class TestCanaryRateLimits:
+    """Phase 4 canary: 1/profile/hour, 2/global/hour."""
+
+    def _tick(self, db_path, mode="simulate", pw_fn=None):
+        get_db = _get_db_factory(db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = mode
+        try:
+            return worker_tick(get_db, _playwright_join_fn=pw_fn)
+        finally:
+            worker_tick._force_enabled = False
+            worker_tick._force_mode = None
+
+    def test_one_per_profile_per_hour(self, test_db_path):
+        _create_test_job(test_db_path, profile_ids=["p1"], num_urls=3)
+        # First tick should succeed
+        r1 = self._tick(test_db_path, mode="simulate")
+        assert r1["processed"] == 1
+        # Second tick should hit per-profile rate limit (1/hour)
+        r2 = self._tick(test_db_path, mode="simulate")
+        assert r2["processed"] == 0
+        assert r2["skipped_rate_limit"] is True
+
+    def test_global_limit_two_per_hour(self, test_db_path):
+        # Create job with 2 profiles, 2 URLs each
+        _create_test_job(test_db_path, profile_ids=["p1", "p2"], num_urls=2)
+        # p1 joins (1 global)
+        r1 = self._tick(test_db_path, mode="simulate")
+        assert r1["processed"] == 1
+        # p2 joins (2 global)
+        r2 = self._tick(test_db_path, mode="simulate")
+        assert r2["processed"] == 1
+        # p1 is rate-limited (1/hour), p2 is rate-limited (1/hour),
+        # but also global limit (2/hour) should block
+        r3 = self._tick(test_db_path, mode="simulate")
+        assert r3["processed"] == 0
+
+    def test_cross_profile_global_limit(self, test_db_path):
+        # Create job with 3 profiles
+        # First need to add p3 as ready (conftest adds it as 'idle')
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.execute("UPDATE profiles SET status = 'ready' WHERE id = 'p3'")
+        conn.commit()
+        conn.close()
+
+        _create_test_job(test_db_path, profile_ids=["p1", "p2", "p3"], num_urls=2)
+        r1 = self._tick(test_db_path, mode="simulate")
+        assert r1["processed"] == 1  # p1 joins
+        r2 = self._tick(test_db_path, mode="simulate")
+        assert r2["processed"] == 1  # p2 joins
+        r3 = self._tick(test_db_path, mode="simulate")
+        # Global limit = 2, should be blocked even though p3 has quota
+        assert r3["skipped_global_limit"] is True
+
+
+class TestBackoffScheduling:
+    """Phase 4 backoff: 15m, 60m, 6h between retry attempts."""
+
+    def _tick_pw(self, db_path, pw_fn):
+        get_db = _get_db_factory(db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "playwright"
+        try:
+            return worker_tick(get_db, _playwright_join_fn=pw_fn)
+        finally:
+            worker_tick._force_enabled = False
+            worker_tick._force_mode = None
+
+    def test_first_failure_backoff_15m(self, test_db_path):
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def fail_fn(*args, **kwargs):
+            return {"status": "FAILED", "detail": "test_failure"}
+
+        self._tick_pw(test_db_path, fail_fn)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT * FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        assert item["attempt_count"] == 1
+        assert item["next_attempt_at"] is not None
+        assert item["fail_reason"] == "test_failure"
+        # Item should be PENDING (retryable) not FAILED terminal
+        assert item["status"] == "PENDING"
+        conn.close()
+
+    def test_compute_backoff_delays(self):
+        # attempt 1 -> 15m = 900s
+        na1 = _compute_next_attempt_at(1)
+        assert na1 is not None
+
+        # attempt 2 -> 60m = 3600s
+        na2 = _compute_next_attempt_at(2)
+        assert na2 is not None
+        assert na2 > na1  # later
+
+        # attempt 3 -> terminal (None)
+        na3 = _compute_next_attempt_at(3)
+        assert na3 is None
+
+    def test_third_failure_terminal(self, test_db_path):
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        # Set item to already have 2 attempts with next_attempt_at in past
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "UPDATE join_job_items SET attempt_count = 2, next_attempt_at = '2020-01-01T00:00:00+00:00' WHERE job_id = ?",
+            (job_id,),
+        )
+        conn.commit()
+        conn.close()
+
+        def fail_fn(*args, **kwargs):
+            return {"status": "FAILED", "detail": "third_failure"}
+
+        self._tick_pw(test_db_path, fail_fn)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT * FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        assert item["attempt_count"] == 3
+        assert item["status"] == "FAILED"  # terminal
+        assert item["next_attempt_at"] is None
+        conn.close()
+
+    def test_items_with_future_backoff_skipped(self, test_db_path):
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        # Set next_attempt_at far in the future
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.execute(
+            "UPDATE join_job_items SET next_attempt_at = '2099-01-01T00:00:00+00:00' WHERE job_id = ?",
+            (job_id,),
+        )
+        conn.commit()
+        conn.close()
+
+        get_db = _get_db_factory(test_db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "simulate"
+        try:
+            result = worker_tick(get_db)
+        finally:
+            worker_tick._force_enabled = False
+            worker_tick._force_mode = None
+
+        assert result["processed"] == 0
+        assert result["skipped_no_work"] is True or result["skipped_rate_limit"] is True
+
+
+class TestKillSwitch:
+    """Kill switch: 3 consecutive failures or auth_session_invalid."""
+
+    def _tick_pw(self, db_path, pw_fn):
+        get_db = _get_db_factory(db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "playwright"
+        try:
+            return worker_tick(get_db, _playwright_join_fn=pw_fn)
+        finally:
+            worker_tick._force_enabled = False
+            worker_tick._force_mode = None
+
+    def test_auth_invalid_immediate_disable(self, test_db_path):
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+        _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def auth_fail_fn(*args, **kwargs):
+            return {"status": "FAILED", "detail": "auth_session_invalid"}
+
+        self._tick_pw(test_db_path, auth_fail_fn)
+        assert _worker_state.disabled is True
+        assert "auth_session_invalid" in (_worker_state.disable_reason or "")
+        # Reset
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+    def test_three_consecutive_failures_disable(self, test_db_path):
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+        # Directly insert 3 consecutive ITEM_FAILED events as the most recent
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        from joiner import _emit_event, _now_iso
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+        for i in range(3):
+            _emit_event(conn, job_id, "ITEM_FAILED", detail=f"failure_{i+1}")
+        conn.commit()
+
+        # Check kill switch directly
+        reason = _check_kill_switch(conn, "some_failure")
+        assert reason is not None
+        assert "3_consecutive" in reason
+        conn.close()
+        # Reset
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+    def test_worker_disabled_event_emitted(self, test_db_path):
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+        _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def auth_fail_fn(*args, **kwargs):
+            return {"status": "FAILED", "detail": "auth_session_invalid"}
+
+        self._tick_pw(test_db_path, auth_fail_fn)
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        events = conn.execute(
+            "SELECT event_type FROM join_events ORDER BY rowid DESC"
+        ).fetchall()
+        event_types = [e["event_type"] for e in events]
+        assert "WORKER_DISABLED" in event_types
+        conn.close()
+        # Reset
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+
+class TestPlaywrightJoinResults:
+    """Playwright join fn results correctly mapped to item status."""
+
+    def _tick_pw(self, db_path, pw_fn):
+        get_db = _get_db_factory(db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "playwright"
+        try:
+            return worker_tick(get_db, _playwright_join_fn=pw_fn)
+        finally:
+            worker_tick._force_enabled = False
+            worker_tick._force_mode = None
+
+    def _get_item_status(self, db_path, job_id):
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT status FROM join_job_items WHERE job_id = ? LIMIT 1", (job_id,)).fetchone()
+        status = item["status"]
+        conn.close()
+        return status
+
+    def test_joined(self, test_db_path):
+        _worker_state.disabled = False
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+        self._tick_pw(test_db_path, lambda *a, **k: {"status": "JOINED", "detail": "ok"})
+        assert self._get_item_status(test_db_path, job_id) == "JOINED"
+
+    def test_already_member(self, test_db_path):
+        _worker_state.disabled = False
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+        self._tick_pw(test_db_path, lambda *a, **k: {"status": "ALREADY_MEMBER", "detail": "member"})
+        assert self._get_item_status(test_db_path, job_id) == "ALREADY_MEMBER"
+
+    def test_pending_approval(self, test_db_path):
+        _worker_state.disabled = False
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+        self._tick_pw(test_db_path, lambda *a, **k: {"status": "PENDING_APPROVAL", "detail": "pending"})
+        assert self._get_item_status(test_db_path, job_id) == "PENDING_APPROVAL"
+
+    def test_skipped_paid(self, test_db_path):
+        _worker_state.disabled = False
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+        self._tick_pw(test_db_path, lambda *a, **k: {"status": "SKIPPED_PAID", "detail": "paid"})
+        assert self._get_item_status(test_db_path, job_id) == "SKIPPED_PAID"
+
+    def test_failed_with_backoff(self, test_db_path):
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+        self._tick_pw(test_db_path, lambda *a, **k: {"status": "FAILED", "detail": "some_error"})
+        # Should be PENDING (retryable, attempt 1 of 3) with next_attempt_at set
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT * FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        assert item["status"] == "PENDING"
+        assert item["next_attempt_at"] is not None
+        assert item["fail_reason"] == "some_error"
+        conn.close()
+
+
+class TestPlaywrightJoinEvents:
+    """Granular events emitted during Playwright join."""
+
+    def _tick_pw(self, db_path, pw_fn):
+        get_db = _get_db_factory(db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "playwright"
+        try:
+            return worker_tick(get_db, _playwright_join_fn=pw_fn)
+        finally:
+            worker_tick._force_enabled = False
+            worker_tick._force_mode = None
+
+    def test_events_emitted_on_success(self, test_db_path):
+        _worker_state.disabled = False
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+        self._tick_pw(test_db_path, lambda *a, **k: {"status": "JOINED", "detail": "ok"})
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        events = conn.execute(
+            "SELECT event_type FROM join_events WHERE job_id = ? ORDER BY rowid",
+            (job_id,),
+        ).fetchall()
+        types = [e["event_type"] for e in events]
+        assert "ITEM_STARTED" in types
+        assert "ITEM_NAVIGATED" in types
+        assert "ITEM_DETECTED_STATE" in types
+        assert "ITEM_COMPLETED" in types
+        assert "ITEM_JOINED" in types
+        conn.close()
+
+    def test_events_emitted_on_failure(self, test_db_path):
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+        self._tick_pw(test_db_path, lambda *a, **k: {"status": "FAILED", "detail": "nav_timeout"})
+
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        events = conn.execute(
+            "SELECT event_type, detail FROM join_events WHERE job_id = ? ORDER BY rowid",
+            (job_id,),
+        ).fetchall()
+        types = [e["event_type"] for e in events]
+        assert "ITEM_STARTED" in types
+        assert "ITEM_FAILED" in types
+        # Check detail contains fail reason
+        fail_events = [e for e in events if e["event_type"] == "ITEM_FAILED"]
+        assert len(fail_events) >= 1
+        assert "nav_timeout" in fail_events[0]["detail"]
+        conn.close()
+
+
+class TestPhase4CoreTableInvariant:
+    """Worker in playwright mode does NOT write to core EngageFlow tables."""
+
+    CORE_TABLES = ["communities", "scheduler_queue", "community_messages"]
+
+    def _ensure_core_tables(self, db_path):
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        conn.execute("CREATE TABLE IF NOT EXISTS communities (id TEXT PRIMARY KEY, name TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS scheduler_queue (id TEXT PRIMARY KEY, profile_id TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS community_messages (id TEXT PRIMARY KEY, body TEXT)")
+        conn.commit()
+        conn.close()
+
+    def _snapshot(self, db_path):
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        result = {}
+        for t in self.CORE_TABLES + ["profiles"]:
+            result[t] = conn.execute(f"SELECT COUNT(*) as c FROM {t}").fetchone()[0]
+        conn.close()
+        return result
+
+    def test_playwright_mode_no_core_writes(self, test_db_path):
+        _worker_state.disabled = False
+        self._ensure_core_tables(test_db_path)
+        _create_test_job(test_db_path, profile_ids=["p1"], num_urls=3)
+
+        before = self._snapshot(test_db_path)
+
+        def mock_join(*args, **kwargs):
+            return {"status": "JOINED", "detail": "mock"}
+
+        get_db = _get_db_factory(test_db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "playwright"
+        try:
+            # Run 1 tick (can only do 1 due to rate limit)
+            worker_tick(get_db, _playwright_join_fn=mock_join)
+        finally:
+            worker_tick._force_enabled = False
+            worker_tick._force_mode = None
+
+        after = self._snapshot(test_db_path)
+        for table in self.CORE_TABLES + ["profiles"]:
+            assert before[table] == after[table], f"core table {table} changed"
+
+
+class TestProxyParser:
+    """Proxy string parsing for joiner (replicated from engine)."""
+
+    def test_url_format(self):
+        result = _parse_proxy_for_joiner("http://user:pass@host:8080")
+        assert result["server"] == "http://host:8080"
+        assert result["username"] == "user"
+        assert result["password"] == "pass"
+
+    def test_four_part_format(self):
+        result = _parse_proxy_for_joiner("host:8080:user:pass")
+        assert result["server"] == "http://host:8080"
+        assert result["username"] == "user"
+        assert result["password"] == "pass"
+
+    def test_none_returns_none(self):
+        assert _parse_proxy_for_joiner(None) is None
+        assert _parse_proxy_for_joiner("") is None
+        assert _parse_proxy_for_joiner("  ") is None

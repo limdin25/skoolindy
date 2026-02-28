@@ -3,7 +3,8 @@ EngageFlow Community Joiner — Phase 2+3+4+4.1+4.2+4.3a+4.4
 DB tables, API routes, normalization, event audit, background worker,
 Playwright join execution (canary), post-click verification (4.1), forensic capture (4.2), WAF detection (4.3a), WAF false-positive fix (4.4-waf), API-first join (4.4), www API join (4.5),
 filled survey + api2 group_id + cancel/leave (4.6),
-join-group contract + answer objects + deterministic verify (4.7).
+join-group contract + answer objects + deterministic verify (4.7),
+remove optimistic verify fallback (4.7b).
 No mutation of core tables. Self-contained Playwright — no imports from automation/.
 """
 from __future__ import annotations
@@ -814,14 +815,14 @@ def _verify_membership_via_classroom(page, slug: str) -> dict:
     2. "Cancel Request" in body text -> PENDING_APPROVAL
     3. Final URL contains /classroom AND no join button visible -> JOINED
     4. Redirected to /about with join button visible -> NOT_MEMBER (retriable)
-    5. Fallback -> JOINED (optimistic: join-group 200 was accepted)
+    5. Fallback -> UNKNOWN_VERIFY (inconclusive, caller treats as retriable failure)
     """
     try:
         page.goto(f"https://www.skool.com/{slug}/classroom",
                    timeout=15000, wait_until="domcontentloaded")
         page.wait_for_timeout(2000)
     except Exception:
-        return {"status": "JOINED",
+        return {"status": "UNKNOWN_VERIFY",
                 "detail": f"verify_nav_failed slug={slug}"}
 
     try:
@@ -861,9 +862,9 @@ def _verify_membership_via_classroom(page, slug: str) -> dict:
                 return {"status": "NOT_MEMBER",
                         "detail": f"verify_redirected_about_join_visible slug={slug}"}
 
-    # 5. Fallback optimistic
-    return {"status": "JOINED",
-            "detail": f"verify_fallback_optimistic slug={slug}"}
+    # 5. Inconclusive — no deterministic signal found
+    return {"status": "UNKNOWN_VERIFY",
+            "detail": f"classroom_verify_inconclusive slug={slug}"}
 
 
 def _cancel_join_via_api2(page, slug: str) -> dict:
@@ -1138,6 +1139,16 @@ def _execute_playwright_join(
             verify["www_api"] = True
             if verify["status"] == "NOT_MEMBER":
                 return {"status": "FAILED", "detail": f"join_group_409_but_not_member slug={slug}"}
+            if verify["status"] == "UNKNOWN_VERIFY":
+                forensic_events = []
+                if job_id and item_id:
+                    try:
+                        forensic_events = _capture_forensics(page, job_id, item_id)
+                    except Exception as fe:
+                        LOGGER.warning("Forensic capture on verify_inconclusive: %s", str(fe)[:200])
+                return {"status": "FAILED",
+                        "detail": f"verify_inconclusive slug={slug}",
+                        "forensic_events": forensic_events}
             return verify
 
         # --- 200: join accepted, check survey ---
@@ -1160,9 +1171,9 @@ def _execute_playwright_join(
             if "survey_result" in dir() and survey_result:
                 verify["survey_answers_count"] = survey_result["answers_count"]
 
-            if verify["status"] == "NOT_MEMBER":
+            if verify["status"] in ("NOT_MEMBER", "UNKNOWN_VERIFY"):
                 # Re-call join-group once, then verify again
-                LOGGER.info("NOT_MEMBER after verify, re-calling join-group slug=%s", slug)
+                LOGGER.info("%s after verify, re-calling join-group slug=%s", verify["status"], slug)
                 retry_result = _try_join_via_www_join_group(page, slug)
                 if retry_result["ok"] or retry_result["status_code"] == 409:
                     verify2 = _verify_membership_via_classroom(page, slug)
@@ -1170,6 +1181,17 @@ def _execute_playwright_join(
                     verify2["join_retry"] = True
                     if "survey_answers_count" in verify:
                         verify2["survey_answers_count"] = verify["survey_answers_count"]
+                    # If retry verify is also inconclusive, capture forensics and fail
+                    if verify2["status"] == "UNKNOWN_VERIFY":
+                        forensic_events = []
+                        if job_id and item_id:
+                            try:
+                                forensic_events = _capture_forensics(page, job_id, item_id)
+                            except Exception as fe:
+                                LOGGER.warning("Forensic capture on verify_inconclusive: %s", str(fe)[:200])
+                        return {"status": "FAILED",
+                                "detail": f"verify_inconclusive slug={slug}",
+                                "forensic_events": forensic_events}
                     return verify2
                 # Retry also failed
                 return {"status": "FAILED",

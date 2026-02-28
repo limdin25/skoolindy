@@ -3535,11 +3535,11 @@ class TestDeterministicVerify:
         assert result["status"] == "NOT_MEMBER"
         assert "about" in result["detail"]
 
-    def test_nav_failure_returns_optimistic_joined(self):
-        """Navigation error -> fallback optimistic JOINED."""
+    def test_nav_failure_returns_unknown_verify(self):
+        """Navigation error -> UNKNOWN_VERIFY (not optimistic JOINED)."""
         page = _MockWwwApiPage(goto_error="timeout")
         result = _verify_membership_via_classroom(page, "test-group")
-        assert result["status"] == "JOINED"
+        assert result["status"] == "UNKNOWN_VERIFY"
         assert "nav_failed" in result["detail"]
 
 
@@ -3711,3 +3711,160 @@ class TestPhase47CoreTableInvariant:
         _blocked_profiles.clear()
         _worker_state.disabled = False
         _worker_state.disable_reason = None
+
+
+
+# =========================================================================
+# PHASE 4.7b: remove optimistic fallback, UNKNOWN_VERIFY
+# =========================================================================
+
+
+class TestVerifyInconclusive:
+    """Unit: _verify_membership_via_classroom returns UNKNOWN_VERIFY when inconclusive."""
+
+    def test_no_signals_returns_unknown_verify(self):
+        """Page with no deterministic signals -> UNKNOWN_VERIFY."""
+        class BlankPage(_MockWwwApiPage):
+            def goto(self, url, **kwargs):
+                # Simulate redirect away from /classroom to unexpected URL
+                self.url = "https://www.skool.com/test-group/unexpected"
+            def text_content(self, sel):
+                return "some random content"
+            def query_selector(self, sel):
+                return None
+        page = BlankPage()
+        result = _verify_membership_via_classroom(page, "test-group")
+        assert result["status"] == "UNKNOWN_VERIFY"
+        assert "inconclusive" in result["detail"]
+
+    def test_classroom_url_with_join_button_returns_unknown(self):
+        """On /classroom but join button visible -> UNKNOWN_VERIFY (not JOINED)."""
+        class ClassroomWithJoinBtn(_MockWwwApiPage):
+            def text_content(self, sel):
+                return "some page content"
+            def query_selector(self, sel):
+                # Join button IS visible
+                if "join" in sel.lower() or "Join" in sel:
+                    return _MockElement(visible=True)
+                return None
+        page = ClassroomWithJoinBtn()
+        result = _verify_membership_via_classroom(page, "test-group")
+        assert result["status"] == "UNKNOWN_VERIFY"
+        assert "inconclusive" in result["detail"]
+
+    def test_leave_group_still_returns_joined(self):
+        """'Leave Group' text -> JOINED (unchanged from 4.7)."""
+        page = _MockWwwApiPage(goto_state="MEMBER")
+        result = _verify_membership_via_classroom(page, "test-group")
+        assert result["status"] == "JOINED"
+
+    def test_cancel_request_still_returns_pending(self):
+        """'Cancel Request' text -> PENDING_APPROVAL (unchanged from 4.7)."""
+        page = _MockWwwApiPage(goto_state="PENDING")
+        result = _verify_membership_via_classroom(page, "test-group")
+        assert result["status"] == "PENDING_APPROVAL"
+
+
+class TestPhase47bInconclusiveIntegration:
+    """Integration: inconclusive verify does NOT mark JOINED and schedules retry."""
+
+    def _tick_pw(self, db_path, pw_fn):
+        get_db = _get_db_factory(db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "playwright"
+        try:
+            return worker_tick(get_db, _playwright_join_fn=pw_fn)
+        finally:
+            worker_tick._force_enabled = False
+            worker_tick._force_mode = None
+
+    def setup_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+    def teardown_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+    def test_inconclusive_verify_does_not_mark_joined(self, test_db_path):
+        """When verify is inconclusive, item is NOT marked JOINED and stays retriable."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def fake_pw(*args, **kwargs):
+            return {"status": "FAILED",
+                    "detail": "verify_inconclusive slug=test",
+                    "forensic_events": [{"type": "ITEM_ARTIFACT", "detail": "screenshot=test.png"}]}
+
+        self._tick_pw(test_db_path, fake_pw)
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT status, attempt_count, fail_reason FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        conn.close()
+        # Must NOT be JOINED — item is set back to PENDING for retry
+        assert item["status"] != "JOINED"
+        assert item["status"] == "PENDING"  # retriable: back to PENDING with backoff
+        assert item["attempt_count"] == 1
+        assert "verify_inconclusive" in (item["fail_reason"] or "")
+
+    def test_inconclusive_verify_has_forensic_events(self, test_db_path):
+        """When verify is inconclusive, forensic events are stored."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def fake_pw(*args, **kwargs):
+            return {"status": "FAILED",
+                    "detail": "verify_inconclusive slug=test",
+                    "forensic_events": [
+                        {"type": "ITEM_ARTIFACT", "detail": "screenshot=artifacts/joiner/j1/i1/test.png"},
+                        {"type": "ITEM_ARTIFACT", "detail": "url=https://www.skool.com/test/classroom"},
+                    ]}
+
+        self._tick_pw(test_db_path, fake_pw)
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        events = conn.execute(
+            "SELECT event_type, detail FROM join_events WHERE job_id = ? AND event_type = 'ITEM_ARTIFACT'",
+            (job_id,)
+        ).fetchall()
+        conn.close()
+        assert len(events) >= 1
+        details = [e["detail"] for e in events]
+        assert any("screenshot" in d for d in details)
+
+    def test_inconclusive_item_can_retry(self, test_db_path):
+        """After inconclusive failure, item retries on next tick and succeeds."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        call_count = [0]
+        def fake_pw(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return {"status": "FAILED",
+                        "detail": "verify_inconclusive slug=test"}
+            return {"status": "JOINED",
+                    "detail": "verified_leave_group slug=test",
+                    "www_api": True}
+
+        # First tick: inconclusive -> set back to PENDING (retriable)
+        self._tick_pw(test_db_path, fake_pw)
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT status, attempt_count FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        conn.close()
+        assert item["status"] == "PENDING"  # retriable
+        assert item["attempt_count"] == 1
+
+        # Reset backoff so item is immediately eligible
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.execute("UPDATE join_job_items SET next_attempt_at = NULL WHERE job_id = ?", (job_id,))
+        conn.commit()
+        conn.close()
+
+        # Second tick: JOINED
+        self._tick_pw(test_db_path, fake_pw)
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT status FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        conn.close()
+        assert item["status"] == "JOINED"

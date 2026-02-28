@@ -3,6 +3,7 @@ EngageFlow Joiner — Phase 2 Test Suite
 Unit + Contract + Behavioral + Invariant tests.
 """
 from __future__ import annotations
+import json
 import os, sys, sqlite3
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -3121,12 +3122,10 @@ class TestPhase45CoreTableInvariant:
 class TestBuildSurveyAnswers:
     """Unit tests: survey answers are never empty and match field patterns."""
 
-    def test_empty_questions_returns_generic(self):
-        """No questions -> at least one generic answer object."""
+    def test_empty_questions_returns_empty_list(self):
+        """No questions -> empty list (caller decides whether to submit)."""
         answers = _build_survey_answers([])
-        assert len(answers) >= 1
-        assert isinstance(answers[0], dict)
-        assert answers[0]["answer"] == _GENERIC_ANSWER
+        assert answers == []
 
     def test_email_field_matched(self):
         """Question with 'email' in label -> email default answer object."""
@@ -3172,10 +3171,10 @@ class TestBuildSurveyAnswers:
             assert a["answer"] != ""
             assert len(a["answer"]) > 5
 
-    def test_answers_never_empty_array(self):
-        """Answers list is never empty, even with no questions."""
+    def test_answers_empty_when_no_questions(self):
+        """Answers list is empty when no questions provided."""
         answers = _build_survey_answers([])
-        assert len(answers) >= 1
+        assert len(answers) == 0
 
     def test_no_pii_in_field_patterns(self):
         """_FIELD_PATTERNS keys all exist in _SURVEY_DEFAULTS."""
@@ -3477,13 +3476,10 @@ class TestSurveyAnswerObjectFormat:
             assert isinstance(a["answer"], str)
             assert len(a["answer"]) > 0
 
-    def test_generic_fallback_is_object(self):
-        """Generic fallback (no questions) returns answer objects."""
+    def test_empty_questions_returns_empty(self):
+        """No questions returns empty list (survey gate in caller)."""
         answers = _build_survey_answers([])
-        assert len(answers) >= 1
-        assert isinstance(answers[0], dict)
-        assert "answer" in answers[0]
-        assert answers[0]["answer"] == _GENERIC_ANSWER
+        assert answers == []
 
     def test_no_bare_strings_in_answers(self):
         """Answers list never contains bare strings."""
@@ -4015,3 +4011,200 @@ class TestForensicsOn404:
         conn.close()
         assert item["status"] != "JOINED"
         assert "not_found" in (item["fail_reason"] or "")
+
+
+
+# =========================================================================
+# PHASE 4.7d: modal parsing, survey gate, NOT_MEMBER forensics
+# =========================================================================
+
+from joiner import _parse_join_group_modal
+
+
+class TestParseJoinGroupModal:
+    """Unit: _parse_join_group_modal extracts group_id and survey questions."""
+
+    def test_full_modal_json(self):
+        """Standard modal JSON with group_id and questions."""
+        payload = json.dumps({
+            "skoolers_modal": {
+                "group_id": "db46e2a8c15944448f2c03a861bd5cb6",
+                "survey": {
+                    "questions": [
+                        {"id": "q1", "type": "email", "label": "What is your email?"},
+                        {"id": "q2", "type": "radio", "label": "Where are you?", "options": ["Just starting", "$5k+"]},
+                        {"id": "q3", "type": "text", "label": "Why do you want to join?"},
+                    ]
+                }
+            }
+        })
+        result = _parse_join_group_modal(payload)
+        assert result["has_modal"] is True
+        assert result["group_id"] == "db46e2a8c15944448f2c03a861bd5cb6"
+        assert result["survey_required"] is True
+        assert len(result["questions"]) == 3
+        assert result["questions"][0]["type"] == "email"
+        assert result["questions"][1]["type"] == "radio"
+        assert result["questions"][1]["options"] == ["Just starting", "$5k+"]
+
+    def test_flat_json_with_uuid(self):
+        """Flat JSON containing a UUID somewhere."""
+        payload = json.dumps({
+            "survey": True,
+            "id": "ab12cd34ef5678901234567890abcdef"
+        })
+        result = _parse_join_group_modal(payload)
+        assert result["has_modal"] is True
+        assert result["survey_required"] is True
+        assert len(result["group_id"]) >= 20
+
+    def test_non_json_with_survey_keyword(self):
+        """Non-JSON text containing 'survey' keyword."""
+        result = _parse_join_group_modal("Success! Please complete the survey.")
+        assert result["has_modal"] is False
+        assert result["survey_required"] is True
+        assert result["questions"] == []
+
+    def test_empty_response(self):
+        """Empty response -> no modal."""
+        result = _parse_join_group_modal("")
+        assert result["has_modal"] is False
+        assert result["group_id"] == ""
+        assert result["survey_required"] is False
+
+    def test_json_no_survey(self):
+        """JSON without survey -> has_modal but no survey."""
+        payload = json.dumps({"status": "ok", "message": "joined"})
+        result = _parse_join_group_modal(payload)
+        assert result["has_modal"] is True
+        assert result["survey_required"] is False
+        assert result["questions"] == []
+
+    def test_group_id_extraction_from_nested(self):
+        """group_id in nested survey object."""
+        payload = json.dumps({
+            "data": {
+                "survey": {
+                    "groupId": "1234567890abcdef1234567890abcdef",
+                    "questions": [{"label": "Email?", "type": "email"}]
+                }
+            }
+        })
+        result = _parse_join_group_modal(payload)
+        assert result["group_id"] == "1234567890abcdef1234567890abcdef"
+        assert len(result["questions"]) == 1
+
+
+class TestSurveySubmitGate:
+    """Unit: survey submit is skipped when questions=0 AND no modal schema."""
+
+    def test_no_submit_when_no_questions(self):
+        """_build_survey_answers returns empty list for empty questions."""
+        answers = _build_survey_answers([])
+        assert answers == []
+        # Caller should NOT call _submit_survey_answers when answers is empty
+
+    def test_radio_question_gets_first_option(self):
+        """Radio question picks first non-decline option."""
+        questions = [
+            {"label": "Where are you?", "type": "radio", "options": ["No thanks", "Just starting", "$5k+"]}
+        ]
+        answers = _build_survey_answers(questions)
+        assert len(answers) == 1
+        # Should skip "No thanks" (decline pattern) and pick "Just starting"
+        assert answers[0]["answer"] == "Just starting"
+
+    def test_radio_all_decline_picks_first(self):
+        """Radio with all decline options picks first one."""
+        questions = [
+            {"label": "Pick one", "type": "radio", "options": ["No", "None", "Not applicable"]}
+        ]
+        answers = _build_survey_answers(questions)
+        assert len(answers) == 1
+        assert answers[0]["answer"] == "No"
+
+    def test_checkbox_gets_true(self):
+        """Checkbox type gets 'true'."""
+        questions = [{"label": "I agree to terms", "type": "checkbox"}]
+        answers = _build_survey_answers(questions)
+        assert answers[0]["answer"] == "true"
+
+    def test_mixed_question_types(self):
+        """Mix of text, email, radio, checkbox all get filled."""
+        questions = [
+            {"label": "Email", "type": "email"},
+            {"label": "Experience level?", "type": "radio", "options": ["Beginner", "Advanced"]},
+            {"label": "Accept terms", "type": "checkbox"},
+            {"label": "Why join?", "type": "text"},
+        ]
+        answers = _build_survey_answers(questions)
+        assert len(answers) == 4
+        assert answers[0]["answer"] == _SURVEY_DEFAULTS["email"]
+        assert answers[1]["answer"] == "Beginner"
+        assert answers[2]["answer"] == "true"
+        assert answers[3]["answer"] == _SURVEY_DEFAULTS["why_join"]
+
+
+class TestNotMemberForensics:
+    """Integration: NOT_MEMBER after join attempts emits forensic events."""
+
+    def _tick_pw(self, db_path, pw_fn):
+        get_db = _get_db_factory(db_path)
+        worker_tick._force_enabled = True
+        worker_tick._force_mode = "playwright"
+        try:
+            return worker_tick(get_db, _playwright_join_fn=pw_fn)
+        finally:
+            worker_tick._force_enabled = False
+            worker_tick._force_mode = None
+
+    def setup_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+    def teardown_method(self):
+        _blocked_profiles.clear()
+        _worker_state.disabled = False
+        _worker_state.disable_reason = None
+
+    def test_not_member_emits_forensic_events(self, test_db_path):
+        """When join ends NOT_MEMBER, forensic artifacts are captured."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def fake_pw(*args, **kwargs):
+            return {"status": "FAILED",
+                    "detail": "not_member_after_join_attempt slug=freegroup",
+                    "forensic_events": [
+                        {"type": "ITEM_ARTIFACT", "detail": "screenshot=artifacts/joiner/j/i/not_member.png"},
+                        {"type": "ITEM_DEBUG", "detail": "url_after=https://www.skool.com/freegroup/about join_btn_text=Join"},
+                    ]}
+
+        self._tick_pw(test_db_path, fake_pw)
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        events = conn.execute(
+            "SELECT event_type, detail FROM join_events WHERE job_id = ? AND event_type IN ('ITEM_ARTIFACT', 'ITEM_DEBUG')",
+            (job_id,)
+        ).fetchall()
+        conn.close()
+        assert len(events) >= 1
+        details = [e["detail"] for e in events]
+        assert any("screenshot" in d for d in details)
+
+    def test_not_member_item_is_retriable(self, test_db_path):
+        """NOT_MEMBER result sets item to retriable PENDING with fail_reason."""
+        job_id = _create_test_job(test_db_path, profile_ids=["p1"], num_urls=1)
+
+        def fake_pw(*args, **kwargs):
+            return {"status": "FAILED",
+                    "detail": "not_member_after_join_attempt slug=freegroup"}
+
+        self._tick_pw(test_db_path, fake_pw)
+        conn = sqlite3.connect(test_db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        item = conn.execute("SELECT status, attempt_count, fail_reason FROM join_job_items WHERE job_id = ?", (job_id,)).fetchone()
+        conn.close()
+        assert item["status"] == "PENDING"  # retriable
+        assert item["attempt_count"] == 1
+        assert "not_member" in (item["fail_reason"] or "")

@@ -5,7 +5,8 @@ Playwright join execution (canary), post-click verification (4.1), forensic capt
 filled survey + api2 group_id + cancel/leave (4.6),
 join-group contract + answer objects + deterministic verify (4.7),
 remove optimistic verify fallback (4.7b),
-api2-first join-group + forensics on 404 (4.7c).
+api2-first join-group + forensics on 404 (4.7c),
+modal-based survey + observability + NOT_MEMBER forensics (4.7d).
 No mutation of core tables. Self-contained Playwright — no imports from automation/.
 """
 from __future__ import annotations
@@ -13,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import json
 import re
 import sqlite3
 import time
@@ -627,6 +629,100 @@ def _try_join_via_join_group(page, slug: str) -> dict:
 
 
 
+def _parse_join_group_modal(response_text: str) -> dict:
+    """Parse join-group response to extract modal data (group_id, survey questions).
+
+    The join-group 200 response may contain JSON with a modal payload.
+    Returns: {"has_modal": bool, "group_id": str, "survey_required": bool, "questions": list}
+    questions items: {"label": str, "type": str, "options": list[str]}
+    """
+    result = {"has_modal": False, "group_id": "", "survey_required": False, "questions": []}
+    if not response_text:
+        return result
+
+    # Try to parse as JSON
+    try:
+        data = json.loads(response_text)
+    except (json.JSONDecodeError, TypeError):
+        # Not JSON — check for "survey" keyword as hint
+        if "survey" in response_text.lower():
+            result["survey_required"] = True
+        return result
+
+    if not isinstance(data, dict):
+        return result
+
+    # Walk known modal key shapes
+    modal = None
+    for key in ("skoolers_modal", "modal", "data"):
+        if key in data and isinstance(data[key], dict):
+            modal = data[key]
+            break
+    if modal is None and "survey" in data:
+        modal = data
+    if modal is None:
+        # Flat response — check top level
+        modal = data
+
+    result["has_modal"] = True
+
+    # Extract group_id (hex UUID, 32 chars)
+    _UUID_RE = re.compile(r"[0-9a-f]{32}")
+    for gid_key in ("group_id", "groupId", "id"):
+        gid = modal.get(gid_key, "")
+        if isinstance(gid, str) and _UUID_RE.fullmatch(gid):
+            result["group_id"] = gid
+            break
+    # Nested check
+    if not result["group_id"]:
+        for sub_key in ("group", "survey"):
+            sub = modal.get(sub_key)
+            if isinstance(sub, dict):
+                for gid_key in ("group_id", "groupId", "id"):
+                    gid = sub.get(gid_key, "")
+                    if isinstance(gid, str) and _UUID_RE.fullmatch(gid):
+                        result["group_id"] = gid
+                        break
+            if result["group_id"]:
+                break
+
+    # Also scan entire text for UUID as last resort
+    if not result["group_id"]:
+        m = _UUID_RE.search(response_text)
+        if m:
+            result["group_id"] = m.group(0)
+
+    # Extract survey questions
+    survey_obj = modal.get("survey", modal)
+    if isinstance(survey_obj, dict):
+        raw_questions = survey_obj.get("questions", [])
+        if isinstance(raw_questions, list):
+            for q in raw_questions:
+                if isinstance(q, dict):
+                    label = q.get("label", q.get("title", q.get("text", "")))
+                    qtype = q.get("type", "text")
+                    options = q.get("options", [])
+                    if isinstance(options, list):
+                        options = [str(o) for o in options[:20]]
+                    else:
+                        options = []
+                    result["questions"].append({
+                        "label": str(label)[:200],
+                        "type": str(qtype),
+                        "options": options,
+                    })
+            if raw_questions:
+                result["survey_required"] = True
+
+    # If no structured questions but "survey" appears anywhere, mark required
+    if not result["questions"] and "survey" in response_text.lower():
+        result["survey_required"] = True
+
+    return result
+
+
+
+
 # ---- Survey answer defaults (mirrors standalone profileInfo) ----
 _SURVEY_DEFAULTS: Dict[str, str] = {
     "email": "hugords100@gmail.com",
@@ -713,27 +809,52 @@ def _extract_survey_questions(page) -> list:
 def _build_survey_answers(questions: list) -> list:
     """Build filled survey answers matching questions to profile defaults.
 
+    Handles text, email, radio, option, checkbox, textarea, and select types.
     Returns list of answer OBJECTS ({"answer": str}), same order as questions.
-    Never empty — always at least one generic answer object.
+    Returns empty list if questions is empty (caller decides whether to submit).
     """
+    if not questions:
+        return []
+
+    # Radio/option decline patterns — avoid these
+    _DECLINE_RE = re.compile(r"no|none|not|never|decline|skip|rather not|n/a", re.I)
+
     answers = []
     for q in questions:
         ctx = q.get("label", "").lower()
+        qtype = q.get("type", "text").lower()
+        options = q.get("options", [])
+
+        # Radio/option: pick first non-decline option
+        if qtype in ("radio", "option", "select") and options:
+            chosen = ""
+            for opt in options:
+                if not _DECLINE_RE.search(str(opt)):
+                    chosen = str(opt)
+                    break
+            if not chosen:
+                chosen = str(options[0])  # last resort: first option
+            answers.append({"answer": chosen})
+            continue
+
+        # Checkbox: always accept/agree
+        if qtype == "checkbox":
+            answers.append({"answer": "true"})
+            continue
+
+        # Text/email/textarea: match label against field patterns
         value = ""
         for key, pattern in _FIELD_PATTERNS.items():
             if pattern.search(ctx):
                 value = _SURVEY_DEFAULTS.get(key, "")
                 break
         if not value:
-            # Email type fallback
-            if q.get("type", "").lower() == "email":
+            if qtype == "email":
                 value = _SURVEY_DEFAULTS["email"]
             else:
                 value = _GENERIC_ANSWER
         answers.append({"answer": value})
-    # Guarantee non-empty
-    if not answers:
-        answers = [{"answer": _GENERIC_ANSWER}]
+
     return answers
 
 
@@ -1172,7 +1293,14 @@ def _execute_playwright_join(
             verify = _verify_membership_via_classroom(page, slug)
             verify["www_api"] = True
             if verify["status"] == "NOT_MEMBER":
-                return {"status": "FAILED", "detail": f"join_group_409_but_not_member slug={slug}"}
+                forensic_events = []
+                if job_id and item_id:
+                    try:
+                        forensic_events = _capture_forensics(page, job_id, item_id)
+                    except Exception as fe:
+                        LOGGER.warning("Forensic capture on 409_not_member: %s", str(fe)[:200])
+                return {"status": "FAILED", "detail": f"join_group_409_but_not_member slug={slug}",
+                        "forensic_events": forensic_events}
             if verify["status"] == "UNKNOWN_VERIFY":
                 forensic_events = []
                 if job_id and item_id:
@@ -1187,22 +1315,46 @@ def _execute_playwright_join(
 
         # --- 200: join accepted, check survey ---
         if join_result["ok"]:
-            response_text_lower = join_result["response_text"].lower()
+            # Parse modal from response to extract group_id + survey schema
+            modal = _parse_join_group_modal(join_result["response_text"])
+            modal_group_id = modal["group_id"]
 
-            # Check if survey is required
-            if "survey" in response_text_lower:
-                questions = _extract_survey_questions(page)
+            # Observability: emit ITEM_DEBUG with join-group details
+            _debug_parts = [
+                f"join_group endpoint_used={join_result.get('endpoint_used', 'unknown')}",
+                f"status_code={join_status}",
+                f"slug={slug}",
+                f"modal_detected={modal['has_modal']}",
+                f"group_id_present={bool(modal_group_id)}",
+                f"survey_required={modal['survey_required']}",
+                f"modal_questions={len(modal['questions'])}",
+            ]
+            LOGGER.info(" ".join(_debug_parts))
+
+            survey_result = None
+            if modal["survey_required"]:
+                # Prefer questions from modal; fall back to DOM extraction
+                questions = modal["questions"]
+                if not questions:
+                    questions = _extract_survey_questions(page)
+
                 answers = _build_survey_answers(questions)
-                group_id = _resolve_group_id(page, slug)
-                survey_result = _submit_survey_answers(page, slug, group_id, answers)
-                LOGGER.info("Survey submitted: endpoint=%s answers_count=%d questions=%d slug=%s",
-                            survey_result["endpoint"], survey_result["answers_count"],
-                            len(questions), slug)
+
+                # Survey gate: only submit if we have real answers
+                if answers:
+                    # Prefer group_id from modal, then DOM
+                    group_id = modal_group_id or _resolve_group_id(page, slug)
+                    survey_result = _submit_survey_answers(page, slug, group_id, answers)
+                    LOGGER.info("Survey submitted: endpoint=%s answers_count=%d questions=%d slug=%s group_id_present=%s",
+                                survey_result["endpoint"], survey_result["answers_count"],
+                                len(questions), slug, bool(group_id))
+                else:
+                    LOGGER.info("Survey required but no questions extracted — skipping submit slug=%s", slug)
 
             # Verify via classroom
             verify = _verify_membership_via_classroom(page, slug)
             verify["www_api"] = True
-            if "survey_result" in dir() and survey_result:
+            if survey_result:
                 verify["survey_answers_count"] = survey_result["answers_count"]
 
             if verify["status"] in ("NOT_MEMBER", "UNKNOWN_VERIFY"):
@@ -1215,21 +1367,28 @@ def _execute_playwright_join(
                     verify2["join_retry"] = True
                     if "survey_answers_count" in verify:
                         verify2["survey_answers_count"] = verify["survey_answers_count"]
-                    # If retry verify is also inconclusive, capture forensics and fail
-                    if verify2["status"] == "UNKNOWN_VERIFY":
+                    # If retry verify fails, capture forensics
+                    if verify2["status"] in ("NOT_MEMBER", "UNKNOWN_VERIFY"):
                         forensic_events = []
                         if job_id and item_id:
                             try:
                                 forensic_events = _capture_forensics(page, job_id, item_id)
                             except Exception as fe:
-                                LOGGER.warning("Forensic capture on verify_inconclusive: %s", str(fe)[:200])
+                                LOGGER.warning("Forensic capture on %s: %s", verify2["status"], str(fe)[:200])
                         return {"status": "FAILED",
-                                "detail": f"verify_inconclusive slug={slug}",
+                                "detail": f"not_member_after_join_attempt slug={slug}" if verify2["status"] == "NOT_MEMBER" else f"verify_inconclusive slug={slug}",
                                 "forensic_events": forensic_events}
                     return verify2
-                # Retry also failed
+                # Retry join-group also failed — capture forensics
+                forensic_events = []
+                if job_id and item_id:
+                    try:
+                        forensic_events = _capture_forensics(page, job_id, item_id)
+                    except Exception as fe:
+                        LOGGER.warning("Forensic capture on retry_failed: %s", str(fe)[:200])
                 return {"status": "FAILED",
-                        "detail": f"join_group_retry_failed slug={slug} status={retry_result['status_code']}"}
+                        "detail": f"join_group_retry_failed slug={slug} status={retry_result['status_code']}",
+                        "forensic_events": forensic_events}
 
             return verify
 

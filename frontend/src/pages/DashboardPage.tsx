@@ -1,6 +1,6 @@
 ﻿import { useEffect, useMemo, useRef, useState } from "react";
 import { Users, MessageSquare, Sparkles, Clock, Activity, ChevronDown, ChevronUp, ExternalLink, Download, Key, CheckCircle, XCircle, Loader2 } from "lucide-react";
-import { useActivity, useAutomationSettings, useCommunities, useProfiles, useQueue } from "@/hooks/useEngageFlow";
+import { useActivity, useAutomationSettings, useCommunities, useProfiles, useQueue, useQueuePreview } from "@/hooks/useEngageFlow";
 import { ApiError, api } from "@/lib/api";
 import NextActionsDrawer from "@/components/NextActionsDrawer";
 import { useBackend } from "@/context/BackendContext";
@@ -372,6 +372,7 @@ export default function DashboardPage() {
   const activityQuery = useActivity();
   const communitiesQuery = useCommunities();
   const queueQuery = useQueue();
+  const queuePreviewQuery = useQueuePreview();
   const automationSettingsQuery = useAutomationSettings();
   const { conversations, engineStatus, logs } = useBackend();
 
@@ -379,11 +380,12 @@ export default function DashboardPage() {
   const communities = communitiesQuery.data ?? [];
   const activityFeed = activityQuery.data ?? [];
   const queue = queueQuery.data ?? [];
+  const queuePreview = queuePreviewQuery.data ?? [];
   const adjustedQueueNowMs = Math.max(0, nowMs - queueTimerPauseOffsetMs);
   const activeTask = useMemo(() => deriveActiveQueueTask(logs, nowMs), [logs, nowMs]);
   const displayActiveTask = activeTask && (nowMs - activeTask.startedAtMs) <= 20 * 1000 ? activeTask : null;
   const recentRequeueTask = useMemo(() => deriveRecentRequeueTask(logs, nowMs), [logs, nowMs]);
-  const visibleQueue = queue;
+  const visibleQueue = queue.length > 0 ? queue : queuePreview;
   const displayQueue = interleaveQueueByProfile(visibleQueue);
   const parsedQueue = visibleQueue
     .map((item) => ({
@@ -797,7 +799,7 @@ export default function DashboardPage() {
             <div className="flex items-center gap-2">
               <Clock className="w-4 h-4 text-muted-foreground" />
               <h2 className="text-sm font-semibold text-foreground">Action Queue</h2>
-              <span className="text-xs text-muted-foreground">({visibleQueue.length} scheduled)</span>
+              <span className="text-xs text-muted-foreground">({queue.length > 0 ? `${visibleQueue.length} scheduled` : visibleQueue.length > 0 ? `0 queued + ${visibleQueue.length} forecast` : "0 scheduled"})</span>
               <div className="ml-2 inline-flex items-center rounded-md border border-border bg-background overflow-hidden">
                 <button
                   type="button"

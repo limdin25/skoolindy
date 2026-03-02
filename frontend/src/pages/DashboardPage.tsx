@@ -472,7 +472,9 @@ export default function DashboardPage() {
     if (!engineStatus?.isRunning || engineStatus?.isPaused) return "Waiting for start";
     if (connectionRest?.active) return formatCountdown(connectionRest.remainingSeconds);
     if (isWaitingSchedule) {
-      return "Waiting next window";
+      const sec = Math.max(0, Number(engineStatus?.countdownSeconds ?? 0));
+      if (sec > 0) return formatCountdown(sec);
+      return "Starting...";
     }
     if (displayActiveTask) return "Executing";
     if (!nextQueueItem) return emptyQueueReason || "--:--";

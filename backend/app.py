@@ -998,7 +998,7 @@ def _extract_logged_in_profile_slug(page: Any) -> str:
               const endpoints = [
                 "https://api2.skool.com/self",
                 "https://api2.skool.com/self/member",
-                "https://api2.skool.com/self/profile",
+                "https://api2.skool.com/self",
                 "https://api2.skool.com/self/account",
               ];
               for (const url of endpoints) {
@@ -1723,6 +1723,7 @@ def _goto_skool_entry_page(page: Any, timeout_ms: int) -> tuple[bool, str]:
     if not PLAYWRIGHT_AVAILABLE:
         return False, "Playwright is not available"
     attempts = [
+        "https://www.skool.com/chat",
         "https://www.skool.com/",
     ]
     last_error = ""
@@ -3149,6 +3150,7 @@ def _fetch_live_skool_chat_cards(
     expected_identities: Optional[List[str]] = None,
     known_profile_slugs: Optional[Set[str]] = None,
     cached_cards_by_chat: Optional[Dict[str, Dict[str, Any]]] = None,
+    cookie_json: Optional[str] = None,
 ) -> tuple[List[Dict[str, Any]], Optional[str]]:
     if not PLAYWRIGHT_AVAILABLE:
         return [], "Playwright is not available on backend"
@@ -3208,6 +3210,28 @@ def _fetch_live_skool_chat_cards(
                     page.set_default_timeout(12000)
                     page_ready = False
                     try:
+                        if cookie_json and cookie_json.strip():
+                            try:
+                                import json as _json
+                                arr = _json.loads(cookie_json) if isinstance(cookie_json, str) else cookie_json
+                                if isinstance(arr, dict):
+                                    arr = [arr]
+                                pw_cookies = []
+                                for x in (arr or []):
+                                    name = x.get("name") or x.get("key")
+                                    value = str(x.get("value", ""))
+                                    if name:
+                                        pw_cookies.append({
+                                            "name": str(name),
+                                            "value": value,
+                                            "domain": ".skool.com",
+                                            "path": "/",
+                                        })
+                                if pw_cookies:
+                                    page.goto("https://www.skool.com/", wait_until="domcontentloaded", timeout=15000)
+                                    context.add_cookies(pw_cookies)
+                            except Exception as _cookie_exc:
+                                LOGGER.warning("Inbox sync cookie inject failed for %s: %s", profile_id, _cookie_exc)
                         nav_ok, _ = _goto_skool_entry_page(page, nav_timeout_ms)
                         page_ready = bool(nav_ok)
                     except Exception:
@@ -3570,6 +3594,7 @@ def _fetch_live_skool_chat_cards_with_timeout(
     expected_identities: Optional[List[str]] = None,
     known_profile_slugs: Optional[Set[str]] = None,
     cached_cards_by_chat: Optional[Dict[str, Dict[str, Any]]] = None,
+    cookie_json: Optional[str] = None,
     timeout_seconds: int = SKOOL_CHAT_PROFILE_SYNC_TIMEOUT_SECONDS,
 ) -> tuple[List[Dict[str, Any]], Optional[str]]:
     try:
@@ -3581,6 +3606,7 @@ def _fetch_live_skool_chat_cards_with_timeout(
             expected_identities,
             known_profile_slugs,
             cached_cards_by_chat,
+            cookie_json,
         )
     except Exception as exc:
         return [], f"Live DM sync failed: {str(exc)[:220] or 'unknown error'}"
@@ -4648,7 +4674,7 @@ def _sync_skool_chats_to_inbox(db: sqlite3.Connection, force: bool = False) -> N
         return
     profile_rows = db.execute(
         """
-        SELECT id, name, proxy, email
+        SELECT id, name, proxy, email, cookie_json
         FROM profiles
         WHERE lower(trim(coalesce(status, ''))) IN ('ready', 'running')
         ORDER BY name
@@ -4737,6 +4763,7 @@ def _sync_skool_chats_to_inbox(db: sqlite3.Connection, force: bool = False) -> N
                         expected_identities=[str(profile_row["name"] or ""), str(profile_row["email"] or "")],
                         known_profile_slugs=known_profile_slugs,
                         cached_cards_by_chat=cached_cards_by_chat,
+                        cookie_json=(str(profile_row["cookie_json"] or "").strip() or None),
                     )
                     if not sync_error:
                         break
@@ -5087,6 +5114,8 @@ class ProfileModel(BaseModel):
     groupsConnected: int
     hasPassword: bool = False
     proxyStatus: Optional[str] = None
+    source: Optional[str] = None
+    connected_at: Optional[str] = None
 
 
 class ProfileCreateModel(BaseModel):
@@ -5109,6 +5138,11 @@ class ProfileUpdateModel(BaseModel):
     status: Optional[str] = None
     dailyUsage: Optional[int] = None
     groupsConnected: Optional[int] = None
+
+
+class ConnectSkoolModel(BaseModel):
+    email: str
+    password: str
 
 
 class CommunityModel(BaseModel):
@@ -5815,6 +5849,8 @@ def build_profile_model(row: sqlite3.Row) -> ProfileModel:
         groupsConnected=groups_connected,
         hasPassword=bool(str(data.get("password") or "").strip()),
         proxyStatus=proxy_status,
+        source=data.get("source"),
+        connected_at=data.get("connected_at"),
     )
 
 
@@ -5824,6 +5860,33 @@ async def debug_scheduler(request: Request):
     snapshot = await engine.get_debug_snapshot()
     return JSONResponse(snapshot)
 
+
+
+
+# ==================== BROWSER LOCK SYSTEM ====================
+def acquire_browser_lock(profile_id: str, locker: str = 'engageflow') -> bool:
+    """Acquire lock before launching browser."""
+    with get_db() as db:
+        existing = db.execute(
+            'SELECT locked_by FROM browser_locks WHERE profile_id = ?',
+            (profile_id,)
+        ).fetchone()
+        if existing and existing['locked_by'] != locker:
+            raise Exception(f"Browser locked by {existing['locked_by']}")
+        now = datetime.now().isoformat()
+        db.execute(
+            'INSERT INTO browser_locks (profile_id, locked_by, locked_at) VALUES (?, ?, ?) '
+            'ON CONFLICT(profile_id) DO UPDATE SET locked_by = ?, locked_at = ?',
+            (profile_id, locker, now, locker, now)
+        )
+        db.commit()
+    return True
+
+def release_browser_lock(profile_id: str):
+    """Release lock after browser closes."""
+    with get_db() as db:
+        db.execute('DELETE FROM browser_locks WHERE profile_id = ?', (profile_id,))
+        db.commit()
 
 @app.get("/health")
 async def health_check(request: Request):
@@ -5931,6 +5994,44 @@ async def create_profile(payload: ProfileCreateModel, request: Request):
     return build_profile_model(row)
 
 
+@app.post("/connect-skool")
+async def connect_skool(payload: ConnectSkoolModel, request: Request):
+    """Public endpoint for micro-workers to connect Skool accounts. Creates profile with source='micro', status='paused'."""
+    email = (payload.email or "").strip()
+    password_plain = (payload.password or "").strip()
+    if not email or not password_plain:
+        raise HTTPException(400, "email and password are required")
+    profile_id = str(uuid.uuid4())
+    password_encrypted = encrypt_secret(password_plain)
+    name = email.split("@")[0] or email
+    username = email
+    avatar = "".join([part[0] for part in name.split() if part]).upper()[:2] or "NA"
+    connected_at = datetime.now(timezone.utc).isoformat()
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO profiles (id, name, username, password, email, proxy, avatar, status, dailyUsage, groupsConnected, source, connected_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (profile_id, name, username, password_encrypted, email, None, avatar, "paused", 0, 0, "micro", connected_at),
+        )
+        db.commit()
+    engine = get_automation_engine(request)
+    try:
+        result = await engine.check_login(profile_id)
+        if isinstance(result, dict) and result.get("success"):
+            return {"success": True, "profileId": profile_id, "message": "Connected"}
+        msg = str(result.get("message", "Login failed")) if isinstance(result, dict) else "Login failed"
+        with get_db() as db:
+            db.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))
+            db.commit()
+        raise HTTPException(400, msg)
+    except HTTPException:
+        raise
+    except Exception as e:
+        with get_db() as db:
+            db.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))
+            db.commit()
+        raise HTTPException(400, str(e))
+
+
 @app.put("/profiles/{profile_id}", response_model=ProfileModel)
 def update_profile(profile_id: str, payload: ProfileUpdateModel):
     updates = payload.model_dump(exclude_unset=True)
@@ -5980,6 +6081,7 @@ def reset_profile_counters(profile_id: str):
         )
         _db_commit_with_retry(db)
     return {"success": True}
+
 
 
 @app.delete("/profiles/{profile_id}")
@@ -6400,6 +6502,46 @@ def update_automation_settings(payload: AutomationSettingsModel):
     return payload
 
 
+
+@app.post("/communities/auto-register")
+def auto_register_community():
+    """Webhook from joiner: auto-register a newly joined community."""
+    data = request.json or {}
+    profile_id = data.get("profileId", "")
+    slug = data.get("slug", "")
+    name = data.get("name", slug)
+    url = data.get("url", f"https://www.skool.com/{slug}")
+
+    if not profile_id or not slug:
+        return {"error": "profileId and slug required"}, 400
+
+    with get_db() as db:
+        # Check profile exists
+        profile = db.execute("SELECT id FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+        if not profile:
+            return {"error": "Profile not found"}, 404
+
+        # Check if community already exists for this profile
+        existing = db.execute(
+            "SELECT id FROM communities WHERE profileId = ? AND url LIKE ?",
+            (profile_id, f"%{slug}%")
+        ).fetchone()
+        if existing:
+            return {"message": "Community already registered", "id": existing["id"]}
+
+        # Create new community with defaults
+        import uuid
+        comm_id = str(uuid.uuid4())
+        now = datetime.now().isoformat()
+        db.execute(
+            """INSERT INTO communities (id, profileId, name, url, dailyLimit, maxPostAgeDays, lastScanned, status, matchesToday, actionsToday, totalScannedPosts, totalKeywordMatches)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (comm_id, profile_id, name, url, 3, 7, now, "active", 0, 0, 0, 0)
+        )
+        db.commit()
+
+    return {"success": True, "id": comm_id, "message": f"Auto-registered {name}"}
+
 @app.get("/queue/preview")
 def queue_preview(limit: int = 50, days: int = 2):
     """Read-only projected schedule. No DB writes, no Playwright, no mutation."""
@@ -6412,6 +6554,16 @@ def queue_preview(limit: int = 50, days: int = 2):
         profiles = db.execute("SELECT * FROM profiles WHERE status IN ('ready','running','idle') ORDER BY name").fetchall()
         communities_rows = db.execute("SELECT * FROM communities WHERE status = 'active' ORDER BY name").fetchall()
         settings_row = db.execute("SELECT value FROM automation_settings WHERE key = 'default'").fetchone()
+        keyword_rules_rows = db.execute("SELECT id, keyword, assignedProfileIds FROM keyword_rules WHERE active = 1").fetchall()
+
+    # Build keywords_by_profile for forecast keyword assignment
+    _keywords_by_profile: Dict[str, List[tuple]] = {}
+    for kr in keyword_rules_rows:
+        assigned = str(kr["assignedProfileIds"] or "")
+        for pid_part in assigned.split(","):
+            pid_part = pid_part.strip()
+            if pid_part:
+                _keywords_by_profile.setdefault(pid_part, []).append((str(kr["id"]), str(kr["keyword"])))
 
     if not profiles:
         return []
@@ -6457,6 +6609,8 @@ def queue_preview(limit: int = 50, days: int = 2):
             "comm_idx": comm_idx,
             "remaining_today": remaining_today,
             "daily_cap": global_daily_cap,
+            "kw_idx": 0,
+            "keywords": _keywords_by_profile.get(pid, []),
         })
 
     if not profile_states:
@@ -6525,6 +6679,15 @@ def queue_preview(limit: int = 50, days: int = 2):
             elif delta_days > 1:
                 day_label = projected_dt.strftime("%a %b %d")
 
+            # Pick keyword via round-robin
+            kw_name = ""
+            kw_id = ""
+            if ps.get("keywords"):
+                kw_entry = ps["keywords"][ps["kw_idx"] % len(ps["keywords"])]
+                kw_id = kw_entry[0]
+                kw_name = kw_entry[1]
+                ps["kw_idx"] += 1
+
             items.append({
                 "id": f"preview-{len(items)}",
                 "profile": ps["name"],
@@ -6532,8 +6695,8 @@ def queue_preview(limit: int = 50, days: int = 2):
                 "community": str(found_community.get("name") or ""),
                 "communityId": cid,
                 "postId": "",
-                "keyword": "",
-                "keywordId": "",
+                "keyword": kw_name,
+                "keywordId": kw_id,
                 "scheduledTime": display_time,
                 "scheduledFor": scheduled_for_iso,
                 "priorityScore": 0,
@@ -6546,10 +6709,27 @@ def queue_preview(limit: int = 50, days: int = 2):
 
         slot += 1
         if not added_this_round:
-            # All profiles exhausted for the remaining window
-            break
-        if slot > limit * 10:
-            # Safety valve
+            # All profiles capped for current day - jump to next day boundary
+            projected_dt = now + timedelta(seconds=step_seconds * (slot + 1))
+            next_day_start = datetime.combine(projected_dt.date() + timedelta(days=1), datetime.min.time())
+            # Add 5 seconds past midnight (matches engine reset timing)
+            next_day_start = next_day_start.replace(second=5)
+            jump_seconds = (next_day_start - now).total_seconds()
+            if jump_seconds <= 0:
+                break
+            new_slot = int(jump_seconds / step_seconds) + 1
+            if new_slot <= slot:
+                break
+            slot = new_slot
+            # Reset daily counters
+            current_day = next_day_start.date()
+            for ps2 in profile_states:
+                day_remaining[ps2["id"]] = ps2["daily_cap"]
+                day_comm_actions[ps2["id"]] = {}
+            continue
+        max_slots = int((end_boundary - now).total_seconds() / step_seconds) + limit
+        if slot > max_slots:
+            # Safety valve: don't exceed the forecast window
             break
 
     return items

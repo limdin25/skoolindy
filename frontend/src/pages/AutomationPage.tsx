@@ -692,7 +692,53 @@ export default function AutomationPage() {
           </div>
         </SettingsCard>
 
-        <SettingsCard>
+        <SettingsCard title="Follow-Up Automation">
+          <p className="text-xs text-muted-foreground mb-3">Automatically send follow-up DMs when contacts don't reply after an AI message.</p>
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-foreground">Enable Follow-Ups</span>
+              <Toggle checked={!!settings.followUpEnabled} onChange={() => updateAndSaveNow({ followUpEnabled: !settings.followUpEnabled })} size="sm" />
+            </div>
+            {settings.followUpEnabled && (
+              <>
+                <div>
+                  <label className="block text-xs font-medium text-muted-foreground mb-1">Follow-Up Delay</label>
+                  <select
+                    className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                    value={settings.followUpDelaySeconds ?? 86400}
+                    onChange={(e) => updateAndSaveNow({ followUpDelaySeconds: Number(e.target.value) })}
+                  >
+                    <option value={1}>1 second (test)</option>
+                    <option value={60}>1 minute (test)</option>
+                    <option value={3600}>1 hour</option>
+                    <option value={10800}>3 hours</option>
+                    <option value={86400}>1 day</option>
+                    <option value={172800}>2 days</option>
+                    <option value={259200}>3 days</option>
+                    <option value={2592000}>1 month</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-muted-foreground mb-1">Max Follow-Ups per Conversation</label>
+                  <select
+                    className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                    value={settings.followUpMaxCount ?? 2}
+                    onChange={(e) => updateAndSaveNow({ followUpMaxCount: Number(e.target.value) })}
+                  >
+                    <option value={0}>0 (disabled)</option>
+                    <option value={1}>1</option>
+                    <option value={2}>2</option>
+                    <option value={3}>3</option>
+                    <option value={5}>5</option>
+                  </select>
+                </div>
+                <p className="text-xs text-muted-foreground">Per-keyword overrides: dmReplyDelay (delay in seconds) and dmMaxReplies (max count) on keyword rules take priority over these global defaults.</p>
+              </>
+            )}
+          </div>
+        </SettingsCard>
+
+                <SettingsCard>
           <h3 className="text-sm font-semibold text-foreground mb-4">Advanced</h3>
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">

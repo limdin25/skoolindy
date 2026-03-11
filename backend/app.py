@@ -320,6 +320,139 @@ async def _run_auto_scan(app: FastAPI, settings_dict: dict) -> None:
         )
         db_log.commit()
 
+_FOLLOW_UP_CHECK_INTERVAL_SECONDS = 60
+
+
+async def _follow_up_checker_loop(app: FastAPI) -> None:
+    """Background loop: every 60s, send follow-up DMs for overdue conversations."""
+    await asyncio.sleep(30)
+    while True:
+        try:
+            with get_db() as db:
+                settings = _load_or_create_automation_settings(db)
+                s = settings.model_dump() if hasattr(settings, "model_dump") else {}
+            if not s.get("followUpEnabled") or not s.get("masterEnabled"):
+                await asyncio.sleep(_FOLLOW_UP_CHECK_INTERVAL_SECONDS)
+                continue
+
+            global_delay = int(s.get("followUpDelaySeconds", 86400))
+            global_max = int(s.get("followUpMaxCount", 2))
+            now_iso = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+
+            with get_db() as db:
+                due_rows = db.execute(
+                    """SELECT * FROM conversations
+                       WHERE aiAutoEnabled = 1 AND isArchived = 0 AND isDeletedUi = 0
+                         AND followUpDueAt IS NOT NULL AND followUpDueAt <= ?""",
+                    (now_iso,),
+                ).fetchall()
+
+            sent_count = 0
+            for conv in due_rows:
+                conv_id = conv["id"]
+                try:
+                    with get_db() as db:
+                        latest = db.execute(
+                            "SELECT sender FROM messages WHERE conversationId = ? AND isDeletedUi = 0 ORDER BY rowid DESC LIMIT 1",
+                            (conv_id,),
+                        ).fetchone()
+                        if latest and str(latest["sender"]).lower() == "inbound":
+                            db.execute("UPDATE conversations SET followUpCount = 0, followUpDueAt = NULL WHERE id = ?", (conv_id,))
+                            db.commit()
+                            continue
+
+                        current_count = int(conv["followUpCount"] or 0)
+                        profile_id = str(conv["profileId"] or "").strip()
+                        kw = str(conv["keyword"] or "").strip()
+                        matched_rule = _find_matching_keyword_rule(db, profile_id, kw)
+                        max_fu = int(matched_rule["dmMaxReplies"]) if matched_rule and matched_rule["dmMaxReplies"] else global_max
+                        if current_count >= max_fu:
+                            db.execute("UPDATE conversations SET followUpDueAt = NULL WHERE id = ?", (conv_id,))
+                            db.commit()
+                            continue
+
+                        ai_reply = _generate_conversation_ai_suggest(db, conv_id, "Friendly")
+                        if str(ai_reply.source or "").startswith("suggest_only_no_send"):
+                            db.execute("UPDATE conversations SET followUpDueAt = NULL WHERE id = ?", (conv_id,))
+                            db.commit()
+                            continue
+                        reply_text = str(ai_reply.text or "").strip()
+                        if not reply_text:
+                            continue
+
+                        if not _reserve_skool_send_dedupe(conv_id, reply_text, ttl_seconds=180.0):
+                            continue
+
+                        attr = parse_json_field(str(conv["commentAttribution"] or "{}"), {})
+                        post_url = str(attr.get("postUrl") or "")
+                        profile_id, chat_id_resolved = _extract_skool_chat_ids(conv_id, post_url)
+                        if not profile_id or not chat_id_resolved:
+                            db.execute("UPDATE conversations SET followUpDueAt = NULL WHERE id = ?", (conv_id,))
+                            db.commit()
+                            _release_skool_send_dedupe(conv_id, reply_text)
+                            continue
+
+                        profile_row = db.execute("SELECT id, name, proxy FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+                        if not profile_row:
+                            db.execute("UPDATE conversations SET followUpDueAt = NULL WHERE id = ?", (conv_id,))
+                            db.commit()
+                            _release_skool_send_dedupe(conv_id, reply_text)
+                            continue
+
+                    sent_card = await asyncio.to_thread(
+                        _send_message_to_skool_chat,
+                        profile_id=profile_id,
+                        profile_name=str(profile_row["name"] or ""),
+                        proxy=str(profile_row["proxy"] or ""),
+                        chat_id=chat_id_resolved,
+                        text=reply_text,
+                        contact_name=str(conv["contactName"] or ""),
+                    )
+                    if not sent_card:
+                        _release_skool_send_dedupe(conv_id, reply_text)
+                        continue
+
+                    with get_db() as db:
+                        _upsert_skool_chat_card(db, sent_card)
+                        _update_live_cache_with_skool_card(sent_card)
+                        latest_out = db.execute(
+                            "SELECT id FROM messages WHERE conversationId = ? AND sender != 'inbound' ORDER BY rowid DESC LIMIT 1",
+                            (conv_id,),
+                        ).fetchone()
+                        if latest_out:
+                            db.execute("UPDATE messages SET isAiGenerated = 1 WHERE id = ?", (latest_out["id"],))
+                        new_count = current_count + 1
+                        delay_sec = int(matched_rule["dmReplyDelay"]) if matched_rule and matched_rule["dmReplyDelay"] else global_delay
+                        new_due = None if new_count >= max_fu else (datetime.now(tz=timezone.utc) + timedelta(seconds=delay_sec)).isoformat(timespec="seconds")
+                        fu_now = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+                        db.execute(
+                            "UPDATE conversations SET followUpCount = ?, followUpDueAt = ?, lastAiOutboundAt = ?, unread = 0 WHERE id = ?",
+                            (new_count, new_due, fu_now, conv_id),
+                        )
+                        db.commit()
+                        contact_name = str(conv["contactName"] or "contact")
+                        LOGGER.info("follow-up #%d sent to %s", new_count, contact_name)
+                        try:
+                            db.execute(
+                                "INSERT OR IGNORE INTO activity_feed (id, profile, groupName, action, timestamp, postUrl) VALUES (?, ?, ?, ?, ?, ?)",
+                                (f"fu-{conv_id}-{new_count}-{fu_now}", str(conv["profileName"] or ""), str(conv["originGroup"] or ""), f"Follow-up #{new_count} to {contact_name}", fu_now, ""),
+                            )
+                            db.commit()
+                        except Exception:
+                            pass
+                    sent_count += 1
+                    await asyncio.sleep(3)
+                except Exception:
+                    LOGGER.exception("follow-up error for %s", conv_id)
+                    continue
+
+            if sent_count > 0:
+                LOGGER.info("follow-up checker: sent %d follow-ups", sent_count)
+        except Exception:
+            LOGGER.exception("follow-up checker loop error")
+        await asyncio.sleep(_FOLLOW_UP_CHECK_INTERVAL_SECONDS)
+
+
 _N8N_EXECUTOR_INTERVAL_SECONDS = 120  # check every 2 minutes
 
 async def _n8n_executor_loop(app: FastAPI) -> None:
@@ -511,6 +644,11 @@ async def lifespan(app: FastAPI):
         _daily_reset_loop(),
         name="daily-reset",
     )
+
+    # Follow-up automation background loop
+    app.state.follow_up_task = asyncio.create_task(
+        _follow_up_checker_loop(app), name="follow-up-checker",
+    )
     try:
         yield
     finally:
@@ -547,6 +685,13 @@ async def lifespan(app: FastAPI):
             reset_task.cancel()
             try:
                 await reset_task
+            except asyncio.CancelledError:
+                pass
+        fu_task = getattr(app.state, "follow_up_task", None)
+        if fu_task:
+            fu_task.cancel()
+            try:
+                await fu_task
             except asyncio.CancelledError:
                 pass
         try:
@@ -4209,6 +4354,15 @@ def _upsert_skool_chat_card(db: sqlite3.Connection, card: Dict[str, Any]) -> Opt
     _dedupe_imported_messages(db, conversation_id)
     _dedupe_adjacent_imported_messages(db, conversation_id)
 
+    # Reset follow-up state if new inbound message arrived
+    if message_changed:
+        try:
+            _latest = db.execute("SELECT sender FROM messages WHERE conversationId = ? AND isDeletedUi = 0 ORDER BY rowid DESC LIMIT 1", (conversation_id,)).fetchone()
+            if _latest and str(_latest["sender"]).lower() == "inbound":
+                db.execute("UPDATE conversations SET followUpCount = 0, followUpDueAt = NULL WHERE id = ?", (conversation_id,))
+        except Exception:
+            pass
+
     _try_ai_auto_reply(
         db=db,
         conversation_id=conversation_id,
@@ -4338,6 +4492,29 @@ def _try_ai_auto_reply(
         _upsert_skool_chat_card(db, sent_card)
         _update_live_cache_with_skool_card(sent_card)
         db.execute("UPDATE conversations SET unread = 0 WHERE id = ?", (conversation_id,))
+        # -- Mark outbound as AI-generated & schedule follow-up --
+        try:
+            _latest_out = db.execute(
+                "SELECT id FROM messages WHERE conversationId = ? AND sender != 'inbound' ORDER BY rowid DESC LIMIT 1",
+                (conversation_id,),
+            ).fetchone()
+            if _latest_out:
+                db.execute("UPDATE messages SET isAiGenerated = 1 WHERE id = ?", (_latest_out["id"],))
+            _now_iso = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+            _fu_settings = _load_or_create_automation_settings(db)
+            _fu_s = _fu_settings.model_dump() if hasattr(_fu_settings, "model_dump") else {}
+            _fu_enabled = _fu_s.get("followUpEnabled", False)
+            _global_delay = int(_fu_s.get("followUpDelaySeconds", 86400))
+            _kw = str(conversation_row["keyword"] if conversation_row else "").strip()
+            _matched_rule = _find_matching_keyword_rule(db, profile_id, _kw)
+            _delay = int(_matched_rule["dmReplyDelay"]) if _matched_rule and _matched_rule["dmReplyDelay"] else _global_delay
+            _due_at = (datetime.now(tz=timezone.utc) + timedelta(seconds=_delay)).isoformat(timespec="seconds") if _fu_enabled and _delay > 0 else None
+            db.execute(
+                "UPDATE conversations SET lastAiOutboundAt = ?, followUpCount = 0, followUpDueAt = ? WHERE id = ?",
+                (_now_iso, _due_at, conversation_id),
+            )
+        except Exception:
+            LOGGER.exception("follow-up schedule failed for %s", conversation_id)
         _insert_backend_log(
             db,
             str(profile_row["name"] or profile_name),
@@ -5374,6 +5551,17 @@ def ensure_tables() -> None:
         if "aiAutoEnabled" not in conversation_columns:
             db.execute("ALTER TABLE conversations ADD COLUMN aiAutoEnabled INTEGER NOT NULL DEFAULT 0")
         db.execute("UPDATE conversations SET aiAutoEnabled = 0 WHERE aiAutoEnabled IS NULL")
+        # -- Follow-up automation columns (conversations) --
+        if "followUpCount" not in conversation_columns:
+            db.execute("ALTER TABLE conversations ADD COLUMN followUpCount INTEGER NOT NULL DEFAULT 0")
+        if "followUpDueAt" not in conversation_columns:
+            db.execute("ALTER TABLE conversations ADD COLUMN followUpDueAt TEXT")
+        if "lastAiOutboundAt" not in conversation_columns:
+            db.execute("ALTER TABLE conversations ADD COLUMN lastAiOutboundAt TEXT")
+        # -- Follow-up automation column (messages) --
+        message_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(messages)").fetchall()}
+        if "isAiGenerated" not in message_columns:
+            db.execute("ALTER TABLE messages ADD COLUMN isAiGenerated INTEGER NOT NULL DEFAULT 0")
         community_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(communities)").fetchall()}
         if "maxPostAgeDays" not in community_columns:
             db.execute("ALTER TABLE communities ADD COLUMN maxPostAgeDays INTEGER NOT NULL DEFAULT 0")
@@ -5667,6 +5855,10 @@ class AutomationSettingsModel(BaseModel):
     blacklistTerms: List[str]
     # Who drives comment automation: "internal" (scheduler) or "n8n"
     orchestrationMode: Literal["internal", "n8n"] = "internal"
+    # -- Follow-up automation --
+    followUpEnabled: bool = False
+    followUpDelaySeconds: int = 86400
+    followUpMaxCount: int = 2
 
 
 AUTOMATION_SETTINGS_DEFAULT = AutomationSettingsModel(
@@ -5773,6 +5965,7 @@ class MessageModel(BaseModel):
     sender: Literal["outbound", "inbound"]
     timestamp: str
     isDeletedUi: bool
+    isAiGenerated: bool = False
 
 
 class MessageCreateModel(BaseModel):
@@ -5795,6 +5988,10 @@ class ConversationModel(BaseModel):
     isArchived: bool
     isDeletedUi: bool
     aiAutoEnabled: bool
+    followUpCount: int = 0
+    followUpDueAt: Optional[str] = None
+    lastAiOutboundAt: Optional[str] = None
+    aiDmCount: int = 0
     contactInfo: ContactInfoModel
     commentAttribution: CommentAttributionModel
     keywordContext: KeywordContextModel
@@ -6173,7 +6370,7 @@ def _generate_conversation_ai_suggest(
 
 
 def format_message(row: sqlite3.Row) -> MessageModel:
-    return MessageModel(id=row["id"], text=row["text"], sender=row["sender"], timestamp=row["timestamp"], isDeletedUi=bool(row["isDeletedUi"]))
+    return MessageModel(id=row["id"], text=row["text"], sender=row["sender"], timestamp=row["timestamp"], isDeletedUi=bool(row["isDeletedUi"]), isAiGenerated=bool(row["isAiGenerated"]) if "isAiGenerated" in row.keys() else False)
 
 
 def build_message_map(db: sqlite3.Connection) -> Dict[str, List[MessageModel]]:
@@ -6191,6 +6388,10 @@ def build_conversation_model(row: sqlite3.Row, messages: Dict[str, List[MessageM
         keyword=data["keyword"], originGroup=_normalize_origin_group_name(data["originGroup"]) or "Skool Inbox", lastMessage=data["lastMessage"], lastMessageTime=data["lastMessageTime"],
         unread=bool(data["unread"]), labelId=data["labelId"], isArchived=bool(data["isArchived"]), isDeletedUi=bool(data["isDeletedUi"]),
         aiAutoEnabled=bool(data.get("aiAutoEnabled", 0)),
+        followUpCount=int(data.get("followUpCount", 0) or 0),
+        followUpDueAt=data.get("followUpDueAt"),
+        lastAiOutboundAt=data.get("lastAiOutboundAt"),
+        aiDmCount=int(data.get("_aiDmCount", 0) or 0),
         contactInfo=ContactInfoModel(**parse_json_field(data["contactInfo"], {})),
         commentAttribution=CommentAttributionModel(**parse_json_field(data["commentAttribution"], {})),
         keywordContext=KeywordContextModel(**parse_json_field(data["keywordContext"], {})),
@@ -8007,7 +8208,7 @@ def read_analytics():
 @app.get("/conversations", response_model=List[ConversationModel])
 def read_conversations(profile_id: Optional[str] = None, sync: bool = False):
     # Hide orphaned chats while the related profile is deleted.
-    query = "SELECT c.rowid AS _rowid, c.* FROM conversations c INNER JOIN profiles p ON p.id = c.profileId"
+    query = "SELECT c.rowid AS _rowid, c.*, COALESCE((SELECT COUNT(*) FROM messages m WHERE m.conversationId = c.id AND m.isAiGenerated = 1), 0) AS _aiDmCount FROM conversations c INNER JOIN profiles p ON p.id = c.profileId"
     params: List[Any] = []
     if profile_id:
         query += " WHERE c.profileId = ?"

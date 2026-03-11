@@ -74,6 +74,9 @@ export interface AutomationSettings {
   blacklistEnabled: boolean;
   blacklistTerms: string[];
   orchestrationMode?: OrchestrationMode;
+  followUpEnabled?: boolean;
+  followUpDelaySeconds?: number;
+  followUpMaxCount?: number;
 }
 
 export interface QueueItem {
@@ -145,6 +148,7 @@ export interface Message {
   sender: "outbound" | "inbound";
   timestamp: string;
   isDeletedUi: boolean;
+  isAiGenerated?: boolean;
 }
 
 export interface Conversation {
@@ -161,6 +165,10 @@ export interface Conversation {
   isArchived: boolean;
   isDeletedUi: boolean;
   aiAutoEnabled: boolean;
+  followUpCount?: number;
+  followUpDueAt?: string | null;
+  lastAiOutboundAt?: string | null;
+  aiDmCount?: number;
   contactInfo: ContactInfo;
   commentAttribution: CommentAttribution;
   keywordContext: KeywordContext;

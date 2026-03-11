@@ -4387,7 +4387,7 @@ def _upsert_skool_chat_card(db: sqlite3.Connection, card: Dict[str, Any]) -> Opt
     _try_ai_auto_reply(
         db=db,
         conversation_id=conversation_id,
-        require_message_changed=True,
+        require_message_changed=False,
         message_changed=message_changed,
         chat_id_hint=chat_id,
         trigger_reason="sync_new_inbound",
@@ -4428,7 +4428,9 @@ def _try_ai_auto_reply(
     try:
         conversation_row = db.execute("SELECT * FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
         if not conversation_row:
+            LOGGER.info("[AI_AUTO] %s (%s): no conversation row", conversation_id[-12:], trigger_reason)
             return False
+        _dbg_contact = str(conversation_row["contactName"] or "?")
         if not bool(conversation_row["aiAutoEnabled"]):
             return False
         if bool(conversation_row["isArchived"]) or bool(conversation_row["isDeletedUi"]):
@@ -4449,8 +4451,10 @@ def _try_ai_auto_reply(
         latest_sender = str((latest_row["sender"] if latest_row else "") or "").strip().lower()
         if latest_sender != "inbound":
             return False
+        LOGGER.info("[AI_AUTO] %s %s (%s): PASSED all guards, generating reply...", conversation_id[-12:], _dbg_contact, trigger_reason)
 
-        # Hard guard: never send stacked outbound AI messages without an inbound reply between them
+        # Hard guard: never send stacked outbound AI messages without an inbound reply between them.
+        # Primary check: isAiGenerated flag on outbound messages.
         _last_outbound_ai = db.execute(
             "SELECT id FROM messages WHERE conversationId = ? AND sender = 'outbound' AND isAiGenerated = 1 ORDER BY rowid DESC LIMIT 1",
             (conversation_id,),
@@ -4461,14 +4465,32 @@ def _try_ai_auto_reply(
                 (conversation_id, _last_outbound_ai["id"]),
             ).fetchone()[0]
             if _inbound_after == 0:
+                LOGGER.info("[AI_AUTO] %s %s (%s): BLOCKED stacked outbound guard (isAiGenerated)", conversation_id[-12:], _dbg_contact, trigger_reason)
                 return False
+        # Fallback guard: if lastAiOutboundAt is set but no isAiGenerated=1 messages exist (bootstrap problem),
+        # check whether the latest outbound was sent AFTER lastAiOutboundAt and has no inbound reply after it.
+        elif str(conversation_row["lastAiOutboundAt"] or "").strip():
+            _latest_outbound_any = db.execute(
+                "SELECT rowid FROM messages WHERE conversationId = ? AND sender = 'outbound' ORDER BY rowid DESC LIMIT 1",
+                (conversation_id,),
+            ).fetchone()
+            if _latest_outbound_any:
+                _inbound_after_any = db.execute(
+                    "SELECT COUNT(*) FROM messages WHERE conversationId = ? AND sender = 'inbound' AND isDeletedUi = 0 AND rowid > ?",
+                    (conversation_id, _latest_outbound_any["rowid"]),
+                ).fetchone()[0]
+                if _inbound_after_any == 0:
+                    LOGGER.info("[AI_AUTO] %s %s (%s): BLOCKED stacked outbound guard (fallback)", conversation_id[-12:], _dbg_contact, trigger_reason)
+                    return False
 
         # Cooldown: also use lastAiOutboundAt from conversation row (survives message reimport)
-        _conv_last_ai = str(conversation_row.get("lastAiOutboundAt") or "").strip()
+        _conv_last_ai = str(conversation_row["lastAiOutboundAt"] or "").strip()
         if _conv_last_ai:
             try:
                 _last_ts = datetime.fromisoformat(_conv_last_ai.replace("Z", "+00:00"))
-                if (datetime.now(timezone.utc) - _last_ts).total_seconds() < 300:
+                _cd_diff = (datetime.now(timezone.utc) - _last_ts).total_seconds()
+                if _cd_diff < 300:
+                    LOGGER.info("[AI_AUTO] %s %s (%s): BLOCKED cooldown %.0fs", conversation_id[-12:], _dbg_contact, trigger_reason, _cd_diff)
                     return False
             except Exception:
                 pass
@@ -8439,6 +8461,31 @@ def patch_conversation(conversation_id: str, payload: ConversationPatchModel):
         row = db.execute("SELECT * FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
         messages = build_message_map(db)
     return build_conversation_model(row, messages)
+
+
+@app.post("/conversations/{conversation_id}/continue-automation")
+def continue_automation(conversation_id: str):
+    """Force-trigger AI auto reply for a conversation, bypassing message_changed check.
+    Respects all other guards (stacked-outbound, cooldown, master enabled, etc.)."""
+    with get_db() as db:
+        conv = db.execute("SELECT * FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+        if not conv:
+            raise HTTPException(404, "Conversation not found")
+        if not bool(conv["aiAutoEnabled"]):
+            raise HTTPException(400, "AI Auto is not enabled for this conversation")
+        result = _try_ai_auto_reply(
+            db=db,
+            conversation_id=conversation_id,
+            require_message_changed=False,
+            message_changed=True,
+            trigger_reason="continue_automation",
+        )
+        db.commit()
+        if result:
+            row = db.execute("SELECT * FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+            messages = build_message_map(db)
+            return {"status": "sent", "conversation": build_conversation_model(row, messages).model_dump()}
+        return {"status": "blocked", "reason": "One or more guards prevented sending (check latest message is inbound, cooldown, stacked outbound)"}
 
 
 @app.delete("/conversations/{conversation_id}")

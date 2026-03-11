@@ -328,6 +328,7 @@ export const api = {
   getAnalytics: () => request<AnalyticsData>("/analytics"),
 
   getConversations: (sync = false) => request<Conversation[]>(`/conversations${sync ? "?sync=true" : ""}`),
+  continueAutomation: (id: string) => request<{ status: string; reason?: string }>(`/conversations/${id}/continue-automation`, { method: "POST" }),
   patchConversation: (id: string, payload: Partial<Pick<Conversation, "labelId" | "isArchived" | "isDeletedUi" | "unread" | "aiAutoEnabled">>) =>
     request<Conversation>(`/conversations/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
   deleteConversation: (id: string) => request<{ success: boolean }>(`/conversations/${id}`, { method: "DELETE" }),

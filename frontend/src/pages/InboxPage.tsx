@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useState } from "react";
-import { Search, Send, Sparkles, ExternalLink, MessageSquare, Archive, ArchiveRestore, Trash2, Tag, X, Plus, Check, ChevronDown, ArrowLeft } from "lucide-react";
+import { Search, Send, Sparkles, ExternalLink, MessageSquare, Archive, ArchiveRestore, Trash2, Tag, X, Plus, Check, ChevronDown, ArrowLeft , Play} from "lucide-react";
 import { useBackend } from "@/context/BackendContext";
 import { api } from "@/lib/api";
 import type { Conversation, Label } from "@/lib/types";
@@ -299,10 +299,16 @@ export default function InboxPage() {
 
   useEffect(() => {
     let active = true;
-    api.getConversations(true)
+    // Fast load: fetch cached conversations first (no external API sync)
+    api.getConversations(false)
       .then(() => {
         if (!active) return;
         return refresh();
+      })
+      .then(() => {
+        if (!active) return;
+        // Background sync: trigger external Skool API sync, then refresh
+        return api.getConversations(true).then(() => active ? refresh() : undefined);
       })
       .catch(() => undefined);
     return () => {
@@ -381,6 +387,16 @@ export default function InboxPage() {
     } finally {
       setAiSuggestPending(false);
     }
+  };
+
+  const handleContinueAutomation = async () => {
+    if (!selected) return;
+    try {
+      const res = await api.continueAutomation(selected.id);
+      if (res.status === "sent") {
+        await refresh();
+      }
+    } catch {}
   };
 
   const handleToggleAiAuto = async () => {
@@ -762,6 +778,15 @@ export default function InboxPage() {
               <button disabled={aiSuggestPending} onClick={handleAISuggest} className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md bg-primary/10 text-primary hover:bg-primary/20 transition-colors disabled:opacity-60">
                 <Sparkles className="w-3.5 h-3.5" /> {aiSuggestPending ? "Generating..." : "AI Suggest"}
               </button>
+              {getAiAuto(selected) && (
+                <button
+                  onClick={handleContinueAutomation}
+                  className="inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-md bg-green-500/10 text-green-600 hover:bg-green-500/20 transition-colors"
+                  title="Force-trigger next AI reply (respects guards)"
+                >
+                  <Play className="w-3 h-3" /> Continue
+                </button>
+              )}
               <button
                 onClick={handleToggleAiAuto}
                 className="inline-flex items-center gap-1.5 text-xs font-medium px-2 py-1.5 rounded-md border border-border hover:bg-muted transition-colors"

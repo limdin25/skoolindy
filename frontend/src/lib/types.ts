@@ -44,6 +44,7 @@ export interface KeywordRule {
   dmPrompt?: string;
   dmMaxReplies?: number;
   dmReplyDelay?: number;
+  dmPromptStages?: Record<string, string>;
   active: boolean;
   assignedProfileIds: string[];
 }
@@ -77,6 +78,10 @@ export interface AutomationSettings {
   followUpEnabled?: boolean;
   followUpDelaySeconds?: number;
   followUpMaxCount?: number;
+  dmModel?: string;
+  followUpModel?: string;
+  commentModel?: string;
+  dmPromptStages?: Record<string, string>;
 }
 
 export interface QueueItem {

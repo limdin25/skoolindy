@@ -278,7 +278,9 @@ async def _run_auto_scan(app: FastAPI, settings_dict: dict) -> None:
                         break
                 try:
                     from automation.engine import _openai_generate_comment_rest
-                    generated = _openai_generate_comment_rest(openai_key, prompt_used, post_text[:4000])
+                    _cm_settings = _load_or_create_automation_settings(db)
+                    _cm_model = str(getattr(_cm_settings, "commentModel", "") or "").strip()
+                    generated = _openai_generate_comment_rest(openai_key, prompt_used, post_text[:4000], model=_cm_model)
                 except Exception:
                     continue
                 if not generated.strip():
@@ -371,7 +373,7 @@ async def _follow_up_checker_loop(app: FastAPI) -> None:
                             db.commit()
                             continue
 
-                        ai_reply = _generate_conversation_ai_suggest(db, conv_id, "Friendly")
+                        ai_reply = _generate_conversation_ai_suggest(db, conv_id, "Friendly", is_follow_up=True)
                         if str(ai_reply.source or "").startswith("suggest_only_no_send"):
                             db.execute("UPDATE conversations SET followUpDueAt = NULL WHERE id = ?", (conv_id,))
                             db.commit()
@@ -5562,6 +5564,9 @@ def ensure_tables() -> None:
         message_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(messages)").fetchall()}
         if "isAiGenerated" not in message_columns:
             db.execute("ALTER TABLE messages ADD COLUMN isAiGenerated INTEGER NOT NULL DEFAULT 0")
+        kr_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(keyword_rules)").fetchall()}
+        if "dmPromptStages" not in kr_columns:
+            db.execute("ALTER TABLE keyword_rules ADD COLUMN dmPromptStages TEXT")
         community_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(communities)").fetchall()}
         if "maxPostAgeDays" not in community_columns:
             db.execute("ALTER TABLE communities ADD COLUMN maxPostAgeDays INTEGER NOT NULL DEFAULT 0")
@@ -5801,6 +5806,7 @@ class KeywordRuleModel(BaseModel):
     dmPrompt: Optional[str]
     dmMaxReplies: Optional[int]
     dmReplyDelay: Optional[int]
+    dmPromptStages: Optional[Dict[str, str]] = None
     active: bool
     assignedProfileIds: List[str]
 
@@ -5813,6 +5819,7 @@ class KeywordRuleCreateModel(BaseModel):
     dmPrompt: Optional[str] = None
     dmMaxReplies: Optional[int] = None
     dmReplyDelay: Optional[int] = None
+    dmPromptStages: Optional[Dict[str, str]] = None
     active: bool = True
     assignedProfileIds: List[str] = []
 
@@ -5825,6 +5832,7 @@ class KeywordRuleUpdateModel(BaseModel):
     dmPrompt: Optional[str] = None
     dmMaxReplies: Optional[int] = None
     dmReplyDelay: Optional[int] = None
+    dmPromptStages: Optional[Dict[str, str]] = None
     active: Optional[bool] = None
     assignedProfileIds: Optional[List[str]] = None
 
@@ -5859,6 +5867,12 @@ class AutomationSettingsModel(BaseModel):
     followUpEnabled: bool = False
     followUpDelaySeconds: int = 86400
     followUpMaxCount: int = 2
+    # -- Model selection --
+    dmModel: str = "gpt-4o-mini"
+    followUpModel: str = ""
+    commentModel: str = "gpt-3.5-turbo"
+    # -- Staged DM prompts (JSON-encoded dict) --
+    dmPromptStages: Dict[str, str] = {}
 
 
 AUTOMATION_SETTINGS_DEFAULT = AutomationSettingsModel(
@@ -6281,10 +6295,29 @@ def _get_openai_key_for_dm() -> str:
     return ""
 
 
+def _resolve_stage(db: sqlite3.Connection, conversation_id: str, is_follow_up: bool = False) -> str:
+    """Determine the conversation stage: first, second, third, fourth_plus, or follow_up."""
+    if is_follow_up:
+        return "follow_up"
+    ai_count = db.execute(
+        "SELECT COUNT(*) FROM messages WHERE conversationId = ? AND isAiGenerated = 1",
+        (conversation_id,),
+    ).fetchone()[0]
+    if ai_count <= 0:
+        return "first"
+    if ai_count == 1:
+        return "second"
+    if ai_count == 2:
+        return "third"
+    return "fourth_plus"
+
+
 def _generate_conversation_ai_suggest(
     db: sqlite3.Connection,
     conversation_id: str,
     tone: Literal["Friendly", "Authority", "Consultant", "Casual"] = "Friendly",
+    *,
+    is_follow_up: bool = False,
 ) -> ConversationAISuggestResponse:
     row = db.execute("SELECT * FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
     if not row:
@@ -6302,8 +6335,31 @@ def _generate_conversation_ai_suggest(
     settings = _load_or_create_automation_settings(db)
     global_dm_fallback = str(getattr(settings, "dmFallbackPrompt", "") or "").strip()
 
-    selected_prompt = dm_prompt or global_dm_fallback
-    source = "keyword_rule_dm_prompt" if dm_prompt else ("global_dm_fallback_prompt" if global_dm_fallback else "suggest_only_no_send")
+    # -- Stage detection --
+    stage = _resolve_stage(db, conversation_id, is_follow_up=is_follow_up)
+
+    # -- Staged prompt resolution --
+    # Priority: keyword rule stage prompt > keyword rule dmPrompt > global stage prompt > global dmFallbackPrompt
+    kr_stages = parse_json_field(matched_rule["dmPromptStages"] if matched_rule and "dmPromptStages" in matched_rule.keys() else None, {}) if matched_rule else {}
+    global_stages = getattr(settings, "dmPromptStages", None) or {}
+    if isinstance(global_stages, str):
+        global_stages = parse_json_field(global_stages, {})
+
+    staged_prompt = str(kr_stages.get(stage, "") or "").strip() or dm_prompt or str(global_stages.get(stage, "") or "").strip() or global_dm_fallback
+
+    selected_prompt = staged_prompt
+    source_parts = []
+    if str(kr_stages.get(stage, "") or "").strip():
+        source_parts.append(f"keyword_rule_stage_{stage}")
+    elif dm_prompt:
+        source_parts.append("keyword_rule_dm_prompt")
+    elif str(global_stages.get(stage, "") or "").strip():
+        source_parts.append(f"global_stage_{stage}")
+    elif global_dm_fallback:
+        source_parts.append("global_dm_fallback_prompt")
+    else:
+        source_parts.append("suggest_only_no_send")
+    source = source_parts[0]
 
     message_rows = db.execute(
         "SELECT sender, text, timestamp FROM messages WHERE conversationId = ? AND isDeletedUi = 0 ORDER BY rowid DESC LIMIT 8",
@@ -6341,12 +6397,19 @@ def _generate_conversation_ai_suggest(
         f"- Group: {origin_group}\n"
         f"- Keyword/topic: {keyword}\n"
         f"- Desired tone: {tone}\n"
+        f"- Conversation stage: {stage}\n"
         f"- Recent chat history:\n{history}\n\n"
         "Write one DM reply in English."
     )
 
     api_key = _get_openai_key_for_dm()
-    model = os.environ.get("OPENAI_DM_MODEL", "").strip() or os.environ.get("OPENAI_MODEL", "").strip() or "gpt-4o-mini"
+    # -- Model resolution: settings > env > default --
+    s_dump = settings.model_dump() if hasattr(settings, "model_dump") else {}
+    if is_follow_up:
+        model = str(s_dump.get("followUpModel", "") or "").strip() or str(s_dump.get("dmModel", "") or "").strip() or os.environ.get("OPENAI_DM_MODEL", "").strip() or os.environ.get("OPENAI_MODEL", "").strip() or "gpt-4o-mini"
+    else:
+        model = str(s_dump.get("dmModel", "") or "").strip() or os.environ.get("OPENAI_DM_MODEL", "").strip() or os.environ.get("OPENAI_MODEL", "").strip() or "gpt-4o-mini"
+
     if not api_key:
         return ConversationAISuggestResponse(
             success=True,
@@ -7032,7 +7095,9 @@ async def automation_n8n_scan_now(request: Request):
 
                 try:
                     from automation.engine import _openai_generate_comment_rest
-                    generated = _openai_generate_comment_rest(openai_key, prompt_used, post_text[:4000])
+                    _cm_settings = _load_or_create_automation_settings(db)
+                    _cm_model = str(getattr(_cm_settings, "commentModel", "") or "").strip()
+                    generated = _openai_generate_comment_rest(openai_key, prompt_used, post_text[:4000], model=_cm_model)
                 except Exception as e:
                     results["errors"].append(f"AI generation failed: {str(e)[:100]}")
                     continue
@@ -7653,18 +7718,18 @@ def delete_label(label_id: str):
 def read_keyword_rules():
     with get_db() as db:
         rows = db.execute("SELECT * FROM keyword_rules ORDER BY keyword").fetchall()
-    return [KeywordRuleModel(id=row["id"], keyword=row["keyword"], persona=row["persona"], promptPreview=row["promptPreview"], commentPrompt=row["commentPrompt"], dmPrompt=row["dmPrompt"], dmMaxReplies=row["dmMaxReplies"], dmReplyDelay=row["dmReplyDelay"], active=bool(row["active"]), assignedProfileIds=parse_json_field(row["assignedProfileIds"], [])) for row in rows]
+    return [KeywordRuleModel(id=row["id"], keyword=row["keyword"], persona=row["persona"], promptPreview=row["promptPreview"], commentPrompt=row["commentPrompt"], dmPrompt=row["dmPrompt"], dmMaxReplies=row["dmMaxReplies"], dmReplyDelay=row["dmReplyDelay"], dmPromptStages=parse_json_field(row["dmPromptStages"] if "dmPromptStages" in row.keys() else None, None), active=bool(row["active"]), assignedProfileIds=parse_json_field(row["assignedProfileIds"], [])) for row in rows]
 
 
 @app.post("/keyword-rules", response_model=KeywordRuleModel)
 def create_keyword_rule(payload: KeywordRuleCreateModel):
     rule_id = str(uuid.uuid4())
     with get_db() as db:
-        db.execute("INSERT INTO keyword_rules (id, keyword, persona, promptPreview, commentPrompt, dmPrompt, dmMaxReplies, dmReplyDelay, active, assignedProfileIds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                   (rule_id, payload.keyword, payload.persona, payload.promptPreview, payload.commentPrompt, payload.dmPrompt, payload.dmMaxReplies, payload.dmReplyDelay, bool_to_int(payload.active), json.dumps(payload.assignedProfileIds)))
+        db.execute("INSERT INTO keyword_rules (id, keyword, persona, promptPreview, commentPrompt, dmPrompt, dmMaxReplies, dmReplyDelay, dmPromptStages, active, assignedProfileIds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   (rule_id, payload.keyword, payload.persona, payload.promptPreview, payload.commentPrompt, payload.dmPrompt, payload.dmMaxReplies, payload.dmReplyDelay, json.dumps(payload.dmPromptStages) if payload.dmPromptStages else None, bool_to_int(payload.active), json.dumps(payload.assignedProfileIds)))
         db.commit()
         row = db.execute("SELECT * FROM keyword_rules WHERE id = ?", (rule_id,)).fetchone()
-    return KeywordRuleModel(id=row["id"], keyword=row["keyword"], persona=row["persona"], promptPreview=row["promptPreview"], commentPrompt=row["commentPrompt"], dmPrompt=row["dmPrompt"], dmMaxReplies=row["dmMaxReplies"], dmReplyDelay=row["dmReplyDelay"], active=bool(row["active"]), assignedProfileIds=parse_json_field(row["assignedProfileIds"], []))
+    return KeywordRuleModel(id=row["id"], keyword=row["keyword"], persona=row["persona"], promptPreview=row["promptPreview"], commentPrompt=row["commentPrompt"], dmPrompt=row["dmPrompt"], dmMaxReplies=row["dmMaxReplies"], dmReplyDelay=row["dmReplyDelay"], dmPromptStages=parse_json_field(row["dmPromptStages"] if "dmPromptStages" in row.keys() else None, None), active=bool(row["active"]), assignedProfileIds=parse_json_field(row["assignedProfileIds"], []))
 
 
 @app.put("/keyword-rules/{rule_id}", response_model=KeywordRuleModel)
@@ -7676,7 +7741,9 @@ def update_keyword_rule(rule_id: str, payload: KeywordRuleUpdateModel):
         updates["active"] = bool_to_int(updates["active"])
     if "assignedProfileIds" in updates:
         updates["assignedProfileIds"] = json.dumps(updates["assignedProfileIds"])
-    allowed = ["keyword", "persona", "promptPreview", "commentPrompt", "dmPrompt", "dmMaxReplies", "dmReplyDelay", "active", "assignedProfileIds"]
+    if "dmPromptStages" in updates:
+        updates["dmPromptStages"] = json.dumps(updates["dmPromptStages"]) if updates["dmPromptStages"] else None
+    allowed = ["keyword", "persona", "promptPreview", "commentPrompt", "dmPrompt", "dmMaxReplies", "dmReplyDelay", "dmPromptStages", "active", "assignedProfileIds"]
     clauses = [f"{field} = ?" for field in updates if field in allowed]
     params = [updates[field] for field in updates if field in allowed]
     if not clauses:
@@ -7687,7 +7754,7 @@ def update_keyword_rule(rule_id: str, payload: KeywordRuleUpdateModel):
         db.execute(f"UPDATE keyword_rules SET {', '.join(clauses)} WHERE id = ?", (*params, rule_id))
         db.commit()
         row = db.execute("SELECT * FROM keyword_rules WHERE id = ?", (rule_id,)).fetchone()
-    return KeywordRuleModel(id=row["id"], keyword=row["keyword"], persona=row["persona"], promptPreview=row["promptPreview"], commentPrompt=row["commentPrompt"], dmPrompt=row["dmPrompt"], dmMaxReplies=row["dmMaxReplies"], dmReplyDelay=row["dmReplyDelay"], active=bool(row["active"]), assignedProfileIds=parse_json_field(row["assignedProfileIds"], []))
+    return KeywordRuleModel(id=row["id"], keyword=row["keyword"], persona=row["persona"], promptPreview=row["promptPreview"], commentPrompt=row["commentPrompt"], dmPrompt=row["dmPrompt"], dmMaxReplies=row["dmMaxReplies"], dmReplyDelay=row["dmReplyDelay"], dmPromptStages=parse_json_field(row["dmPromptStages"] if "dmPromptStages" in row.keys() else None, None), active=bool(row["active"]), assignedProfileIds=parse_json_field(row["assignedProfileIds"], []))
 
 
 @app.delete("/keyword-rules/{rule_id}")
@@ -8618,7 +8685,7 @@ def automation_test_openai(payload: OpenAITestRequest):
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={
-                "model": os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo"),
+                "model": str(getattr(_load_or_create_automation_settings(db), "commentModel", "") or "").strip() or os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo"),
                 "messages": [
                     {"role": "system", "content": "Return a short test response."},
                     {"role": "user", "content": payload.prompt},

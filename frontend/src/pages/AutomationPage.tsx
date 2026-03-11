@@ -692,6 +692,55 @@ export default function AutomationPage() {
           </div>
         </SettingsCard>
 
+        <SettingsCard title="AI Model Selection">
+          <p className="text-xs text-muted-foreground mb-3">Choose which OpenAI model to use for each type of AI generation.</p>
+          <div className="space-y-3">
+            <div>
+              <label className="block text-xs font-medium text-muted-foreground mb-1">DM Reply Model</label>
+              <select
+                className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                value={settings.dmModel ?? "gpt-4o-mini"}
+                onChange={(e) => updateAndSaveNow({ dmModel: e.target.value })}
+              >
+                <option value="gpt-4o-mini">gpt-4o-mini (default)</option>
+                <option value="gpt-4o">gpt-4o</option>
+                <option value="gpt-4-turbo">gpt-4-turbo</option>
+                <option value="gpt-3.5-turbo">gpt-3.5-turbo</option>
+                <option value="o1-mini">o1-mini</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-muted-foreground mb-1">Follow-Up Model</label>
+              <select
+                className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                value={settings.followUpModel ?? ""}
+                onChange={(e) => updateAndSaveNow({ followUpModel: e.target.value })}
+              >
+                <option value="">Same as DM model</option>
+                <option value="gpt-4o-mini">gpt-4o-mini</option>
+                <option value="gpt-4o">gpt-4o</option>
+                <option value="gpt-4-turbo">gpt-4-turbo</option>
+                <option value="gpt-3.5-turbo">gpt-3.5-turbo</option>
+                <option value="o1-mini">o1-mini</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-muted-foreground mb-1">Comment Model</label>
+              <select
+                className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                value={settings.commentModel ?? "gpt-3.5-turbo"}
+                onChange={(e) => updateAndSaveNow({ commentModel: e.target.value })}
+              >
+                <option value="gpt-3.5-turbo">gpt-3.5-turbo (default)</option>
+                <option value="gpt-4o-mini">gpt-4o-mini</option>
+                <option value="gpt-4o">gpt-4o</option>
+                <option value="gpt-4-turbo">gpt-4-turbo</option>
+                <option value="o1-mini">o1-mini</option>
+              </select>
+            </div>
+          </div>
+        </SettingsCard>
+
         <SettingsCard title="Follow-Up Automation">
           <p className="text-xs text-muted-foreground mb-3">Automatically send follow-up DMs when contacts don't reply after an AI message.</p>
           <div className="space-y-3">
@@ -736,6 +785,45 @@ export default function AutomationPage() {
               </>
             )}
           </div>
+        </SettingsCard>
+
+        <SettingsCard title="Staged DM Prompts">
+          <p className="text-xs text-muted-foreground mb-3">Optional per-stage prompt overrides. If empty, the default DM prompt is used. Per-keyword-rule staged prompts override these globals.</p>
+          {(() => {
+            const stages = settings.dmPromptStages ?? {};
+            const updateStage = (key: string, val: string) => {
+              const next = { ...stages, [key]: val };
+              if (!val.trim()) delete next[key];
+              updateAndSaveNow({ dmPromptStages: next });
+            };
+            const stageLabels: [string, string][] = [
+              ["first", "First Reply"],
+              ["second", "Second Reply"],
+              ["third", "Third Reply"],
+              ["fourth_plus", "Fourth+ Reply"],
+              ["follow_up", "Follow-Up"],
+            ];
+            return (
+              <div className="space-y-3">
+                {stageLabels.map(([key, label]) => (
+                  <details key={key} className="group">
+                    <summary className="cursor-pointer text-xs font-medium text-foreground flex items-center gap-2">
+                      <span className="transition-transform group-open:rotate-90">&#9654;</span>
+                      {label}
+                      {stages[key] ? <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary">set</span> : null}
+                    </summary>
+                    <textarea
+                      value={stages[key] ?? ""}
+                      onChange={(e) => updateStage(key, e.target.value)}
+                      rows={3}
+                      placeholder={`Optional ${label.toLowerCase()} prompt override...`}
+                      className="mt-2 w-full px-3 py-2 rounded-lg border border-border bg-background text-sm text-foreground resize-none focus:outline-none focus:ring-2 focus:ring-ring"
+                    />
+                  </details>
+                ))}
+              </div>
+            );
+          })()}
         </SettingsCard>
 
                 <SettingsCard>

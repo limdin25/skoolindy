@@ -6186,11 +6186,12 @@ def _extract_task_ref_from_post_url(post_url: str) -> str:
     return raw[:32]
 
 
-def _openai_generate_comment_rest(api_key: str, prompt: str, post_text: str) -> str:
+def _openai_generate_comment_rest(api_key: str, prompt: str, post_text: str, model: str = "") -> str:
     if not api_key:
         raise RuntimeError("OpenAI API key missing")
+    _model = model.strip() if model else os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo")
     payload = {
-        "model": os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo"),
+        "model": _model,
         "messages": [
             {"role": "system", "content": prompt or "Write a short helpful comment under 40 words."},
             {"role": "user", "content": f"Post:\n{post_text}\n\nWrite a single comment reply."},

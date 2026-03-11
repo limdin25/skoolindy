@@ -34,6 +34,7 @@ export default function KeywordsPage() {
   const [dmMaxReplies, setDmMaxReplies] = useState(3);
   const [dmReplyDelay, setDmReplyDelay] = useState(1);
   const [assignedProfiles, setAssignedProfiles] = useState<string[]>([]);
+  const [dmPromptStages, setDmPromptStages] = useState<Record<string, string>>({});
 
   const openNew = () => {
     setEditing(null);
@@ -45,6 +46,7 @@ export default function KeywordsPage() {
     setDmMaxReplies(3);
     setDmReplyDelay(1);
     setAssignedProfiles([]);
+    setDmPromptStages({});
     setShowEditor(true);
   };
 
@@ -58,6 +60,7 @@ export default function KeywordsPage() {
     setDmMaxReplies(rule.dmMaxReplies ?? 3);
     setDmReplyDelay(rule.dmReplyDelay ?? 1);
     setAssignedProfiles(rule.assignedProfileIds);
+    setDmPromptStages(rule.dmPromptStages ?? {});
     setShowEditor(true);
   };
 
@@ -72,6 +75,7 @@ export default function KeywordsPage() {
       dmPrompt,
       dmMaxReplies,
       dmReplyDelay,
+      dmPromptStages: Object.keys(dmPromptStages).length > 0 ? dmPromptStages : undefined,
       assignedProfileIds: assignedProfiles,
     };
     if (editing) {
@@ -227,6 +231,32 @@ export default function KeywordsPage() {
               <div className="border-t border-border pt-4">
                 <label className="text-xs font-semibold text-foreground mb-1 block">DM PROMPT</label>
                 <textarea value={dmPrompt} onChange={e => setDmPrompt(e.target.value)} rows={3} placeholder="Prompt used when sending a DM after engagement…" className="w-full px-3 py-2 rounded-lg border border-border bg-background text-sm text-foreground resize-none focus:outline-none focus:ring-2 focus:ring-ring" />
+                <details className="mt-3 group">
+                  <summary className="cursor-pointer text-xs font-medium text-muted-foreground flex items-center gap-2">
+                    <span className="transition-transform group-open:rotate-90">&#9654;</span>
+                    Staged Prompt Overrides
+                    {Object.values(dmPromptStages).some(v => v?.trim()) ? <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary">set</span> : null}
+                  </summary>
+                  <div className="mt-2 space-y-2">
+                    {([["first", "First Reply"], ["second", "Second Reply"], ["third", "Third Reply"], ["fourth_plus", "Fourth+ Reply"], ["follow_up", "Follow-Up"]] as const).map(([key, label]) => (
+                      <div key={key}>
+                        <label className="text-[11px] text-muted-foreground mb-0.5 block">{label}</label>
+                        <textarea
+                          value={dmPromptStages[key] ?? ""}
+                          onChange={e => {
+                            const next = { ...dmPromptStages };
+                            if (e.target.value.trim()) next[key] = e.target.value;
+                            else delete next[key];
+                            setDmPromptStages(next);
+                          }}
+                          rows={2}
+                          placeholder={`Optional ${label.toLowerCase()} override...`}
+                          className="w-full px-3 py-1.5 rounded-lg border border-border bg-background text-xs text-foreground resize-none focus:outline-none focus:ring-2 focus:ring-ring"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </details>
                 <div className="flex gap-4 mt-3">
                   <div className="flex-1">
                     <label className="text-xs text-muted-foreground mb-1 block">Max DM Replies</label>

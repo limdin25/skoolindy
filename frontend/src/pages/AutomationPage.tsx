@@ -5,6 +5,7 @@ import { useAutomationSettings, useN8nTiming, useOpenAIModels, useQueue, useQueu
 import { api } from "@/lib/api";
 import type { AutomationSettings } from "@/lib/types";
 import { toast } from "sonner";
+import { KeywordsContent } from "./KeywordsPage";
 import { useBackend } from "@/context/BackendContext";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
@@ -374,7 +375,8 @@ export default function AutomationPage() {
   };
 
   return (
-    <div className="p-4 md:p-6 lg:p-8 pt-16 md:pt-6 lg:pt-8 max-w-2xl">
+    <div className="p-4 md:p-6 lg:p-8 pt-16 md:pt-6 lg:pt-8 flex gap-8 max-w-[1600px]">
+      <div className="flex-1 max-w-2xl">
       <div className="mb-8">
         <h1 className="text-2xl font-bold text-foreground">Automation Settings</h1>
         <p className="text-sm text-muted-foreground mt-1">Global configuration inherited by all profiles</p>
@@ -928,6 +930,10 @@ export default function AutomationPage() {
         <button onClick={() => saveSettings()} className="px-4 py-2 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors">
           Save All Settings
         </button>
+      </div>
+    </div>
+      <div className="hidden xl:block w-[480px] flex-shrink-0">
+        <KeywordsContent />
       </div>
     </div>
   );

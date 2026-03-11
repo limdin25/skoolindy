@@ -4,7 +4,7 @@ import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, R
 
 const dateRanges = ["Last 7 days", "Last 14 days", "Last 30 days"];
 
-export default function AnalyticsPage() {
+export function AnalyticsContent() {
   const [range, setRange] = useState("Last 7 days");
   const [selectedProfile, setSelectedProfile] = useState("");
   const analyticsQuery = useAnalytics();
@@ -31,7 +31,7 @@ export default function AnalyticsPage() {
   };
 
   return (
-    <div className="p-4 md:p-6 lg:p-8 pt-16 md:pt-6 lg:pt-8 max-w-7xl">
+    <>
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-8">
         <div>
           <h1 className="text-2xl font-bold text-foreground">Analytics</h1>
@@ -96,6 +96,15 @@ export default function AnalyticsPage() {
           </ResponsiveContainer>
         </div>
       </div>
+    </>
+  );
+}
+
+
+export default function AnalyticsPage() {
+  return (
+    <div className="p-4 md:p-6 lg:p-8 pt-16 md:pt-6 lg:pt-8 max-w-7xl">
+      <AnalyticsContent />
     </div>
   );
 }

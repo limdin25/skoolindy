@@ -3,6 +3,7 @@ import { useBackend } from "@/context/BackendContext";
 import { api } from "@/lib/api";
 import type { LogEntry } from "@/lib/types";
 import { RefreshCw, Trash2 } from "lucide-react";
+import { AnalyticsContent } from "./AnalyticsPage";
 
 const statusColors: Record<string, string> = {
   success: "text-success",
@@ -363,7 +364,8 @@ export default function LogsPage() {
   };
 
   return (
-    <div className="p-4 md:p-6 lg:p-8 pt-16 md:pt-6 lg:pt-8 max-w-7xl h-screen flex flex-col">
+    <div className="p-4 md:p-6 lg:p-8 pt-16 md:pt-6 lg:pt-8 max-w-[1600px] h-screen flex gap-8">
+      <div className="flex-1 max-w-4xl flex flex-col">
       <div className="mb-6">
         <h1 className="text-2xl font-bold text-foreground">Logs</h1>
         <p className="text-sm text-muted-foreground mt-1">
@@ -459,6 +461,10 @@ export default function LogsPage() {
           )}
           {filtered.length === 0 && <div className="px-1 py-2 text-sm text-primary-foreground/60">No logs found for selected filters.</div>}
         </div>
+      </div>
+    </div>
+      <div className="hidden xl:block w-[480px] flex-shrink-0 overflow-y-auto">
+        <AnalyticsContent />
       </div>
     </div>
   );

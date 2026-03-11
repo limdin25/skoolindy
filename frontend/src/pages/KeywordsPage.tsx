@@ -6,7 +6,7 @@ import { Plus, Pencil, X, Sparkles, Users } from "lucide-react";
 
 const defaultPersonas = ["Growth Consultant", "Outreach Specialist", "Product Expert", "Marketing Strategist", "Tech Advisor"];
 
-export default function KeywordsPage() {
+export function KeywordsContent() {
   const keywordRulesQuery = useKeywordRules();
   const profilesQuery = useProfiles();
 
@@ -99,7 +99,7 @@ export default function KeywordsPage() {
   };
 
   return (
-    <div className="p-4 md:p-6 lg:p-8 pt-16 md:pt-6 lg:pt-8 max-w-7xl">
+    <>
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
         <div>
           <h1 className="text-2xl font-bold text-foreground">Keywords & AI Rules</h1>
@@ -331,7 +331,16 @@ export default function KeywordsPage() {
           </div>
         </div>
       )}
-    </div>
+    </>
   );
 }
 
+
+
+export default function KeywordsPage() {
+  return (
+    <div className="p-4 md:p-6 lg:p-8 pt-16 md:pt-6 lg:pt-8 max-w-7xl">
+      <KeywordsContent />
+    </div>
+  );
+}

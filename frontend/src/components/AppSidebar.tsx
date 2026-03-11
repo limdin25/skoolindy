@@ -21,10 +21,12 @@ const navItems = [
   { title: "Inbox", path: "/inbox", icon: Inbox },
   { title: "Profiles", path: "/profiles", icon: Users },
   { title: "Communities", path: "/communities", icon: Globe },
-  { title: "Keywords & AI Rules", path: "/keywords", icon: Sparkles },
+  // Keywords & AI Rules — now embedded in Automation page
+  // { title: "Keywords & AI Rules", path: "/keywords", icon: Sparkles },
   { title: "Automation", path: "/automation", icon: Zap },
   { title: "Logs", path: "/logs", icon: ScrollText },
-  { title: "Analytics", path: "/analytics", icon: BarChart3 },
+  // Analytics — now embedded in Logs page
+  // { title: "Analytics", path: "/analytics", icon: BarChart3 },
 ];
 
 interface SidebarProps {

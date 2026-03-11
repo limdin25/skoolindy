@@ -1,0 +1,11 @@
+{fetchingId === p.id && fetchProgress && (
+                                    <p className="text-xs text-muted-foreground">
+                                      {fetchProgress.status}
+                                      {fetchProgress.total > 0 && ` (${fetchProgress.current}/${fetchProgress.total})`}
+                                      {fetchProgress.community && ` — ${fetchProgress.community}`}
+                                    </p>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                            {/* Countdown + Cookies */}

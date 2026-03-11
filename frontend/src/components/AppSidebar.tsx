@@ -88,7 +88,7 @@ export default function AppSidebar({ onNavigate }: SidebarProps) {
         <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-primary">
           <Zap className="w-4 h-4 text-primary-foreground" />
         </div>
-        <span className="text-base font-semibold text-sidebar-accent-foreground tracking-tight">EngageFlow</span>
+        <span className="text-base font-semibold text-sidebar-accent-foreground tracking-tight">Skoolindy</span>
       </div>
 
       {/* Navigation */}

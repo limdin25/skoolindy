@@ -299,7 +299,7 @@ export default function InboxPage() {
 
   useEffect(() => {
     let active = true;
-    api.getConversations(false)
+    api.getConversations(true)
       .then(() => {
         if (!active) return;
         return refresh();

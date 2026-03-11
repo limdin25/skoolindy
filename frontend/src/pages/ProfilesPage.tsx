@@ -54,7 +54,7 @@ export default function ProfilesPage() {
   const selected = profiles.find(p => p.id === selectedProfileId);
   const dailyCap = settings?.globalDailyCapPerAccount ?? 0;
   const profileCommunities = selected ? communities.filter(c => c.profileId === selected.id) : [];
-  const queueItems = queueQuery.data ?? [];
+  const queueItems = queueQuery.data?.items ?? [];
 
   const nextActionByProfileId = useMemo(() => {
     const parseQueueTs = (scheduledFor: string, scheduledTime: string): number => {
@@ -381,7 +381,12 @@ export default function ProfilesPage() {
                     {profile.avatar}
                   </div>
                   <div className="flex-1 min-w-0">
-                    <p className="text-sm font-semibold text-foreground truncate">{profile.name}</p>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <p className="text-sm font-semibold text-foreground truncate">{profile.name}</p>
+                      {profile.source === "micro" && (
+                        <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-primary/20 text-primary">Micro</span>
+                      )}
+                    </div>
                     <div className="flex items-center gap-1.5 mt-0.5">
                       <span className={`w-2 h-2 rounded-full ${statusColors[displayStatus]} ${displayStatus === 'running' ? 'animate-pulse-dot' : ''}`} />
                       <span className="text-xs text-muted-foreground">{statusLabels[displayStatus] || displayStatus}</span>
@@ -401,6 +406,9 @@ export default function ProfilesPage() {
 
                 <div className="flex justify-between text-xs text-muted-foreground mb-2">
                   <span>{profile.groupsConnected} groups</span>
+                  {profile.connected_at && (
+                    <span>Added {new Date(profile.connected_at).toLocaleDateString()}</span>
+                  )}
                 </div>
                 {nextActionByProfileId.get(profile.id)?.text && (
                   <div className="h-5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
@@ -578,6 +586,9 @@ export default function ProfilesPage() {
                   <button className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border text-xs font-medium text-foreground hover:bg-muted transition-colors">
                     <RefreshCw className="w-3 h-3" /> Force Re-scan
                   </button>
+                  <button onClick={() => window.open('https://www.skool.com/settings?t=profile', '_blank')} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border text-xs font-medium text-foreground hover:bg-muted transition-colors" title="Open Skool profile settings">
+                    <Pencil className="w-3 h-3" /> Edit profile
+                  </button>
                   <button onClick={() => deleteProfile(selected.id)} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-destructive text-xs font-medium text-destructive hover:bg-destructive/10 transition-colors">
                     <Trash2 className="w-3 h-3" /> Delete
                   </button>
@@ -684,7 +695,8 @@ export default function ProfilesPage() {
         </div>
       )}
 
-    </div>
+    
+      </div>
   );
 }
 

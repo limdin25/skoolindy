@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { Clock3, Download, Info, Loader2, Play, Square, Upload, RotateCcw } from "lucide-react";
-import { useAutomationSettings } from "@/hooks/useEngageFlow";
+import { formatLiveCountdown } from "@/lib/utils";
+import { Clock3, Download, Info, Loader2, Play, Square, Upload, RotateCcw, Zap, Search, AlertCircle } from "lucide-react";
+import { useAutomationSettings, useN8nTiming, useQueue, useQueuePreview } from "@/hooks/useEngageFlow";
 import { api } from "@/lib/api";
 import type { AutomationSettings } from "@/lib/types";
 import { toast } from "sonner";
@@ -40,12 +41,13 @@ function buildTime(hour12: number, minute: number, meridiem: "AM" | "PM") {
 
 export default function AutomationPage() {
   const settingsQuery = useAutomationSettings();
-  const { engineStatus, refresh } = useBackend();
+  const { engineStatus, logs, refresh } = useBackend();
   const [settings, setSettings] = useState<AutomationSettings | null>(settingsQuery.data ?? null);
   const [showTooltip, setShowTooltip] = useState(false);
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [actionPending, setActionPending] = useState<"start" | "resume" | "stop" | null>(null);
   const [resetTasksPending, setResetTasksPending] = useState(false);
+  const [nowMs, setNowMs] = useState(Date.now());
   const saveTimerRef = useRef<number | null>(null);
   const lastSavedJsonRef = useRef<string>("");
 
@@ -57,6 +59,12 @@ export default function AutomationPage() {
       setSaveState("idle");
     }
   }, [settingsQuery.data]);
+
+  // Tick countdown every second for live display
+  useEffect(() => {
+    const t = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, []);
 
   const update = (patch: Partial<AutomationSettings>) => setSettings((prev) => (prev ? { ...prev, ...patch } : prev));
   const toSafeNumber = (value: string, fallback: number) => {
@@ -196,6 +204,30 @@ export default function AutomationPage() {
     e.target.value = "";
   };
 
+  /* ── n8n scan-now handler (hooks must be before any early return) ── */
+  const [scanPending, setScanPending] = useState(false);
+  const [scanResult, setScanResult] = useState<{ scanned: number; posts_found: number; queued: number; skipped: number; errors: string[]; ts: string } | null>(null);
+  const isN8nMode = settings?.orchestrationMode === "n8n";
+  const n8nTimingQuery = useN8nTiming(isN8nMode);
+  const n8nTiming = n8nTimingQuery.data ?? null;
+  const queueQuery = useQueue();
+  const queuePreviewQuery = useQueuePreview();
+  const realQueue = (() => {
+    const d = queueQuery.data;
+    if (!d) return [];
+    if (typeof d === "object" && "items" in d) return (d as any).items ?? [];
+    return Array.isArray(d) ? d : [];
+  })() as Array<{ id: string; profile?: string; community?: string; scheduledFor?: string; keyword?: string; [k: string]: any }>;
+  const projectedQueue = (queuePreviewQuery.data ?? []).filter((p: any) => p.isProjected);
+
+  /* ── live automation log from logs context ── */
+  const automationLogs = (logs ?? [])
+    .filter((l) => {
+      const m = (l.message || "").toLowerCase();
+      return m.includes("n8n") || m.includes("scan") || m.includes("queue") || m.includes("execute") || m.includes("executor") || m.includes("auto-scan") || m.includes("cron") || m.includes("comment");
+    })
+    .slice(0, 20);
+
   if (!settings) {
     return (
       <div className="p-4 md:p-6 lg:p-8 pt-16 md:pt-6 lg:pt-8 max-w-2xl">
@@ -207,9 +239,55 @@ export default function AutomationPage() {
     );
   }
   const isEngineStopped = !engineStatus?.isRunning;
-  const resetTasksDisabledReason = "Stop automation to clear queued tasks.";
-  const configuredRestRounds = Math.max(1, Number(settings.roundsBeforeConnectionRest || 1));
-  const configuredRestMinutes = Math.max(1, Number(settings.connectionRestMinutes || 1));
+  void 0; // connection rest UI removed — feature is opt-in backend-only
+
+  const handleScanNow = async () => {
+    setScanPending(true);
+    setScanResult(null);
+    try {
+      const r = await api.n8nScanNow();
+      setScanResult({ ...r, ts: new Date().toLocaleTimeString() });
+      n8nTimingQuery.refetch();
+      toast.success(`Scan complete: ${r.queued} queued, ${r.posts_found} posts found`);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : "Scan failed";
+      toast.error(msg);
+    } finally {
+      setScanPending(false);
+    }
+  };
+
+  const formatAgo = (raw: string | null) => {
+    if (!raw) return "never";
+    const parsed = new Date(raw);
+    if (isNaN(parsed.getTime())) {
+      return raw;
+    }
+    const diff = Date.now() - parsed.getTime();
+    // Clock skew tolerance: if timestamp is slightly in the future (< 2 min), treat as "just now"
+    // If far in the future, it's a timezone mismatch — use absolute diff
+    const absDiff = Math.abs(diff);
+    if (diff < 0 && absDiff > 120000) {
+      // Likely timezone-naive string parsed wrong — show as relative using abs
+      const s = Math.floor(absDiff / 1000);
+      if (s < 60) return "just now";
+      const m = Math.floor(s / 60);
+      if (m < 60) return `${m}m ago`;
+      const h = Math.floor(m / 60);
+      if (h < 24) return `${h}h ${m % 60}m ago`;
+      const d = Math.floor(h / 24);
+      return `${d}d ${h % 24}h ago`;
+    }
+    if (diff < 0) return "just now";
+    const s = Math.floor(diff / 1000);
+    if (s < 60) return "just now";
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ${m % 60}m ago`;
+    const d = Math.floor(h / 24);
+    return `${d}d ${h % 24}h ago`;
+  };
 
   return (
     <div className="p-4 md:p-6 lg:p-8 pt-16 md:pt-6 lg:pt-8 max-w-2xl">
@@ -219,68 +297,233 @@ export default function AutomationPage() {
       </div>
 
       <div className="space-y-6">
-        <SettingsCard title="Automation Control">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <p className="text-sm text-foreground font-medium">
-                {engineStatus?.isRunning ? (engineStatus.isPaused ? "Paused" : "Running") : "Stopped"}
-              </p>
-            </div>
-            <div className="flex items-center gap-2">
-              {!engineStatus?.isRunning && (
-                <button
-                  onClick={() => handleEngineAction("start")}
-                  disabled={actionPending !== null}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-medium hover:bg-primary/90 transition-colors disabled:opacity-60"
-                >
-                  {actionPending === "start" ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
-                  Start
-                </button>
-              )}
-              {engineStatus?.isRunning && engineStatus.isPaused && (
-                <button
-                  onClick={() => handleEngineAction("resume")}
-                  disabled={actionPending !== null}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border text-xs font-medium text-foreground hover:bg-muted transition-colors disabled:opacity-60"
-                >
-                  {actionPending === "resume" ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
-                  Resume
-                </button>
-              )}
-              {engineStatus?.isRunning && (
-                <button
-                  onClick={() => handleEngineAction("stop")}
-                  disabled={actionPending !== null}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-destructive text-xs font-medium text-destructive hover:bg-destructive/10 transition-colors disabled:opacity-60"
-                >
-                  {actionPending === "stop" ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Square className="w-3.5 h-3.5" />}
-                  Stop
-                </button>
-              )}
-              <TooltipProvider delayDuration={150}>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span className={`inline-flex ${!isEngineStopped ? "cursor-not-allowed" : ""}`}>
-                      <button
-                        onClick={handleResetTasks}
-                        disabled={!isEngineStopped || actionPending !== null || resetTasksPending}
-                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border text-xs font-medium text-foreground hover:bg-muted transition-colors disabled:opacity-60 disabled:pointer-events-none"
-                      >
-                        {resetTasksPending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />}
-                        Reset Tasks
-                      </button>
-                    </span>
-                  </TooltipTrigger>
-                  {!isEngineStopped && (
-                    <TooltipContent side="top" className="max-w-56 text-xs">
-                      {resetTasksDisabledReason}
-                    </TooltipContent>
+        {/* ── AUTOMATION CONTROL — N8N MODE ── */}
+        {isN8nMode ? (
+          <>
+            <SettingsCard title="n8n Automation Status">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <span className={`inline-block w-2 h-2 rounded-full ${settings.masterEnabled ? "bg-green-500" : "bg-red-500"}`} />
+                  <p className="text-sm text-foreground font-medium">
+                    {settings.masterEnabled ? "Armed — External automation active" : "Disarmed — Automation paused"}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={handleScanNow}
+                    disabled={scanPending || !settings.masterEnabled}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-medium hover:bg-primary/90 transition-colors disabled:opacity-60"
+                  >
+                    {scanPending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Search className="w-3.5 h-3.5" />}
+                    {scanPending ? "Scanning..." : "Run Scan Now"}
+                  </button>
+                  <button
+                    onClick={handleResetTasks}
+                    disabled={resetTasksPending}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border text-xs font-medium text-foreground hover:bg-muted transition-colors disabled:opacity-60"
+                  >
+                    {resetTasksPending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />}
+                    Reset Tasks
+                  </button>
+                </div>
+              </div>
+
+              {/* n8n timing strip */}
+              {n8nTiming && (
+                <div className="text-xs text-muted-foreground mt-2 pt-2 border-t border-border space-y-2">
+                  {/* Past events */}
+                  <div className="grid grid-cols-2 gap-x-6 gap-y-1">
+                    <div>Last scan: <span className="text-foreground">{formatAgo(n8nTiming.lastScanTime)}</span></div>
+                    <div>Last execute: <span className="text-foreground">{formatAgo(n8nTiming.lastExecuteTime)}</span></div>
+                    <div>Last queued: <span className="text-foreground">{formatAgo(n8nTiming.lastQueueInsert)}</span></div>
+                    <div>Pending: <span className="text-foreground">{n8nTiming.pendingQueueItems}</span></div>
+                  </div>
+                  {/* Upcoming countdowns */}
+                  {settings.masterEnabled && (
+                    <div className="grid grid-cols-2 gap-x-6 gap-y-1 pt-1 border-t border-border/50">
+                      <div>Next scan: <span className="text-foreground font-mono">{(() => {
+                        if (!n8nTiming.lastScanTime) return "unknown";
+                        const lastScan = new Date(n8nTiming.lastScanTime).getTime();
+                        if (isNaN(lastScan)) return "unknown";
+                        const interval = (n8nTiming.executorIntervalSeconds || 120) * 1000;
+                        const nextScanMs = lastScan + interval;
+                        const sec = Math.floor((nextScanMs - nowMs) / 1000);
+                        if (sec > 0) return formatLiveCountdown(sec);
+                        // Already overdue — show cycle info
+                        const elapsed = Math.floor((nowMs - lastScan) / 1000);
+                        const cyclePos = elapsed % Math.max(1, n8nTiming.executorIntervalSeconds || 120);
+                        const remaining = Math.max(0, (n8nTiming.executorIntervalSeconds || 120) - cyclePos);
+                        return remaining > 0 ? formatLiveCountdown(remaining) : "imminent";
+                      })()}</span></div>
+                      <div>Next execute check: <span className="text-foreground font-mono">{(() => {
+                        // Executor loop runs on a fixed interval from startup, not from last event
+                        // Best estimate: use modular arithmetic on the interval
+                        const interval = n8nTiming.executorIntervalSeconds || 120;
+                        if (!n8nTiming.lastScanTime && !n8nTiming.lastExecuteTime) return "unknown";
+                        // Use the most recent event as anchor
+                        const anchors = [n8nTiming.lastScanTime, n8nTiming.lastExecuteTime].filter(Boolean).map(t => new Date(t!).getTime()).filter(t => !isNaN(t));
+                        if (anchors.length === 0) return "unknown";
+                        const latest = Math.max(...anchors);
+                        const elapsed = Math.floor((nowMs - latest) / 1000);
+                        const cyclePos = elapsed % Math.max(1, interval);
+                        const remaining = Math.max(0, interval - cyclePos);
+                        return remaining > 0 ? formatLiveCountdown(remaining) : "imminent";
+                      })()}</span></div>
+                      <div className="col-span-2">Next planned comment: <span className="text-foreground font-mono">{(() => {
+                        // Real queue first
+                        if (n8nTiming.nextScheduledFor) {
+                          const d = new Date(n8nTiming.nextScheduledFor).getTime();
+                          if (!isNaN(d)) {
+                            const sec = Math.max(0, Math.floor((d - nowMs) / 1000));
+                            return sec <= 0 ? "ready now" : formatLiveCountdown(sec);
+                          }
+                        }
+                        // Projected fallback
+                        if (projectedQueue.length > 0) {
+                          const sorted = projectedQueue
+                            .map((p: any) => new Date(String(p.scheduledFor || "")).getTime())
+                            .filter((t: number) => !isNaN(t) && t > nowMs)
+                            .sort((a: number, b: number) => a - b);
+                          if (sorted.length > 0) {
+                            const sec = Math.max(0, Math.floor((sorted[0] - nowMs) / 1000));
+                            return sec > 0 ? `${formatLiveCountdown(sec)} (projected)` : "imminent";
+                          }
+                        }
+                        return "no upcoming actions";
+                      })()}</span></div>
+                      {/* Next planned target */}
+                      {(() => {
+                        // Show target profile > community for next planned
+                        let target: { profile?: string; community?: string } | null = null;
+                        let isProjected = false;
+                        if (realQueue.length > 0 && n8nTiming.nextScheduledFor) {
+                          const sorted = [...realQueue].filter(i => i.scheduledFor).sort((a, b) =>
+                            new Date(a.scheduledFor!).getTime() - new Date(b.scheduledFor!).getTime()
+                          );
+                          if (sorted.length > 0) target = sorted[0];
+                        } else if (projectedQueue.length > 0) {
+                          const sorted = [...projectedQueue].filter((p: any) => p.scheduledFor).sort((a: any, b: any) =>
+                            new Date(a.scheduledFor).getTime() - new Date(b.scheduledFor).getTime()
+                          );
+                          if (sorted.length > 0) { target = sorted[0] as any; isProjected = true; }
+                        }
+                        return target ? (
+                          <div className={`col-span-2 ${isProjected ? "italic text-muted-foreground/70" : ""}`}>
+                            {isProjected ? "Next planned" : "Next queued"}: <span className="text-foreground">
+                              {(target as any).profile} &gt; {(target as any).community}
+                            </span>
+                          </div>
+                        ) : null;
+                      })()}
+                    </div>
                   )}
-                </Tooltip>
-              </TooltipProvider>
+                  {settings.masterEnabled && n8nTiming.executorIntervalSeconds && (
+                    <div className="pt-1 border-t border-border/50">
+                      Executor interval: <span className="text-foreground">{Math.round(n8nTiming.executorIntervalSeconds / 60)}m</span>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* scan result */}
+              {scanResult && (
+                <div className="mt-2 p-2 rounded-lg bg-muted/50 text-xs text-muted-foreground">
+                  <span className="text-foreground font-medium">{scanResult.ts}</span> — Scanned {scanResult.scanned} communities, found {scanResult.posts_found} posts, queued {scanResult.queued}, skipped {scanResult.skipped}
+                  {scanResult.errors.length > 0 && (
+                    <div className="mt-1 text-destructive">
+                      {scanResult.errors.map((e, i) => <div key={i}>{e}</div>)}
+                    </div>
+                  )}
+                </div>
+              )}
+            </SettingsCard>
+
+            {/* ── LIVE AUTOMATION LOG ── */}
+            <SettingsCard title="Live Automation Feed">
+              <div className="space-y-1 max-h-56 overflow-y-auto font-mono bg-background/50 rounded-md p-2 border border-border/50">
+                {automationLogs.length > 0 ? automationLogs.map((log, i) => {
+                  const ts = log.timestamp || "";
+                  const isErr = (log.status || "").toLowerCase() === "error";
+                  const isSuccess = (log.status || "").toLowerCase() === "success";
+                  return (
+                    <div key={log.id || i} className={`text-[11px] leading-relaxed ${isErr ? "text-destructive" : isSuccess ? "text-green-500" : "text-muted-foreground"} flex gap-2`}>
+                      <span className="text-foreground/40 shrink-0">{ts}</span>
+                      <span className="truncate">{log.message}</span>
+                    </div>
+                  );
+                }) : (
+                  <div className="text-[11px] text-muted-foreground py-4 text-center">
+                    {settings.masterEnabled ? "Waiting for automation events..." : "Automation is stopped"}
+                  </div>
+                )}
+              </div>
+            </SettingsCard>
+          </>
+        ) : (
+          /* ── AUTOMATION CONTROL — INTERNAL MODE ── */
+          <SettingsCard title="Automation Control">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-sm text-foreground font-medium">
+                  {engineStatus?.isRunning ? (engineStatus.isPaused ? "Paused" : "Running") : "Stopped"}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                {!engineStatus?.isRunning && (
+                  <button
+                    onClick={() => handleEngineAction("start")}
+                    disabled={actionPending !== null}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-medium hover:bg-primary/90 transition-colors disabled:opacity-60"
+                  >
+                    {actionPending === "start" ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+                    Start
+                  </button>
+                )}
+                {engineStatus?.isRunning && engineStatus.isPaused && (
+                  <button
+                    onClick={() => handleEngineAction("resume")}
+                    disabled={actionPending !== null}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border text-xs font-medium text-foreground hover:bg-muted transition-colors disabled:opacity-60"
+                  >
+                    {actionPending === "resume" ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
+                    Resume
+                  </button>
+                )}
+                {engineStatus?.isRunning && (
+                  <button
+                    onClick={() => handleEngineAction("stop")}
+                    disabled={actionPending !== null}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-destructive text-xs font-medium text-destructive hover:bg-destructive/10 transition-colors disabled:opacity-60"
+                  >
+                    {actionPending === "stop" ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Square className="w-3.5 h-3.5" />}
+                    Stop
+                  </button>
+                )}
+                <TooltipProvider delayDuration={150}>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <span className={`inline-flex ${!isEngineStopped ? "cursor-not-allowed" : ""}`}>
+                        <button
+                          onClick={handleResetTasks}
+                          disabled={!isEngineStopped || actionPending !== null || resetTasksPending}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border text-xs font-medium text-foreground hover:bg-muted transition-colors disabled:opacity-60 disabled:pointer-events-none"
+                        >
+                          {resetTasksPending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />}
+                          Reset Tasks
+                        </button>
+                      </span>
+                    </TooltipTrigger>
+                    {!isEngineStopped && (
+                      <TooltipContent side="top" className="max-w-56 text-xs">
+                        Stop automation to clear queued tasks.
+                      </TooltipContent>
+                    )}
+                  </Tooltip>
+                </TooltipProvider>
+              </div>
             </div>
-          </div>
-        </SettingsCard>
+          </SettingsCard>
+        )}
 
         <SettingsCard>
           <div className="flex items-center justify-between">
@@ -289,6 +532,36 @@ export default function AutomationPage() {
               <p className="text-xs text-muted-foreground mt-0.5">{settings.masterEnabled ? "All automation is active" : "All automation is paused"}</p>
             </div>
             <Toggle checked={settings.masterEnabled} onChange={() => updateAndSaveNow({ masterEnabled: !settings.masterEnabled })} />
+          </div>
+        </SettingsCard>
+
+        <SettingsCard title="Comment automation orchestration">
+          <div>
+            <label className="text-xs text-muted-foreground mb-1 block">Who drives comment automation</label>
+            <div className="flex gap-2 mt-1">
+              <button
+                type="button"
+                onClick={() => updateAndSaveNow({ orchestrationMode: "internal" })}
+                className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${(settings.orchestrationMode ?? "internal") === "internal" ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground"}`}
+              >
+                Internal
+              </button>
+              <button
+                type="button"
+                onClick={() => updateAndSaveNow({ orchestrationMode: "n8n" })}
+                className={`px-3 py-1.5 rounded-md text-xs font-medium transition-colors ${settings.orchestrationMode === "n8n" ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground"}`}
+              >
+                n8n
+              </button>
+            </div>
+            <p className="text-[11px] text-muted-foreground mt-1.5">
+              Internal: Skoollindy scheduler scans, queues and posts comments. n8n: comment automation is orchestrated externally by n8n; scheduler does not run comment flow.
+            </p>
+            {settings.orchestrationMode === "n8n" && (
+              <div className="mt-2 p-2 rounded-lg bg-muted/50 text-xs text-muted-foreground">
+                Current mode: n8n. Comment automation is externally orchestrated by n8n. All rules and settings above still apply; n8n reads them from the backend API.
+              </div>
+            )}
           </div>
         </SettingsCard>
 
@@ -301,9 +574,9 @@ export default function AutomationPage() {
             <SettingsInput type="number" value={settings.globalDailyCapPerAccount} onChange={(e) => update({ globalDailyCapPerAccount: toSafeNumber(e.target.value, settings.globalDailyCapPerAccount) })} />
           </div>
           <div>
-            <label className="text-xs text-muted-foreground mb-1 block">Max Tasks Per Profile Per Round</label>
+            <label className="text-xs text-muted-foreground mb-1 block">Actions Per Account Per Pass</label>
             <p className="text-[11px] text-muted-foreground mb-1.5">
-              Queue prefill limit per profile for one scheduler pass (your current default is 2)
+              How many comment actions each account performs before switching to the next account
             </p>
             <SettingsInput
               type="number"
@@ -331,36 +604,6 @@ export default function AutomationPage() {
           </div>
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="text-xs text-muted-foreground mb-1 block">Rounds Before Connection Rest</label>
-              <p className="text-[11px] text-muted-foreground mb-1.5 min-h-[2rem]">After this many full circles, automation pauses connection activity.</p>
-              <SettingsInput
-                type="number"
-                min={1}
-                value={settings.roundsBeforeConnectionRest}
-                onChange={(e) =>
-                  update({
-                    roundsBeforeConnectionRest: Math.max(1, toSafeNumber(e.target.value, settings.roundsBeforeConnectionRest)),
-                  })
-                }
-              />
-            </div>
-            <div>
-              <label className="text-xs text-muted-foreground mb-1 block">Connection Rest (minutes)</label>
-              <p className="text-[11px] text-muted-foreground mb-1.5 min-h-[2rem]">How long to pause after each connection-rest trigger.</p>
-              <SettingsInput
-                type="number"
-                min={1}
-                value={settings.connectionRestMinutes}
-                onChange={(e) =>
-                  update({
-                    connectionRestMinutes: Math.max(1, toSafeNumber(e.target.value, settings.connectionRestMinutes)),
-                  })
-                }
-              />
-            </div>
-          </div>
-          <div className="grid grid-cols-2 gap-4">
-            <div>
               <label className="text-xs text-muted-foreground mb-1 block">Global Run Window From</label>
               <TimeInput id="run-from" value={settings.runFrom} onChange={(value) => updateAndSaveNow({ runFrom: value })} />
             </div>
@@ -368,12 +611,6 @@ export default function AutomationPage() {
               <label className="text-xs text-muted-foreground mb-1 block">Global Run Window To</label>
               <TimeInput id="run-to" value={settings.runTo} onChange={(value) => updateAndSaveNow({ runTo: value })} />
             </div>
-          </div>
-          <div className="rounded-lg border border-border bg-muted/20 px-3 py-2">
-            <p className="text-[11px] text-muted-foreground">
-              Current setup: pause after <span className="text-foreground font-medium">{configuredRestRounds}</span> rounds
-              for <span className="text-foreground font-medium">{configuredRestMinutes}</span> minutes.
-            </p>
           </div>
           <div>
             <label className="text-xs text-muted-foreground mb-2 block">Global Active Days</label>

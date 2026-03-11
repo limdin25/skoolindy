@@ -9,6 +9,7 @@ import type {
   LogEntry,
   Profile,
   QueueItem,
+  QueueListResponse,
   QueuePreviewItem,
 } from "./types";
 
@@ -24,9 +25,11 @@ function timeoutForPath(path: string): number {
   // Community sync can take longer because Playwright iterates profiles one by one.
   if (p.includes("/communities/fetch")) return 90000;
   if (p.includes("/check-login")) return 70000;
+  if (p.includes("/connect-skool")) return 70000;
   if (p.includes("/check-proxy")) return 70000;
   if (p.includes("/conversations") && p.includes("sync=true")) return 70000;
   if (p.includes("/conversations/") && p.includes("/messages")) return 45000;
+  if (p.includes("/n8n-scan-now")) return 300000; // Scans can take minutes (Playwright)
   return REQUEST_TIMEOUT_MS;
 }
 
@@ -274,12 +277,24 @@ export interface CommunityFetchStatus {
 
 export const getBackendBaseUrl = async () => resolveBackendBaseUrl("/automation/status");
 
+export interface AdminSummaryResponse {
+  profiles: Array<{ email: string; actionsToday: number; dailyCap: number; status: string; lastActionAt: string | null; failuresToday: number }>;
+  communities: Array<{ name: string; profile: string; actionsToday: number; dailyCap: number; editorFailures: number; skippedToday: boolean; lastFailureReason: string | null }>;
+  queue: { pending: number; retrying: number; skipped: number; failedToday: number };
+  skippedPosts: Array<{ url: string; profile: string; reason: string; skippedAt: string }>;
+}
+
 export const api = {
   getProfiles: () => request<Profile[]>("/profiles"),
   createProfile: (payload: Omit<Profile, "id">) => request<Profile>("/profiles", { method: "POST", body: JSON.stringify(payload) }),
   updateProfile: (id: string, payload: Partial<Profile>) => request<Profile>(`/profiles/${id}`, { method: "PUT", body: JSON.stringify(payload) }),
   deleteProfile: (id: string) => request<{ success: boolean }>(`/profiles/${id}`, { method: "DELETE" }),
   profileResetCounters: (profileId: string) => request<{ success: boolean }>(`/profiles/${profileId}/reset-counters`, { method: "POST" }),
+  connectSkool: (payload: { email: string; password: string }) =>
+    request<{ success: boolean; profileId?: string; message?: string }>("/connect-skool", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
 
   getCommunities: () => request<Community[]>("/communities"),
   fetchCommunities: () => request<CommunityFetchStatus>("/communities/fetch", { method: "POST" }),
@@ -301,7 +316,7 @@ export const api = {
   getAutomationSettings: () => request<AutomationSettings>("/automation/settings"),
   updateAutomationSettings: (payload: AutomationSettings) => request<AutomationSettings>("/automation/settings", { method: "PUT", body: JSON.stringify(payload) }),
 
-  getQueue: () => request<QueueItem[]>("/queue"),
+  getQueue: () => request<QueueListResponse>("/queue"),
   getQueuePreview: (limit = 50, days = 2) => request<QueuePreviewItem[]>(`/queue/preview?limit=${limit}&days=${days}`),
   updateQueueItem: (id: string, payload: Partial<QueueItem>) => request<QueueItem>(`/queue/${id}`, { method: "PUT", body: JSON.stringify(payload) }),
   queueStartSoon: (id: string, seconds = 10) => request<QueueItem>(`/queue/${id}/start-soon?seconds=${Math.max(1, Math.floor(seconds))}`, { method: "POST" }),
@@ -331,6 +346,9 @@ export const api = {
   automationResume: () => request<AutomationEngineStatus>("/automation/resume", { method: "POST" }),
   automationResetTasks: () => request<{ success: boolean; queueDeleted: number; activityDeleted: number }>("/automation/reset-tasks", { method: "POST" }),
   automationStatus: () => request<AutomationEngineStatus>("/automation/status"),
+
+  n8nScanNow: () => request<{ success: boolean; scanned: number; posts_found: number; queued: number; skipped: number; errors: string[] }>("/automation/n8n-scan-now", { method: "POST" }),
+  n8nTiming: () => request<{ lastScanTime: string | null; lastExecuteTime: string | null; lastQueueInsert: string | null; pendingQueueItems: number; nextScheduledFor: string | null; masterEnabled: boolean; isN8nMode: boolean; executorIntervalSeconds: number }>("/automation/n8n-timing"),
   profileCheckLogin: (profileId: string) => request<{ success: boolean; status: string; message: string }>(`/profiles/${profileId}/check-login`, { method: "POST" }),
   profileCheckProxy: (profileId: string) => request<{ success: boolean; status: string; message: string }>(`/profiles/${profileId}/check-proxy`, { method: "POST" }),
   automationCheckLogin: (profileId: string) => request<{ success: boolean; status: string; message: string }>(`/automation/profiles/${profileId}/check-login`, { method: "POST" }),
@@ -343,4 +361,12 @@ export const api = {
   getOpenAIKey: () => request<{ success: boolean; apiKey: string; isConfigured: boolean }>(`/automation/openai-key`),
   updateOpenAIKey: (payload: { apiKey: string }) =>
     request<{ success: boolean; isConfigured: boolean }>(`/automation/openai-key`, { method: "PUT", body: JSON.stringify(payload) }),
+
+  getAdminSummary: () => request<AdminSummaryResponse>("/admin/summary"),
+  adminResetCommunityFailures: (communityId?: string) =>
+    request<{ success: boolean }>("/admin/reset-community-failures", { method: "POST", body: JSON.stringify(communityId ? { communityId } : {}) }),
+  adminUnskipPost: (postUrl: string) =>
+    request<{ success: boolean }>("/admin/unskip-post", { method: "POST", body: JSON.stringify({ postUrl }) }),
+  adminClearSkippedPosts: () => request<{ success: boolean }>("/admin/clear-skipped-posts", { method: "POST" }),
+  adminResetDailyCounts: () => request<{ success: boolean }>("/admin/reset-daily-counts", { method: "POST" }),
 };

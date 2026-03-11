@@ -52,7 +52,7 @@ export const useQueue = () =>
 export const useQueuePreview = () =>
   useQuery({
     queryKey: ["queuePreview"],
-    queryFn: () => api.getQueuePreview(50, 2),
+    queryFn: () => api.getQueuePreview(30, 7),
     refetchInterval: 30000,
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: false,
@@ -89,4 +89,14 @@ export const useConversations = () =>
     refetchInterval: 5000,
     refetchIntervalInBackground: true,
     refetchOnWindowFocus: false,
+  });
+
+export const useN8nTiming = (enabled = false) =>
+  useQuery({
+    queryKey: ["n8nTiming"],
+    queryFn: api.n8nTiming,
+    refetchInterval: 5000,
+    refetchIntervalInBackground: true,
+    refetchOnWindowFocus: false,
+    enabled,
   });

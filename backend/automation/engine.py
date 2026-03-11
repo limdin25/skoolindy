@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import json
@@ -7,10 +7,8 @@ import os
 import random
 import re
 import sqlite3
-import sys
 import threading
 import time
-import traceback
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -46,9 +44,9 @@ QUEUE_NETWORK_FAIL_COOLDOWN_SECONDS = max(60, int(os.environ.get("QUEUE_NETWORK_
 QUEUE_NETWORK_MAX_BUDGET_EXHAUST_CYCLES = max(1, int(os.environ.get("QUEUE_NETWORK_MAX_BUDGET_EXHAUST_CYCLES", "3")))
 QUEUE_NETWORK_PERSISTENT_FAIL_COOLDOWN_SECONDS = max(300, int(os.environ.get("QUEUE_NETWORK_PERSISTENT_FAIL_COOLDOWN_SECONDS", "300")))
 QUEUE_COMMUNITY_NETWORK_COOLDOWN_SECONDS = max(60, int(os.environ.get("QUEUE_COMMUNITY_NETWORK_COOLDOWN_SECONDS", "600")))
-QUEUE_EDITOR_NOT_VISIBLE_COOLDOWN_SECONDS = max(300, int(os.environ.get("QUEUE_EDITOR_NOT_VISIBLE_COOLDOWN_SECONDS", "1800")))
+QUEUE_EDITOR_NOT_VISIBLE_COOLDOWN_SECONDS = max(300, int(os.environ.get("QUEUE_EDITOR_NOT_VISIBLE_COOLDOWN_SECONDS", "300")))
 AUTOMATION_NO_POST_WAIT_SECONDS = max(15, int(os.environ.get("AUTOMATION_NO_POST_WAIT_SECONDS", "75")))
-AUTOMATION_POSTED_WAIT_MIN_SECONDS = max(30, int(os.environ.get("AUTOMATION_POSTED_WAIT_MIN_SECONDS", "75")))
+AUTOMATION_POSTED_WAIT_MIN_SECONDS = max(10, int(os.environ.get("AUTOMATION_POSTED_WAIT_MIN_SECONDS", "30")))
 PREFILL_SKIP_LOG_COOLDOWN_SECONDS = max(60, int(os.environ.get("PREFILL_SKIP_LOG_COOLDOWN_SECONDS", "900")))
 PREFILL_SKIP_DEBUG_EVERY = max(5, int(os.environ.get("PREFILL_SKIP_DEBUG_EVERY", "20")))
 AUTOMATION_DUE_DEFER_MIN_SECONDS = max(5, int(os.environ.get("AUTOMATION_DUE_DEFER_MIN_SECONDS", "45")))
@@ -65,22 +63,34 @@ AUTOMATION_FAILURE_DIAGNOSTICS_ENABLED = str(
 ).strip().lower() in {"1", "true", "yes", "on"}
 LOGGER = logging.getLogger("engageflow.automation")
 
-# Heartbeat / watchdog tuning
-_HEARTBEAT_WRITE_INTERVAL = 60      # write heartbeat file every N seconds
-_HEARTBEAT_LOG_INTERVAL = 300       # log "HEARTBEAT ok" every N seconds
-_HEARTBEAT_MAX_AGE_SECONDS = 300    # watchdog exit threshold
+SKOOL_AUTH_CHECK_URL = "https://api2.skool.com/self/groups?offset=0&limit=1&prefs=false&members=true"
 
 
-def _write_heartbeat(path: Path) -> None:
-    """Atomically write a heartbeat timestamp to *path*."""
+def _validate_cookies_via_api(cookie_json: str) -> bool:
+    """Validate cookie_json via Skool API. Returns True if 2xx."""
+    if not cookie_json or not str(cookie_json).strip():
+        return False
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps({"ts": time.time(), "pid": os.getpid()}),
-            encoding="utf-8",
+        c = json.loads(cookie_json) if isinstance(cookie_json, str) else cookie_json
+        arr = c if isinstance(c, list) else [c]
+        cookie_header = "; ".join(
+            str(x.get("name", "")) + "=" + str(x.get("value", ""))
+            for x in arr
+            if x.get("name")
         )
+        if not cookie_header:
+            return False
+        headers = {
+            "Cookie": cookie_header,
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0",
+            "Origin": "https://www.skool.com",
+            "Referer": "https://www.skool.com/",
+        }
+        resp = requests.get(SKOOL_AUTH_CHECK_URL, headers=headers, timeout=12)
+        return 200 <= resp.status_code < 300
     except Exception:
-        pass
+        return False
 
 
 SKOOL_SELECTORS = {
@@ -145,9 +155,6 @@ class EngineState:
         "total_skipped": 0,
         "total_blacklisted": 0,
     })
-    last_scheduler_tick_ts: float = 0.0
-    idle_mode: bool = False
-    idle_reason: str = "unknown"
 
 
 @dataclass
@@ -276,26 +283,12 @@ class SkoolSessionManager:
             return json.load(f)
 
     def get_cookies_json(self) -> Optional[str]:
-        """Extract cookies from context for API auth. Returns JSON string or None.
-        Uses sync Playwright API: context.cookies() (no await). Stores full cookie fields."""
+        """Return browser cookies as JSON string (list of {name, value}) for API auth."""
+        if not self.context:
+            return None
         try:
-            if not self.context:
-                return None
-            cookies = self.context.cookies()
-            arr = []
-            for c in cookies:
-                if not c.get("name"):
-                    continue
-                arr.append({
-                    "name": str(c.get("name", "")),
-                    "value": str(c.get("value", "")),
-                    "domain": str(c.get("domain", "")) if c.get("domain") is not None else "",
-                    "path": str(c.get("path", "")),
-                    "expires": c.get("expires", -1) if c.get("expires") is not None else -1,
-                    "httpOnly": bool(c.get("httpOnly", False)),
-                    "secure": bool(c.get("secure", False)),
-                    "sameSite": str(c.get("sameSite", "Lax")) if c.get("sameSite") else "Lax",
-                })
+            raw = self.context.cookies()
+            arr = [{"name": c.get("name", ""), "value": c.get("value", "")} for c in (raw or [])]
             return json.dumps(arr) if arr else None
         except Exception:
             return None
@@ -323,6 +316,7 @@ class SkoolSessionManager:
             'a[href*="/chat?ch="]',
             'a[href^="/@"]',
             'div[class*="TopNav"]',
+            'div[class*="NotificationButtonWrapper"] button[type="button"]',
         ]
         try:
             for selector in markers:
@@ -442,14 +436,12 @@ class AutomationEngine:
         self.blacklist_file = self.base_dir / "skool_global_blacklist.json"
         self.daily_counters_state_file = self.base_dir / "skool_daily_counters_state.json"
         self.config_file = self.base_dir / "config.local.json"
-        self.heartbeat_file = self.base_dir / ".claude_state" / "heartbeat.json"
 
         self._state = EngineState()
         self._lock = asyncio.Lock()
         self._session_check_lock = asyncio.Lock()
         self._task: Optional[asyncio.Task[None]] = None
         self._session_task: Optional[asyncio.Task[None]] = None
-        self._heartbeat_task: Optional[asyncio.Task[None]] = None
         self._subscribers: Set[asyncio.Queue[Dict[str, Any]]] = set()
         self._queue_network_fail_streak: Dict[str, int] = {}
         self._queue_submit_fail_streak: Dict[str, int] = {}
@@ -457,13 +449,15 @@ class AutomationEngine:
         self._queue_post_cooldown_until: Dict[str, float] = {}
         self._queue_community_cooldown_until: Dict[str, float] = {}
         self._prefill_skip_log_state: Dict[str, Dict[str, float]] = {}
-        self._ensure_profile_auth_fn: Optional[Callable[[str], dict]] = None
-        self._settings_etag: str = ""
-        self._debug_snapshot_cache: Dict[str, Any] = {}
-        self._debug_snapshot_ts: float = 0.0
-        self._last_action: Dict[str, Any] = {}
-        self._last_error: Dict[str, Any] = {}
-        self._last_recover_reason: Optional[str] = None
+        # FIX 1: Community-level editor failure tracking (key = "profileId:communityId")
+        self._community_editor_failures: Dict[str, int] = {}
+        # FIX 1: Per-profile community skip list for today (key = profileId, value = set of communityIds)
+        self._community_skip_today: Dict[str, Set[str]] = {}
+        self._community_skip_today_date: str = datetime.now().strftime("%Y-%m-%d")
+        # FIX 2: Post-level editor failure tracking (key = post URL)
+        self._post_editor_failures: Dict[str, int] = {}
+
+        self._ensure_skipped_posts_table()
 
         self._hydrate_state_from_disk()
     async def subscribe(self) -> asyncio.Queue[Dict[str, Any]]:
@@ -512,7 +506,9 @@ class AutomationEngine:
                 "runState": self._state.run_state,
                 "countdownSeconds": self._state.countdown_seconds,
                 "connectionRest": {
-                    "active": bool(self._state.connection_rest_active),
+                    "active": bool(self._state.connection_rest_active) and str(
+                        self._state.global_settings.get("connectionRestEnabled", "false")
+                    ).strip().lower() in {"1", "true", "yes", "on"},
                     "remainingSeconds": int(self._state.connection_rest_remaining_seconds or 0),
                     "roundsBefore": int(self._state.connection_rest_rounds_before or 0),
                     "roundsCompleted": int(self._state.connection_rest_rounds_completed or 0),
@@ -534,18 +530,9 @@ class AutomationEngine:
             settings = {**db_settings, **(global_settings or {})}
             run_profiles = self._merge_profiles(db_profiles, profiles or [])
             persisted = self._load_run_state_file()
-            persisted_day = (persisted.get("state_day") or (persisted.get("last_updated", "")[:10] or None)) if persisted else None
-            same_day = (persisted_day == datetime.now().strftime("%Y-%m-%d")) if persisted_day else True
-            should_restore = bool(persisted and persisted.get("run_state") not in {"completed", "idle", None} and same_day)
+            should_restore = bool(persisted and persisted.get("run_state") not in {"completed", "idle", None})
             if should_restore:
                 run_profiles = self._apply_persisted_counters(run_profiles, persisted)
-            elif persisted:
-                # Rotation pointers survive day boundaries even when counters don't
-                by_id = {str(p.get("id") or ""): p for p in persisted.get("profiles", [])}
-                for profile in run_profiles:
-                    saved = by_id.get(str(profile.get("id") or ""))
-                    if saved and "_current_community_index" in saved:
-                        profile["_current_community_index"] = int(saved.get("_current_community_index", 0) or 0)
 
             self._validate_start_payload(run_profiles, settings)
 
@@ -575,9 +562,6 @@ class AutomationEngine:
                 self._task.cancel()
             shifted_on_start = self._reschedule_overdue_queue_items()
             self._task = asyncio.create_task(self._scheduler_loop(), name="automation-scheduler")
-            if self._heartbeat_task and not self._heartbeat_task.done():
-                self._heartbeat_task.cancel()
-            self._heartbeat_task = asyncio.create_task(self._heartbeat_task_loop(), name="automation-heartbeat")
             if self._session_task and not self._session_task.done():
                 self._session_task.cancel()
             self._session_task = (
@@ -595,7 +579,6 @@ class AutomationEngine:
     async def stop(self) -> Dict[str, Any]:
         task_to_wait: Optional[asyncio.Task[None]] = None
         session_task_to_wait: Optional[asyncio.Task[None]] = None
-        watchdog_task_to_cancel: Optional[asyncio.Task[None]] = None
         should_log_stopped = False
         due_pending_before_stop = await asyncio.to_thread(self._count_due_queue_actions)
         async with self._lock:
@@ -609,13 +592,7 @@ class AutomationEngine:
             self._state.connection_rest_rounds_completed = 0
             task_to_wait = self._task
             session_task_to_wait = self._session_task
-            watchdog_task_to_cancel = self._heartbeat_task
             self._save_run_state_locked()
-        if watchdog_task_to_cancel and not watchdog_task_to_cancel.done():
-            watchdog_task_to_cancel.cancel()
-        async with self._lock:
-            if self._heartbeat_task is watchdog_task_to_cancel:
-                self._heartbeat_task = None
         if task_to_wait and not task_to_wait.done():
             try:
                 await asyncio.wait_for(task_to_wait, timeout=5)
@@ -663,12 +640,6 @@ class AutomationEngine:
                 self._save_run_state_locked()
             task_to_wait = self._task
             session_task_to_wait = self._session_task
-            watchdog_task_to_cancel = self._heartbeat_task
-        if watchdog_task_to_cancel and not watchdog_task_to_cancel.done():
-            watchdog_task_to_cancel.cancel()
-        async with self._lock:
-            if self._heartbeat_task is watchdog_task_to_cancel:
-                self._heartbeat_task = None
         if task_to_wait and not task_to_wait.done():
             try:
                 await asyncio.wait_for(task_to_wait, timeout=5)
@@ -738,24 +709,6 @@ class AutomationEngine:
         if persisted.get("run_state") not in {"running", "paused"}:
             return
 
-        # Discard stale per-profile counters from a previous day to prevent
-        # restoring "finished" statuses across daily boundaries.
-        today = datetime.now().strftime("%Y-%m-%d")
-        persisted_day = persisted.get("state_day") or (persisted.get("last_updated", "")[:10] or None)
-        if persisted_day and persisted_day != today:
-            LOGGER.info(
-                "[SKOOL] Discarded stale run_state from previous day (%s); rebuilt from DB",
-                persisted_day,
-            )
-            self._last_recover_reason = f"stale_day:{persisted_day}"
-            # Preserve rotation pointers (not daily counters) across day boundary
-            stale_run_state = persisted.get("run_state", "running")
-            rotation_profiles = [
-                {"id": p.get("id"), "_current_community_index": int(p.get("_current_community_index", 0) or 0)}
-                for p in persisted.get("profiles", [])
-            ]
-            persisted = {"run_state": stale_run_state, "profiles": rotation_profiles, "stats": {"total_comments": 0, "total_skipped": 0, "total_blacklisted": 0}, "current_profile_index": 0}
-
         db_profiles, db_settings = self._load_runtime_config_from_db()
         restored = self._apply_persisted_counters(db_profiles, persisted)
 
@@ -765,10 +718,11 @@ class AutomationEngine:
             self._state.run_state = persisted.get("run_state", "running")
             self._state.current_profile_index = int(persisted.get("current_profile_index", 0))
             self._state.stats = persisted.get("stats", self._state.stats)
+            self._state.countdown_seconds = int(persisted.get("countdown_seconds", 0))
             self._state.profiles = restored
             self._state.global_settings = db_settings
+            shifted_on_recovery = self._reschedule_overdue_queue_items()
             self._task = asyncio.create_task(self._scheduler_loop(), name="automation-scheduler")
-            self._heartbeat_task = asyncio.create_task(self._heartbeat_task_loop(), name="automation-heartbeat")
             self._session_task = (
                 asyncio.create_task(self._session_monitor_loop(), name="automation-session-monitor")
                 if SESSION_MONITOR_ENABLED
@@ -776,6 +730,9 @@ class AutomationEngine:
             )
 
         await self.publish_log("[SKOOL] Engine state recovered after restart", status="info")
+        if shifted_on_recovery > 0:
+            await self.publish_log(f"[SKOOL] Rescheduled {shifted_on_recovery} overdue queue task(s) after recovery", status="info")
+
     async def check_login(self, profile_id: str) -> Dict[str, Any]:
         profile = self._load_profile_for_session(profile_id)
         if not profile:
@@ -809,7 +766,9 @@ class AutomationEngine:
                         if session_status == "valid":
                             manager.update_state("ready")
                             cookie_json = manager.get_cookies_json()
-                            return {"success": True, "status": "ready", "message": "Session is active", "cookie_json": cookie_json}
+                            if cookie_json:
+                                self._save_profile_cookie_json(profile_id, cookie_json)
+                            return {"success": True, "status": "ready", "message": "Session is active"}
                         if session_status == "blocked":
                             manager.update_state("blocked")
                             return {"success": False, "status": "network_error", "message": "Account is blocked or access denied"}
@@ -829,7 +788,9 @@ class AutomationEngine:
                             if recheck == "valid":
                                 manager.update_state("ready")
                                 cookie_json = manager.get_cookies_json()
-                                return {"success": True, "status": "ready", "message": "Session is active", "cookie_json": cookie_json}
+                                if cookie_json:
+                                    self._save_profile_cookie_json(profile_id, cookie_json)
+                                return {"success": True, "status": "ready", "message": "Session is active"}
                         if login_result == "failed":
                             manager.update_state("logged_out")
                             return {"success": False, "status": "invalid_credentials", "message": "Credentials are invalid"}
@@ -845,7 +806,9 @@ class AutomationEngine:
                         if "/login" not in current_url and manager.has_authenticated_markers():
                             manager.update_state("ready")
                             cookie_json = manager.get_cookies_json()
-                            return {"success": True, "status": "ready", "message": "Session is active", "cookie_json": cookie_json}
+                            if cookie_json:
+                                self._save_profile_cookie_json(profile_id, cookie_json)
+                            return {"success": True, "status": "ready", "message": "Session is active"}
                         if "/login" in current_url:
                             manager.update_state("logged_out")
                             return {
@@ -853,6 +816,12 @@ class AutomationEngine:
                                 "status": "invalid_credentials",
                                 "message": "Still on login page after login attempt",
                             }
+
+                        cookie_json = manager.get_cookies_json()
+                        if cookie_json and _validate_cookies_via_api(cookie_json):
+                            manager.update_state("ready")
+                            self._save_profile_cookie_json(profile_id, cookie_json)
+                            return {"success": True, "status": "ready", "message": "Session is active"}
 
                         manager.update_state("error")
                         return {
@@ -882,9 +851,6 @@ class AutomationEngine:
             except Exception as exc:
                 result = {"success": False, "status": "network_error", "message": f"Login check failed: {str(exc)[:250]}"}
 
-            if result.get("success") and result.get("cookie_json"):
-                self._save_profile_cookie_json(profile_id, result["cookie_json"])
-
             profile_status = {
                 "ready": "ready",
                 "invalid_credentials": "logged_out",
@@ -907,6 +873,96 @@ class AutomationEngine:
                 ),
             )
             return result
+
+    def run_profile_login_refresh_sync(self, profile_id: str) -> Dict[str, Any]:
+        """Sync refresh for ensure_profile_auth on 401/403. Performs login and returns cookie_json on success."""
+        profile = self._load_profile_for_session(profile_id)
+        if not profile:
+            return {"success": False, "status": "network_error", "message": "Profile not found", "cookie_json": None}
+        manager = SkoolSessionManager(
+            account_id=profile_id,
+            email=profile.get("email", ""),
+            password=profile.get("password", ""),
+            proxy=profile.get("proxy"),
+            base_dir=self.accounts_dir,
+            headless=True,
+        )
+        try:
+            with _PLAYWRIGHT_SYNC_LOCK:
+                manager.launch()
+                session_status = manager.validate_session()
+                if session_status == "valid":
+                    manager.update_state("ready")
+                    cookie_json = manager.get_cookies_json()
+                    if cookie_json:
+                        self._save_profile_cookie_json(profile_id, cookie_json)
+                    return {"success": True, "status": "ready", "message": "Session is active", "cookie_json": cookie_json or ""}
+                if session_status == "blocked":
+                    manager.update_state("blocked")
+                    return {"success": False, "status": "network_error", "message": "Account is blocked or access denied", "cookie_json": None}
+                if session_status == "captcha":
+                    manager.update_state("captcha")
+                    return {"success": False, "status": "captcha", "message": "Captcha required", "cookie_json": None}
+                if not profile.get("email") or not profile.get("password"):
+                    manager.update_state("logged_out")
+                    return {"success": False, "status": "invalid_credentials", "message": "Missing email or password", "cookie_json": None}
+                login_result = manager.perform_login()
+                manager.page.wait_for_timeout(2500)
+                if login_result == "success":
+                    recheck = manager.validate_session()
+                    if recheck == "valid":
+                        manager.update_state("ready")
+                        cookie_json = manager.get_cookies_json()
+                        if cookie_json:
+                            self._save_profile_cookie_json(profile_id, cookie_json)
+                        return {"success": True, "status": "ready", "message": "Session is active", "cookie_json": cookie_json or ""}
+                if login_result == "failed":
+                    manager.update_state("logged_out")
+                    return {"success": False, "status": "invalid_credentials", "message": "Credentials are invalid", "cookie_json": None}
+                if login_result == "captcha" or manager.detect_captcha():
+                    manager.update_state("captcha")
+                    return {"success": False, "status": "captcha", "message": "Captcha required", "cookie_json": None}
+                if login_result == "blocked" or manager.detect_blocked():
+                    manager.update_state("blocked")
+                    return {"success": False, "status": "network_error", "message": "Account is blocked or access denied", "cookie_json": None}
+                current_url = str(getattr(manager.page, "url", "") or "").lower()
+                if "/login" not in current_url and manager.has_authenticated_markers():
+                    manager.update_state("ready")
+                    cookie_json = manager.get_cookies_json()
+                    if cookie_json:
+                        self._save_profile_cookie_json(profile_id, cookie_json)
+                    return {"success": True, "status": "ready", "message": "Session is active", "cookie_json": cookie_json or ""}
+                if "/login" in current_url:
+                    manager.update_state("logged_out")
+                    return {"success": False, "status": "invalid_credentials", "message": "Still on login page after login attempt", "cookie_json": None}
+                cookie_json = manager.get_cookies_json()
+                if cookie_json and _validate_cookies_via_api(cookie_json):
+                    manager.update_state("ready")
+                    self._save_profile_cookie_json(profile_id, cookie_json)
+                    return {"success": True, "status": "ready", "message": "Session is active", "cookie_json": cookie_json}
+                manager.update_state("error")
+                return {
+                    "success": False,
+                    "status": "network_error",
+                    "message": "Could not validate chat session (chat page/auth markers not detected)",
+                    "cookie_json": None,
+                }
+        except Exception as exc:
+            err = str(exc)
+            low = err.lower()
+            if "err_proxy_connection_failed" in low or "proxy" in low:
+                manager.update_state("proxy_error", {"error": err})
+                return {"success": False, "status": "proxy_error", "message": "Proxy connection failed", "cookie_json": None}
+            if "timeout" in low:
+                manager.update_state("error", {"error": err})
+                return {"success": False, "status": "network_error", "message": "Network timeout while checking login", "cookie_json": None}
+            if "net::" in low or "network" in low or "dns" in low:
+                manager.update_state("error", {"error": err})
+                return {"success": False, "status": "network_error", "message": "Network error while checking login", "cookie_json": None}
+            manager.update_state("error", {"error": err})
+            return {"success": False, "status": "network_error", "message": err[:300] or "Unknown login check error", "cookie_json": None}
+        finally:
+            manager.close()
 
     async def check_proxy(self, profile_id: str) -> Dict[str, Any]:
         async with self._session_check_lock:
@@ -1169,17 +1225,6 @@ class AutomationEngine:
         await self.publish_log("[SKOOL] ========== PROOF RUN COMPLETED ==========", profile=profile_name, status="success")
         return result
 
-    async def _heartbeat_task_loop(self) -> None:
-        """Dedicated background task: write heartbeat every 30s regardless of scheduler state."""
-        _log_ts = 0.0
-        while True:
-            _write_heartbeat(self.heartbeat_file)
-            _now = time.time()
-            if _now - _log_ts >= _HEARTBEAT_LOG_INTERVAL:
-                LOGGER.info("HEARTBEAT ok ts=%d", int(_now))
-                _log_ts = _now
-            await asyncio.sleep(_HEARTBEAT_WRITE_INTERVAL)
-
     async def _scheduler_loop(self) -> None:
         await self.publish_log("[SKOOL] ===== SCHEDULER LOOP STARTED =====")
         await self.publish_log("[SKOOL] Round-robin mode: one profile action pass, then switch to next profile", status="info")
@@ -1210,21 +1255,10 @@ class AutomationEngine:
 
         while True:
             db_profiles, db_settings = await asyncio.to_thread(self._load_runtime_config_from_db)
-            try:
-                await asyncio.to_thread(self._reset_daily_counters_if_needed)
-            except Exception:
-                LOGGER.error(
-                    "Daily counter reset failed (scheduler continues):\n%s",
-                    traceback.format_exc(),
-                )
-            # IMPORTANT: reset may change daily counters in DB.
-            # Reload runtime config so in-memory state reflects the post-reset truth.
-            db_profiles, db_settings = await asyncio.to_thread(self._load_runtime_config_from_db)
+            await asyncio.to_thread(self._reset_daily_counters_if_needed)
             async with self._lock:
                 if not self._state.is_running:
                     break
-                self._state.last_scheduler_tick_ts = time.time()
-                self._state.idle_mode = False
                 if db_settings:
                     self._state.global_settings = dict(db_settings)
                 # Apply profile/community changes from DB immediately on next scheduler loop.
@@ -1232,9 +1266,6 @@ class AutomationEngine:
                 if db_profiles:
                     self._refresh_runtime_profiles_locked(db_profiles)
                 paused = self._state.is_paused
-                if paused:
-                    self._state.idle_mode = True
-                    self._state.idle_reason = "paused"
                 settings = dict(self._state.global_settings)
                 profile, next_index = self._get_next_profile_locked()
                 self._state.current_profile_index = next_index
@@ -1252,12 +1283,23 @@ class AutomationEngine:
                 await self._countdown(10)
                 continue
 
+            if str(settings.get("orchestrationMode", "internal")).strip().lower() == "n8n":
+                await self.publish_log(
+                    "[SKOOL] Orchestration mode n8n: comment automation driven externally; waiting",
+                    status="info",
+                )
+                await self._countdown(30)
+                continue
+
+            connection_rest_enabled = str(
+                settings.get("connectionRestEnabled", "false")
+            ).strip().lower() in {"1", "true", "yes", "on"}
             rounds_before_rest = max(1, int(settings.get("roundsBeforeConnectionRest", 5) or 5))
             rest_minutes = max(1, int(settings.get("connectionRestMinutes", 5) or 5))
             rest_seconds = rest_minutes * 60
 
             now_rest_ts = time.time()
-            if connection_rest_until_ts > now_rest_ts:
+            if connection_rest_enabled and connection_rest_until_ts > now_rest_ts:
                 remaining_rest = max(1, int(connection_rest_until_ts - now_rest_ts))
                 async with self._lock:
                     self._state.run_state = "resting_connections"
@@ -1304,8 +1346,12 @@ class AutomationEngine:
                 int(settings.get("queuePrefillMaxPerProfilePerPass", QUEUE_PREFILL_MAX_PER_PROFILE_PER_PASS)),
             )
             prefill_target_total = max(1, len(enabled_profiles_for_prefill) * per_profile_prefill_limit)
-            # Refill only when queue is fully drained; then prefill all profiles in one pass.
-            should_prefill = bootstrap_queue_fill_required or queue_total == 0
+            # Refill when queue is below target — not only when fully drained.
+            should_prefill = (
+                bootstrap_queue_fill_required
+                or queue_total == 0
+                or queue_total < prefill_target_total
+            )
             if should_prefill:
                 async with self._lock:
                     scan_profiles = [dict(p) for p in self._state.profiles if p.get("enabled", True)]
@@ -1333,24 +1379,21 @@ class AutomationEngine:
                 if not pending_prefill:
                     bootstrap_queue_fill_required = False
                     now_ts = time.time()
-                    _use_idle_wait = False
-                    _idle_reason_pending = "unknown"
                     if in_schedule_profiles and not capacity_profiles:
                         wait_seconds = max(60, min(1800, int(self._seconds_until_next_daily_reset())))
-                        _use_idle_wait = True
-                        _idle_reason_pending = "limits_reached"
                         if now_ts - daily_exhausted_wait_log_ts >= 300:
                             daily_exhausted_wait_log_ts = now_ts
                             await self.publish_log(
                                 (
-                                    "[SKOOL] All in-schedule communities reached today's limits; "
+                                    f"All accounts have reached their daily comment limit (cap: {settings.get('globalDailyCapPerAccount', '?')}/account). Pausing until reset. "
+                                    f"| [SKOOL] All in-schedule communities reached today's limits "
+                                    f"(dailyCap={settings.get('globalDailyCapPerAccount', '?')} per profile); "
                                     f"waiting {wait_seconds}s for daily reset or settings changes"
                                 ),
                                 status="info",
                             )
                     elif in_schedule_profiles and capacity_profiles:
                         wait_seconds = max(10, min(120, int(self._seconds_until_next_run_for_all())))
-                        _idle_reason_pending = "backoff"
                         if now_ts - outside_schedule_wait_log_ts >= 60:
                             outside_schedule_wait_log_ts = now_ts
                             await self.publish_log(
@@ -1365,7 +1408,6 @@ class AutomationEngine:
                             5,
                             min(AUTOMATION_OUTSIDE_SCHEDULE_POLL_SECONDS, int(self._seconds_until_next_run_for_all())),
                         )
-                        _idle_reason_pending = "outside_schedule"
                         async with self._lock:
                             self._state.run_state = "waiting_schedule"
                             self._save_run_state_locked()
@@ -1376,15 +1418,7 @@ class AutomationEngine:
                                 f"[SKOOL] All profiles are outside schedule; waiting {wait_seconds}s until next run window",
                                 status="info",
                             )
-                    async with self._lock:
-                        self._state.idle_mode = True
-                        self._state.idle_reason = _idle_reason_pending
-                    if _use_idle_wait:
-                        await self._idle_daily_reset_wait(wait_seconds)
-                    else:
-                        await self._countdown(wait_seconds)
-                    async with self._lock:
-                        self._state.idle_mode = False
+                    await self._countdown(wait_seconds)
                     continue
                 await self.publish_log("[SKOOL] Queue prefill started for all profiles", status="info")
                 for prefill_round in range(2):
@@ -1522,7 +1556,13 @@ class AutomationEngine:
             had_due_for_profile_pass = False
             try:
                 profile_for_run = dict(profile)
-                profile_for_run["repliesPerVisit"] = 1
+                _replies = max(1, int(
+                    profile.get("repliesPerVisit")
+                    or settings.get("repliesPerVisit")
+                    or settings.get("queuePrefillMaxPerProfilePerPass")
+                    or 1
+                ))
+                profile_for_run["repliesPerVisit"] = _replies
                 run_result = await asyncio.to_thread(self._run_profile_automation_sync, profile_for_run, settings, False, 0)
                 comments_posted_this_pass = int(run_result.comments_posted or 0)
                 had_due_for_profile_pass = int(run_result.due_queue_items_seen or 0) > 0
@@ -1547,7 +1587,9 @@ class AutomationEngine:
                         profile_network_fail_streak[profile_key] = max(0, current_streak - 1)
                 await self.publish_log(
                     (
-                        f"[SKOOL] Profile pass done: posted={int(run_result.comments_posted or 0)} "
+                        f"{label} — Pass complete: {int(run_result.comments_posted or 0)} comments posted, "
+                        f"{int(run_result.skipped_count or 0)} posts skipped "
+                        f"| [SKOOL] Profile pass done: posted={int(run_result.comments_posted or 0)} "
                         f"skipped={int(run_result.skipped_count or 0)} "
                         f"blacklisted={int(run_result.blacklisted_count or 0)}"
                     ),
@@ -1568,16 +1610,8 @@ class AutomationEngine:
                     self._persist_activity_rows(run_result.activity_rows)
                     self._update_profile_locked(applied_profile)
                     self._save_run_state_locked()
-                self._last_action = {
-                    "type": "profile_run",
-                    "profile_id": applied_profile.get("id"),
-                    "profile_label": applied_profile.get("label"),
-                    "comments_posted": run_result.comments_posted,
-                    "ts": datetime.now().isoformat(),
-                }
             except Exception as exc:
                 err_text = str(exc or "")
-                self._last_error = {"message": err_text[:500], "ts": datetime.now().isoformat()}
                 if "network timeout" in err_text.lower():
                     streak = int(profile_network_fail_streak.get(profile_key, 0) or 0) + 1
                     profile_network_fail_streak[profile_key] = streak
@@ -1594,15 +1628,18 @@ class AutomationEngine:
                 else:
                     await self.publish_log(f"[SKOOL] Scheduler error: {err_text}", profile=label, status="error")
 
-            delay_min = max(30, int(profile.get("delayBetweenMessagesMinSec", profile.get("delay_min", settings.get("delayMin", 30)))))
+            delay_min = max(10, int(profile.get("delayBetweenMessagesMinSec", profile.get("delay_min", settings.get("delayMin", 30)))))
             delay_max = max(delay_min, int(profile.get("delayBetweenMessagesMaxSec", profile.get("delay_max", settings.get("delayMax", 90)))))
             if delay_max < delay_min:
                 delay_min, delay_max = delay_max, delay_min
             random_delay = random.randint(delay_min, delay_max)
-            # Keep idle profile passes from collapsing to very short loops.
-            # This avoids accidental high-frequency rotation across many accounts.
+            user_delay_min = max(10, int(
+                profile.get("delayBetweenMessagesMinSec")
+                or settings.get("delayMin")
+                or AUTOMATION_POSTED_WAIT_MIN_SECONDS
+            ))
             wait_seconds = (
-                max(AUTOMATION_POSTED_WAIT_MIN_SECONDS, random_delay)
+                max(user_delay_min, random_delay)
                 if comments_posted_this_pass > 0
                 else max(AUTOMATION_NO_POST_WAIT_SECONDS, random_delay)
             )
@@ -1636,7 +1673,7 @@ class AutomationEngine:
                     )
 
             rest_started_this_pass = False
-            if completed_rounds_since_rest >= rounds_before_rest:
+            if connection_rest_enabled and completed_rounds_since_rest >= rounds_before_rest:
                 due_pending_before_rest = await asyncio.to_thread(self._count_due_queue_actions)
                 queue_pending_before_rest = await asyncio.to_thread(self._count_all_queue_actions)
                 if due_pending_before_rest <= 0 and queue_pending_before_rest <= 0:
@@ -1717,177 +1754,6 @@ class AutomationEngine:
             if self._session_task is asyncio.current_task():
                 self._session_task = None
 
-    async def get_debug_snapshot(self) -> Dict[str, Any]:
-        """Read-only scheduler diagnostics. Cached for 10s to avoid repeated DB hits."""
-        now = time.time()
-        if now - self._debug_snapshot_ts < 10.0 and self._debug_snapshot_cache:
-            return dict(self._debug_snapshot_cache)
-
-        # Heartbeat age
-        hb_age: Optional[float] = None
-        try:
-            hb_data = json.loads(self.heartbeat_file.read_text(encoding="utf-8"))
-            hb_age = round(time.time() - float(hb_data.get("ts", 0)), 1)
-        except Exception:
-            pass
-
-        # last_reset_date from daily counters state file
-        last_reset_date: Optional[str] = None
-        try:
-            dc = json.loads(self.daily_counters_state_file.read_text(encoding="utf-8"))
-            last_reset_date = dc.get("last_reset_date")
-        except Exception:
-            pass
-
-        # Snapshot mutable state under lock
-        async with self._lock:
-            is_running = self._state.is_running
-            is_paused = self._state.is_paused
-            idle_mode = self._state.idle_mode
-            idle_reason_raw = self._state.idle_reason
-            tick_ts = self._state.last_scheduler_tick_ts
-            profiles = list(self._state.profiles)
-            settings = dict(self._state.global_settings)
-
-        tick_iso = datetime.fromtimestamp(tick_ts).isoformat() if tick_ts else None
-        tick_age = round(time.time() - tick_ts, 1) if tick_ts else None
-
-        # Derive idle_reason
-        if not is_running:
-            idle_reason: Optional[str] = "stopped"
-        elif is_paused:
-            idle_reason = "paused"
-        elif idle_mode:
-            idle_reason = idle_reason_raw
-        else:
-            idle_reason = None
-
-        # Counts derived from in-memory profiles (no extra DB query)
-        profiles_total = len(profiles)
-        profiles_active = sum(
-            1 for p in profiles
-            if str(p.get("status", "")).lower() not in {"stopped", "paused", "finished"}
-        )
-        communities_all = [c for p in profiles for c in (p.get("communities") or [])]
-        communities_total = len(communities_all)
-        in_schedule = self._check_schedule(settings)
-        communities_in_schedule = communities_total if in_schedule else 0
-        communities_reached = sum(
-            1 for c in communities_all
-            if str(c.get("status", "active")).lower() == "active"
-            and int(c.get("dailyLimit") or 0) > 0
-            and int(c.get("actionsToday") or 0) >= int(c.get("dailyLimit") or 0)
-        )
-
-        # Queue pending: single cheap COUNT(*)
-        queue_pending = 0
-        try:
-            queue_pending = await asyncio.to_thread(self._count_all_queue_actions)
-        except Exception:
-            pass
-
-        secs_to_reset: Optional[int] = None
-        if is_running:
-            try:
-                secs_to_reset = self._seconds_until_next_daily_reset()
-            except Exception:
-                pass
-
-        # state_day from run_state file
-        run_state_day: Optional[str] = None
-        run_state_last_updated: Optional[str] = None
-        try:
-            rs = json.loads(self.run_state_file.read_text(encoding="utf-8"))
-            run_state_day = rs.get("state_day")
-            run_state_last_updated = rs.get("last_updated")
-        except Exception:
-            pass
-        today_str = datetime.now().strftime("%Y-%m-%d")
-
-        result: Dict[str, Any] = {
-            "now_iso": datetime.now().isoformat(),
-            "heartbeat_age_seconds": hb_age,
-            "engine_running": is_running,
-            "engine_paused": is_paused,
-            "state_day": run_state_day,
-            "state_day_is_stale": bool(run_state_day and run_state_day != today_str),
-            "last_recover_reason": self._last_recover_reason,
-            "run_state_last_updated_iso": run_state_last_updated,
-            "last_scheduler_tick_iso": tick_iso,
-            "last_scheduler_tick_age_seconds": tick_age,
-            "last_reset_date": last_reset_date,
-            "seconds_until_next_daily_reset": secs_to_reset,
-            "idle_mode": idle_mode,
-            "idle_reason": idle_reason,
-            "counts": {
-                "profiles_total": profiles_total,
-                "profiles_active": profiles_active,
-                "communities_total": communities_total,
-                "communities_in_schedule": communities_in_schedule,
-                "communities_reached_limit": communities_reached,
-                "queue_pending": queue_pending,
-            },
-            "last_action": self._last_action or None,
-            "last_error": self._last_error or None,
-        }
-        self._debug_snapshot_cache = result
-        self._debug_snapshot_ts = time.time()
-        return result
-
-    def _compute_settings_etag(self) -> str:
-        """Hash the DB rows that drive capacity decisions so idle can detect changes."""
-        import hashlib
-        try:
-            with self._db() as db:
-                settings_row = db.execute(
-                    "SELECT value FROM automation_settings WHERE key = 'default'"
-                ).fetchone()
-                communities = db.execute(
-                    "SELECT id, dailyLimit, status FROM communities ORDER BY id"
-                ).fetchall()
-            parts = [
-                (settings_row["value"] if settings_row else ""),
-                json.dumps([dict(c) for c in communities], sort_keys=True),
-            ]
-            return hashlib.md5("|".join(parts).encode()).hexdigest()
-        except Exception:
-            return self._settings_etag  # don't break on transient DB error
-
-    async def _idle_daily_reset_wait(self, initial_seconds: int) -> None:
-        """Interruptible idle wait: wakes at reset time or on settings change."""
-        _TICK = 5.0
-        _ETAG_INTERVAL = 10.0
-        deadline = time.time() + initial_seconds
-        _fake_reset = int(os.environ.get("ENGAGEFLOW_DEBUG_FAKE_RESET_SECONDS", "0") or "0")
-        reset_time = time.time() + (_fake_reset if _fake_reset > 0 else self._seconds_until_next_daily_reset())
-        # Seed etag on first entry so we detect *changes* from this point forward, not from "".
-        if not self._settings_etag:
-            self._settings_etag = await asyncio.to_thread(self._compute_settings_etag)
-        etag_check_ts = time.time()  # first real check in _ETAG_INTERVAL seconds
-        while time.time() < deadline:
-            async with self._lock:
-                if not self._state.is_running or self._state.is_paused:
-                    return
-                self._state.last_scheduler_tick_ts = time.time()
-            now = time.time()
-            if now >= reset_time:
-                await self.publish_log(
-                    "[SKOOL] Daily reset time reached; resuming scheduler immediately",
-                    status="info",
-                )
-                return
-            if now - etag_check_ts >= _ETAG_INTERVAL:
-                etag_check_ts = now
-                new_etag = await asyncio.to_thread(self._compute_settings_etag)
-                if new_etag != self._settings_etag:
-                    self._settings_etag = new_etag
-                    await self.publish_log(
-                        "[SKOOL] Settings change detected during idle; resuming immediately",
-                        status="info",
-                    )
-                    return
-            await asyncio.sleep(min(_TICK, max(0.1, deadline - time.time())))
-
     async def _countdown(self, seconds: int) -> None:
         for remaining in range(seconds, 0, -1):
             async with self._lock:
@@ -1898,7 +1764,6 @@ class AutomationEngine:
                     self._state.countdown_seconds = 0
                     return
                 self._state.countdown_seconds = remaining
-                self._state.last_scheduler_tick_ts = time.time()
                 if self._state.connection_rest_active:
                     # Keep the visible connection-rest timer ticking each second.
                     self._state.connection_rest_remaining_seconds = remaining
@@ -1922,14 +1787,6 @@ class AutomationEngine:
         profile = dict(profile)
         profile_id = profile.get("id")
         profile_label = profile.get("label") or profile.get("name") or profile_id
-        if self._ensure_profile_auth_fn:
-            auth = self._ensure_profile_auth_fn(profile_id)
-            if not auth.get("ok"):
-                LOGGER.info("[SKOOL] Profile %s blocked_auth status=%s message=%s refresh_attempted=%s",
-                    profile_label, auth.get("status"), auth.get("message"), auth.get("refresh_attempted"))
-                result = ProfileRunResult(profile=profile)
-                result.comments_posted = 0
-                return result
         result = ProfileRunResult(profile=profile)
         browser_profile_dir = self.accounts_dir / profile_id / "browser"
         browser_profile_dir.mkdir(parents=True, exist_ok=True)
@@ -2269,7 +2126,10 @@ class AutomationEngine:
                         "timestamp": datetime.now().strftime("%H:%M:%S"),
                         "profile": str(profile_label),
                         "status": "success",
-                        "message": f"[SKOOL] Due queue items: {len(due_queue_items)}",
+                        "message": (
+                            f"{profile_label} — {'No tasks due right now' if len(due_queue_items) == 0 else f'{len(due_queue_items)} task(s) ready to run'}. "
+                            f"| [SKOOL] Due queue items: {len(due_queue_items)}"
+                        ),
                     }
                 )
             due_by_community: Dict[str, List[Dict[str, str]]] = {}
@@ -2882,6 +2742,35 @@ class AutomationEngine:
                         try:
                             post_url = selected["post_url"]
                             task_ref = str(selected.get("queue_id") or _extract_task_ref_from_post_url(post_url) or "n/a")
+                            # FIX 2: Skip permanently skipped posts
+                            if self._is_post_skipped(post_url, profile_id):
+                                self._remove_queue_item(profile_id, post_url)
+                                result.skipped_count += 1
+                                self._insert_log(
+                                    {
+                                        "id": str(uuid.uuid4()),
+                                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                        "profile": str(profile_label),
+                                        "status": "info",
+                                        "message": f"[SKOOL] Post previously skipped (permanent), not attempting: {post_url}",
+                                    }
+                                )
+                                continue
+                            # FIX 1: Skip communities that failed too many times today
+                            _sel_comm_id = str(selected.get("community_id") or community.get("id", "") or "").strip()
+                            if _sel_comm_id and self._is_community_skipped_today(profile_id, _sel_comm_id):
+                                self._remove_queue_item(profile_id, post_url)
+                                result.skipped_count += 1
+                                self._insert_log(
+                                    {
+                                        "id": str(uuid.uuid4()),
+                                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                        "profile": str(profile_label),
+                                        "status": "info",
+                                        "message": f"[SKOOL] Community {_sel_comm_id} skipped for today (editor failures). Trying a different community.",
+                                    }
+                                )
+                                continue
                             if bool(selected.get("from_queue")) and not bool(selected.get("_queue_claimed")):
                                 # Remove active task from queue immediately when execution starts.
                                 self._remove_queue_item(profile_id, post_url)
@@ -3183,7 +3072,7 @@ class AutomationEngine:
                             )
                             result.activity_rows.append({
                                 "id": str(uuid.uuid4()),
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "timestamp": datetime.now().isoformat(),
                                 "profileLabel": profile_label,
                                 "profileId": profile_id,
                                 "community": community_url,
@@ -3231,6 +3120,21 @@ class AutomationEngine:
                                 page.wait_for_timeout(2000)
                             except Exception:
                                 pass
+                            # Intra-action delay between consecutive actions in the same pass.
+                            if replies_this_visit < replies_per_visit:
+                                intra_min = max(5, int(settings.get("intraActionDelayMinSec", 10)))
+                                intra_max = max(intra_min, int(settings.get("intraActionDelayMaxSec", 30)))
+                                intra_delay = random.randint(intra_min, intra_max)
+                                self._insert_log(
+                                    {
+                                        "id": str(uuid.uuid4()),
+                                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                        "profile": str(profile_label),
+                                        "status": "info",
+                                        "message": f"[SKOOL] Intra-action delay: {intra_delay}s before next action ({replies_this_visit}/{replies_per_visit})",
+                                    }
+                                )
+                                time.sleep(intra_delay)
                             if community_daily_limit and community_actions_today >= community_daily_limit:
                                 break
                         except Exception as exc:
@@ -3384,15 +3288,68 @@ class AutomationEngine:
                                 )
                             else:
                                 if bool(selected.get("from_queue")) and send_error_detail == "editor_not_visible":
-                                    # This post/thread often has delayed or unavailable editor.
-                                    # Cool it down longer instead of burning immediate retries/cycles.
+                                    # FIX 2: Track post-level failures
+                                    _post_fail_count = self._record_post_editor_failure(post_url, profile_id)
+                                    # FIX 1: Track community-level failures
+                                    _comm_id_for_fail = str(community.get("id", "") or "").strip()
+                                    _comm_fail_count = self._record_community_editor_failure(profile_id, _comm_id_for_fail) if _comm_id_for_fail else 0
+                                    _attempt_num = int(self._queue_submit_fail_streak.get(_queue_post_key(post_url), 0) or 0) + 1
+
+                                    # FIX 2: Post permanently skipped after 3 failures
+                                    if _post_fail_count >= 3:
+                                        self._remove_queue_item(profile_id, post_url)
+                                        result.skipped_count += 1
+                                        self._insert_log(
+                                            {
+                                                "id": str(uuid.uuid4()),
+                                                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                                "profile": str(profile_label),
+                                                "status": "error",
+                                                "message": (
+                                                    f"[SKOOL] Post permanently skipped after {_post_fail_count} failures: {post_url} "
+                                                    f"| send_or_dom_error:editor_not_visible_cooldown_attempt_{_attempt_num}"
+                                                ),
+                                            }
+                                        )
+                                        try:
+                                            page.go_back(wait_until="domcontentloaded")
+                                            page.wait_for_timeout(2000)
+                                        except Exception:
+                                            pass
+                                        continue
+
+                                    # FIX 1: Community skipped after 2 failures
+                                    if _comm_fail_count >= 2:
+                                        self._remove_queue_item(profile_id, post_url)
+                                        result.skipped_count += 1
+                                        self._insert_log(
+                                            {
+                                                "id": str(uuid.uuid4()),
+                                                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                                "profile": str(profile_label),
+                                                "status": "error",
+                                                "message": (
+                                                    f"[SKOOL] Community skipped after {_comm_fail_count} editor failures: "
+                                                    f"{_comm_id_for_fail} profile={profile_id}. Will try a different community. "
+                                                    f"| send_or_dom_error:editor_not_visible_cooldown_attempt_{_attempt_num}"
+                                                ),
+                                            }
+                                        )
+                                        try:
+                                            page.go_back(wait_until="domcontentloaded")
+                                            page.wait_for_timeout(2000)
+                                        except Exception:
+                                            pass
+                                        continue
+
+                                    # Count < 2 on community AND < 3 on post: requeue with cooldown (existing behaviour)
                                     requeued_editor = _requeue_due_task(
                                         selected,
                                         post_url,
                                         delay_seconds=QUEUE_EDITOR_NOT_VISIBLE_COOLDOWN_SECONDS,
                                         reason=(
                                             "send_or_dom_error:editor_not_visible_cooldown"
-                                            f"_attempt_{int(self._queue_submit_fail_streak.get(_queue_post_key(post_url), 0) or 0) + 1}"
+                                            f"_attempt_{_attempt_num}"
                                         ),
                                         status="retry",
                                     )
@@ -3404,9 +3361,8 @@ class AutomationEngine:
                                                 "profile": str(profile_label),
                                                 "status": "retry",
                                                 "message": (
-                                                    f"[SKOOL] Task postponed task={task_ref} "
-                                                    "reason=editor_not_visible_cooldown "
-                                                    f"cooldown={QUEUE_EDITOR_NOT_VISIBLE_COOLDOWN_SECONDS}s"
+                                                    f"[SKOOL] Comment box not found on this post (attempt {_attempt_num}). Will retry in 5 min. "
+                                                    f"task={task_ref} | send_or_dom_error:editor_not_visible_cooldown cooldown={QUEUE_EDITOR_NOT_VISIBLE_COOLDOWN_SECONDS}s"
                                                 ),
                                             }
                                         )
@@ -3830,6 +3786,21 @@ class AutomationEngine:
                         break
                     # Keep queue prefill diverse: at most one new task per community per pass.
                     per_community_quota = min(1, target_quota)
+                    # Skip community entirely if it already has a pending queue item for this profile.
+                    _comm_id = str(community.get("id", "") or "").strip()
+                    if _comm_id and self._has_pending_queue_for_profile_community(str(profile_id or ""), _comm_id):
+                        _note_prefill_skip("already_queued")
+                        self._insert_log(
+                            {
+                                "id": str(uuid.uuid4()),
+                                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                "profile": str(profile_label),
+                                "status": "info",
+                                "message": f"[SKOOL] Queue prefill skip: already_queued profile={profile_id} community={_comm_id}",
+                            }
+                        )
+                        comm_index = (comm_index + 1) % len(communities)
+                        continue
                     planned_count = 0
                     for idx, selected in enumerate(eligible_posts):
                         if planned_count >= per_community_quota:
@@ -3965,6 +3936,22 @@ class AutomationEngine:
                 return int(row["cnt"] if row and "cnt" in row.keys() else 0)
         except Exception:
             return 0
+
+    def _has_pending_queue_for_profile_community(self, profile_id: str, community_id: str) -> bool:
+        """Return True if queue_items has any row for this profile+community."""
+        pid = str(profile_id or "").strip()
+        cid = str(community_id or "").strip()
+        if not pid or not cid:
+            return False
+        try:
+            with self._db() as db:
+                row = db.execute(
+                    "SELECT 1 FROM queue_items WHERE profileId = ? AND communityId = ? LIMIT 1",
+                    (pid, cid),
+                ).fetchone()
+                return row is not None
+        except Exception:
+            return False
 
     def _count_pending_queue_for_profile_community_today(self, profile_id: str, community_id: str) -> int:
         pid = str(profile_id or "").strip()
@@ -4199,6 +4186,115 @@ class AutomationEngine:
             pass
         return conn
 
+    # -- FIX 1/2: Editor failure tracking helpers --------------------------
+
+    def _ensure_skipped_posts_table(self) -> None:
+        try:
+            with self._db() as db:
+                db.execute(
+                    """CREATE TABLE IF NOT EXISTS skipped_posts (
+                        post_url TEXT NOT NULL,
+                        profile_id TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        skipped_at TEXT NOT NULL,
+                        PRIMARY KEY (post_url, profile_id)
+                    )"""
+                )
+                db.commit()
+        except Exception:
+            pass
+
+    def _reset_community_skip_if_new_day(self) -> None:
+        today = datetime.now().strftime("%Y-%m-%d")
+        if today != self._community_skip_today_date:
+            self._community_editor_failures.clear()
+            self._community_skip_today.clear()
+            self._post_editor_failures.clear()
+            self._community_skip_today_date = today
+
+    def _is_community_skipped_today(self, profile_id: str, community_id: str) -> bool:
+        self._reset_community_skip_if_new_day()
+        return community_id in self._community_skip_today.get(profile_id, set())
+
+    def _record_community_editor_failure(self, profile_id: str, community_id: str) -> int:
+        self._reset_community_skip_if_new_day()
+        key = f"{profile_id}:{community_id}"
+        self._community_editor_failures[key] = self._community_editor_failures.get(key, 0) + 1
+        count = self._community_editor_failures[key]
+        if count >= 2:
+            self._community_skip_today.setdefault(profile_id, set()).add(community_id)
+        return count
+
+    def _record_post_editor_failure(self, post_url: str, profile_id: str) -> int:
+        self._post_editor_failures[post_url] = self._post_editor_failures.get(post_url, 0) + 1
+        count = self._post_editor_failures[post_url]
+        if count >= 3:
+            self._add_skipped_post(post_url, profile_id, f"editor_not_visible x{count}")
+        return count
+
+    def _add_skipped_post(self, post_url: str, profile_id: str, reason: str) -> None:
+        try:
+            with self._db() as db:
+                db.execute(
+                    "INSERT OR REPLACE INTO skipped_posts (post_url, profile_id, reason, skipped_at) VALUES (?, ?, ?, ?)",
+                    (post_url, profile_id, reason, datetime.now().isoformat(timespec="seconds")),
+                )
+                db.commit()
+        except Exception:
+            pass
+
+    def _is_post_skipped(self, post_url: str, profile_id: str) -> bool:
+        try:
+            with self._db() as db:
+                row = db.execute(
+                    "SELECT 1 FROM skipped_posts WHERE post_url = ? AND profile_id = ?",
+                    (post_url, profile_id),
+                ).fetchone()
+                return row is not None
+        except Exception:
+            return False
+
+    def _get_skipped_posts(self) -> List[Dict[str, Any]]:
+        try:
+            with self._db() as db:
+                rows = db.execute("SELECT post_url, profile_id, reason, skipped_at FROM skipped_posts ORDER BY skipped_at DESC").fetchall()
+                return [dict(r) for r in rows]
+        except Exception:
+            return []
+
+    def _remove_skipped_post(self, post_url: str) -> None:
+        try:
+            with self._db() as db:
+                db.execute("DELETE FROM skipped_posts WHERE post_url = ?", (post_url,))
+                db.commit()
+        except Exception:
+            pass
+
+    def _clear_all_skipped_posts(self) -> None:
+        try:
+            with self._db() as db:
+                db.execute("DELETE FROM skipped_posts")
+                db.commit()
+        except Exception:
+            pass
+
+    def get_community_editor_failures(self) -> Dict[str, int]:
+        self._reset_community_skip_if_new_day()
+        return dict(self._community_editor_failures)
+
+    def reset_community_editor_failures(self, community_id: Optional[str] = None) -> None:
+        if community_id:
+            keys_to_remove = [k for k in self._community_editor_failures if k.endswith(f":{community_id}")]
+            for k in keys_to_remove:
+                self._community_editor_failures.pop(k, None)
+            for skip_set in self._community_skip_today.values():
+                skip_set.discard(community_id)
+        else:
+            self._community_editor_failures.clear()
+            self._community_skip_today.clear()
+
+    # -- END FIX 1/2 helpers --
+
     def _write_with_retry(self, operation: Callable[[], None], attempts: int = 10, sleep_seconds: float = 0.2) -> None:
         last_exc: Optional[Exception] = None
         for attempt in range(attempts):
@@ -4364,6 +4460,12 @@ class AutomationEngine:
             )
             for row in activity_rows:
                 event_id = row.get("id", str(uuid.uuid4()))
+                profile_label = row.get("profileLabel", "")
+                profile_id = str(row.get("profileId") or "").strip()
+                if profile_id:
+                    name_row = db.execute("SELECT name FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+                    if name_row and name_row["name"]:
+                        profile_label = str(name_row["name"])
                 db.execute(
                     """
                     INSERT INTO activity_feed (id, profile, groupName, action, timestamp, postUrl)
@@ -4371,10 +4473,10 @@ class AutomationEngine:
                     """,
                     (
                         event_id,
-                        row.get("profileLabel", ""),
+                        profile_label or row.get("profileLabel", ""),
                         row.get("community", ""),
                         row.get("result", "Commented"),
-                        row.get("timestamp", datetime.now(timezone.utc).isoformat()),
+                        row.get("timestamp", datetime.now().isoformat()),
                         row.get("postUrl", ""),
                     ),
                 )
@@ -4393,7 +4495,7 @@ class AutomationEngine:
                         str(row.get("keywordMatched") or ("general" if str(row.get("matchSource") or "") == "general" else "")),
                         str(row.get("promptUsed") or ""),
                         str(row.get("aiReply") or ""),
-                        str(row.get("timestamp") or datetime.now(timezone.utc).isoformat()),
+                        str(row.get("timestamp") or datetime.now().isoformat()),
                     ),
                 )
             db.commit()
@@ -4556,97 +4658,12 @@ class AutomationEngine:
                 db.commit()
         self._write_with_retry(_op)
 
-
-    def set_ensure_profile_auth(self, fn: Callable[[str], dict]) -> None:
-        self._ensure_profile_auth_fn = fn
-
-    def run_profile_login_refresh_sync(self, profile_id: str) -> Dict[str, Any]:
-        """Blocking. Runs login refresh. Returns result dict. Saves cookie_json on success."""
-        profile = self._load_profile_for_session(profile_id)
-        if not profile:
-            return {"success": False, "status": "invalid_credentials", "message": "Profile not found"}
-        manager = SkoolSessionManager(
-            account_id=profile_id,
-            email=profile.get("email", ""),
-            password=profile.get("password", ""),
-            proxy=profile.get("proxy"),
-            base_dir=self.accounts_dir,
-            headless=True,
-        )
-        try:
-            with _PLAYWRIGHT_SYNC_LOCK:
-                manager.launch()
-                session_status = manager.validate_session()
-                if session_status == "valid":
-                    manager.update_state("ready")
-                    cookie_json = manager.get_cookies_json()
-                    if cookie_json:
-                        self._save_profile_cookie_json(profile_id, cookie_json)
-                    return {"success": True, "status": "ready", "message": "Session is active", "cookie_json": cookie_json}
-                if session_status == "blocked":
-                    manager.update_state("blocked")
-                    return {"success": False, "status": "network_error", "message": "Account is blocked or access denied"}
-                if session_status == "captcha":
-                    manager.update_state("captcha")
-                    return {"success": False, "status": "captcha", "message": "Captcha required"}
-                if not profile.get("email") or not profile.get("password"):
-                    manager.update_state("logged_out")
-                    return {"success": False, "status": "invalid_credentials", "message": "Missing email or password"}
-                login_result = manager.perform_login()
-                manager.page.wait_for_timeout(2500)
-                if login_result == "success":
-                    recheck = manager.validate_session()
-                    if recheck == "valid":
-                        manager.update_state("ready")
-                        cookie_json = manager.get_cookies_json()
-                        if cookie_json:
-                            self._save_profile_cookie_json(profile_id, cookie_json)
-                        return {"success": True, "status": "ready", "message": "Session is active", "cookie_json": cookie_json}
-                if login_result == "failed":
-                    manager.update_state("logged_out")
-                    return {"success": False, "status": "invalid_credentials", "message": "Credentials are invalid"}
-                if login_result == "captcha" or manager.detect_captcha():
-                    manager.update_state("captcha")
-                    return {"success": False, "status": "captcha", "message": "Captcha required"}
-                if login_result == "blocked" or manager.detect_blocked():
-                    manager.update_state("blocked")
-                    return {"success": False, "status": "network_error", "message": "Account is blocked or access denied"}
-                current_url = str(getattr(manager.page, "url", "") or "").lower()
-                if "/login" not in current_url and manager.has_authenticated_markers():
-                    manager.update_state("ready")
-                    cookie_json = manager.get_cookies_json()
-                    if cookie_json:
-                        self._save_profile_cookie_json(profile_id, cookie_json)
-                    return {"success": True, "status": "ready", "message": "Session is active", "cookie_json": cookie_json}
-                if "/login" in current_url:
-                    manager.update_state("logged_out")
-                    return {"success": False, "status": "invalid_credentials", "message": "Still on login page after login attempt"}
-                manager.update_state("error")
-                return {"success": False, "status": "network_error", "message": "Could not validate session"}
-        except Exception as exc:
-            err = str(exc)
-            low = err.lower()
-            if "proxy" in low:
-                return {"success": False, "status": "proxy_error", "message": "Proxy connection failed"}
-            if "timeout" in low:
-                return {"success": False, "status": "network_error", "message": "Network timeout"}
-            return {"success": False, "status": "network_error", "message": err[:300] or "Unknown error"}
-        finally:
-            manager.close()
-
     def _save_profile_cookie_json(self, profile_id: str, cookie_json: str) -> None:
-        """Save extracted cookies to profile for API-based fetch."""
-        if not cookie_json or not str(cookie_json).strip():
-            return
         def _op() -> None:
             with self._db() as db:
-                pc = {str(r["name"]) for r in db.execute("PRAGMA table_info(profiles)").fetchall()}
-                if "cookie_json" not in pc:
-                    db.execute("ALTER TABLE profiles ADD COLUMN cookie_json TEXT")
                 db.execute("UPDATE profiles SET cookie_json = ? WHERE id = ?", (cookie_json, profile_id))
                 db.commit()
         self._write_with_retry(_op)
-        LOGGER.info("[SKOOL] Saved cookie_json for profile %s", profile_id)
 
     def _increment_profile_daily_usage(self, profile_id: Optional[str], amount: int) -> None:
         if not profile_id or amount <= 0:
@@ -4784,6 +4801,208 @@ class AutomationEngine:
         except Exception:
             return
 
+    def run_scan_community_sync(
+        self,
+        profile_id: str,
+        community_id: str,
+        max_posts: int = 20,
+    ) -> Dict[str, Any]:
+        """Scan a single community for eligible posts. For n8n orchestration. Returns posts only; no queue writes."""
+        result: Dict[str, Any] = {
+            "profile_id": profile_id,
+            "community_id": community_id,
+            "community_name": "",
+            "posts": [],
+            "error": None,
+        }
+        with self._db() as db:
+            comm = db.execute("SELECT id, profileId, name, url FROM communities WHERE id = ?", (community_id,)).fetchone()
+            if not comm:
+                result["error"] = "community_not_found"
+                return result
+            if str(comm["profileId"] or "") != str(profile_id):
+                result["error"] = "community_profile_mismatch"
+                return result
+            result["community_name"] = str(comm["name"] or comm["id"] or "")
+            community_url = self._normalize_url(str(comm["url"] or ""))
+        if not community_url:
+            result["error"] = "community_url_missing"
+            return result
+
+        profile = self._load_profile_for_session(profile_id)
+        if not profile:
+            result["error"] = "profile_not_found"
+            return result
+        blacklist = self._load_blacklist()
+        commented = self._load_profile_commented_posts(profile_id)
+        limit = max(1, min(50, int(max_posts)))
+
+        def _run() -> None:
+            manager = SkoolSessionManager(
+                account_id=profile_id,
+                email=profile.get("email", ""),
+                password=profile.get("password", ""),
+                proxy=profile.get("proxy"),
+                base_dir=self.accounts_dir,
+                headless=True,
+            )
+            try:
+                with _PLAYWRIGHT_SYNC_LOCK:
+                    manager.launch()
+                page = manager.page
+                page.goto(community_url, timeout=45000)
+                page.wait_for_timeout(3000)
+                if "login" in page.url.lower():
+                    result["error"] = "login_required"
+                    return
+                posts = self._collect_feed_posts_newest_to_oldest(page)[:limit]
+                for p in posts:
+                    post_url = str(p.get("post_url") or "").strip()
+                    if not post_url:
+                        continue
+                    norm_url = self._normalize_url(post_url)
+                    already_commented = norm_url in commented if norm_url else False
+                    preview = str(p.get("preview_text") or "")[:2000]
+                    blacklisted_match = self._is_url_blacklisted(post_url, blacklist, preview) or (
+                        bool(preview) and any(term in preview.lower() for term in blacklist)
+                    )
+                    post_ts = p.get("post_ts")
+                    post_age_seconds: Optional[float] = None
+                    if post_ts is not None and isinstance(post_ts, (int, float)):
+                        post_age_seconds = time.time() - float(post_ts)
+                    result["posts"].append({
+                        "post_url": post_url,
+                        "post_id": _extract_task_ref_from_post_url(post_url) or post_url.split("?p=", 1)[-1].split("&", 1)[0] if "?p=" in post_url else "",
+                        "post_text": preview,
+                        "post_age_seconds": post_age_seconds,
+                        "already_commented": already_commented,
+                        "blacklisted_match": blacklisted_match,
+                    })
+            finally:
+                manager.close()
+
+        try:
+            _run()
+        except Exception as e:
+            result["error"] = str(e)[:400]
+        return result
+
+    def run_execute_comment_sync(self, queue_item_id: str) -> Dict[str, Any]:
+        """Execute a single queue item: post the stored generated comment via Playwright. For n8n."""
+        out: Dict[str, Any] = {"success": False, "queue_item_id": queue_item_id, "error": None}
+        with self._db() as db:
+            row = db.execute(
+                "SELECT * FROM queue_items WHERE id = ?",
+                (queue_item_id,),
+            ).fetchone()
+            if not row:
+                out["error"] = "queue_item_not_found"
+                return out
+            keys = row.keys() if hasattr(row, "keys") else []
+            generated = (str(row["generatedComment"] or "").strip() if "generatedComment" in keys else "").strip()
+            if not generated:
+                out["error"] = "generated_comment_missing"
+                return out
+            profile_id = str(row["profileId"] or "")
+            community_id = str(row["communityId"] or "")
+            post_url = self._normalize_url(str(row["postId"] or "")) or str(row["postId"] or "").strip()
+            profile_name = str(row["profile"] or "")
+            fallback_level = str(row["fallbackLevelUsed"] or "keyword_rule") if "fallbackLevelUsed" in keys else "keyword_rule"
+            community_name = str(row["community"] or "")
+            keyword_matched = str(row["keyword"] or "")
+        if not profile_id or not post_url:
+            out["error"] = "missing_profile_or_post"
+            return out
+
+        if "skool.com" not in post_url.lower():
+            out["error"] = "invalid_post_url"
+            return out
+
+        # Enforce daily cap in n8n mode (server-side check)
+        with self._db() as db:
+            _settings_row = db.execute("SELECT value FROM automation_settings WHERE key = 'default'").fetchone()
+            _settings = json.loads(_settings_row["value"]) if _settings_row else {}
+            _daily_cap = max(1, int(_settings.get("globalDailyCapPerAccount", 5)))
+            _profile_row = db.execute("SELECT dailyUsage FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+            if _profile_row and int(_profile_row["dailyUsage"] or 0) >= _daily_cap:
+                out["error"] = "daily_cap_reached"
+                return out
+
+        profile = self._load_profile_for_session(profile_id)
+        if not profile:
+            out["error"] = "profile_not_found"
+            return out
+
+        def _run() -> None:
+            manager = SkoolSessionManager(
+                account_id=profile_id,
+                email=profile.get("email", ""),
+                password=profile.get("password", ""),
+                proxy=profile.get("proxy"),
+                base_dir=self.accounts_dir,
+                headless=True,
+            )
+            try:
+                with _PLAYWRIGHT_SYNC_LOCK:
+                    manager.launch()
+                page = manager.page
+                page.goto(post_url, wait_until="domcontentloaded", timeout=35000)
+                page.wait_for_timeout(2000)
+                if "login" in page.url.lower():
+                    out["error"] = "login_required"
+                    return
+                editor = self._ensure_comment_editor(page, timeout_ms=15000)
+                if not editor:
+                    out["error"] = "editor_not_visible"
+                    return
+                editor.click()
+                page.keyboard.press("Control+a")
+                page.keyboard.press("Delete")
+                editor.type(generated, delay=40)
+                sent, reason = self._submit_comment_with_fallback(page, generated)
+                if not sent:
+                    out["error"] = f"submit_failed:{reason}"
+                    return
+                if not self._verify_comment_published(page, profile, generated):
+                    out["error"] = "post_submit_not_verified"
+                    return
+                out["success"] = True
+                self._remove_queue_item(profile_id, post_url)
+                self._increment_profile_daily_usage(profile_id, 1)
+                self._increment_community_action_counters(community_id, fallback_level == "keyword_rule")
+                self._insert_log({
+                    "id": str(uuid.uuid4()),
+                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                    "profile": profile_name or profile_id or "SYSTEM",
+                    "status": "success",
+                    "message": f"[SKOOL] n8n execute-comment success task={queue_item_id}",
+                })
+                # Write to activity_feed + automation_comment_events so UI reflects n8n actions
+                _evt_id = str(uuid.uuid4())
+                _now_iso = datetime.now(timezone.utc).isoformat()
+                with self._db() as _db:
+                    _db.execute(
+                        """INSERT INTO activity_feed (id, profile, groupName, action, timestamp, postUrl)
+                        VALUES (?, ?, ?, ?, ?, ?)""",
+                        (_evt_id, profile_name, community_name, "Commented", _now_iso, post_url),
+                    )
+                    _db.execute(
+                        """INSERT OR REPLACE INTO automation_comment_events
+                        (id, profileId, profile, community, postUrl, keyword, prompt, commentText, createdAt)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (_evt_id, profile_id, profile_name, community_name, post_url,
+                         keyword_matched, "", generated, _now_iso),
+                    )
+                    _db.commit()
+            finally:
+                manager.close()
+
+        try:
+            _run()
+        except Exception as e:
+            out["error"] = str(e)[:400]
+        return out
+
     def _get_profile_status_from_db(self, profile_id: str) -> Optional[str]:
         with self._db() as db:
             row = db.execute("SELECT status FROM profiles WHERE id = ?", (profile_id,)).fetchone()
@@ -4891,8 +5110,6 @@ class AutomationEngine:
                 profile["visitsCompleted"] = saved.get("visitsCompleted", 0)
                 profile["repliesCompleted"] = saved.get("repliesCompleted", 0)
                 profile["status"] = saved.get("status", "idle")
-                if "_current_community_index" in saved:
-                    profile["_current_community_index"] = int(saved.get("_current_community_index", 0) or 0)
         return profiles
 
     def _refresh_runtime_profiles_locked(self, db_profiles: List[Dict[str, Any]]) -> None:
@@ -4990,12 +5207,12 @@ class AutomationEngine:
 
     def _save_run_state_locked(self) -> None:
         payload = {
-            "profiles": [{"id": p.get("id"), "visitsCompleted": p.get("visitsCompleted", 0), "repliesCompleted": p.get("repliesCompleted", 0), "status": p.get("status", "idle"), "_current_community_index": int(p.get("_current_community_index", 0) or 0)} for p in self._state.profiles],
+            "profiles": [{"id": p.get("id"), "visitsCompleted": p.get("visitsCompleted", 0), "repliesCompleted": p.get("repliesCompleted", 0), "status": p.get("status", "idle")} for p in self._state.profiles],
             "stats": self._state.stats,
             "run_state": self._state.run_state,
             "current_profile_index": self._state.current_profile_index,
+            "countdown_seconds": self._state.countdown_seconds,
             "last_updated": datetime.now().isoformat(),
-            "state_day": datetime.now().strftime("%Y-%m-%d"),
         }
         with self.run_state_file.open("w", encoding="utf-8") as f:
             json.dump(payload, f)
@@ -5016,6 +5233,7 @@ class AutomationEngine:
         self._state.run_state = persisted.get("run_state", "idle")
         self._state.current_profile_index = int(persisted.get("current_profile_index", 0))
         self._state.stats = persisted.get("stats", self._state.stats)
+        self._state.countdown_seconds = int(persisted.get("countdown_seconds", 0))
 
     def _load_blacklist(self) -> Set[str]:
         if not self.blacklist_file.exists():

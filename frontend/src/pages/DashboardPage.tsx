@@ -1,6 +1,7 @@
 ﻿import { useEffect, useMemo, useRef, useState } from "react";
+import { formatLiveCountdown } from "@/lib/utils";
 import { Users, MessageSquare, Sparkles, Clock, Activity, ChevronDown, ChevronUp, ExternalLink, Download, Key, CheckCircle, XCircle, Loader2 } from "lucide-react";
-import { useActivity, useAutomationSettings, useCommunities, useProfiles, useQueue, useQueuePreview } from "@/hooks/useEngageFlow";
+import { useActivity, useAutomationSettings, useCommunities, useProfiles, useQueue, useQueuePreview, useN8nTiming } from "@/hooks/useEngageFlow";
 import { ApiError, api } from "@/lib/api";
 import NextActionsDrawer from "@/components/NextActionsDrawer";
 import { useBackend } from "@/context/BackendContext";
@@ -379,30 +380,33 @@ export default function DashboardPage() {
   const profiles = profilesQuery.data ?? [];
   const communities = communitiesQuery.data ?? [];
   const activityFeed = activityQuery.data ?? [];
-  const queue = queueQuery.data ?? [];
+  const queueResponse = queueQuery.data; const queue = (queueResponse && "items" in queueResponse ? queueResponse.items : Array.isArray(queueResponse) ? queueResponse : []) as QueueItem[];
   const queuePreview = queuePreviewQuery.data ?? [];
   const adjustedQueueNowMs = Math.max(0, nowMs - queueTimerPauseOffsetMs);
   const activeTask = useMemo(() => deriveActiveQueueTask(logs, nowMs), [logs, nowMs]);
   const displayActiveTask = activeTask && (nowMs - activeTask.startedAtMs) <= 20 * 1000 ? activeTask : null;
   const recentRequeueTask = useMemo(() => deriveRecentRequeueTask(logs, nowMs), [logs, nowMs]);
-  const visibleQueue = queue.length > 0 ? queue : queuePreview;
+  const settings = automationSettingsQuery.data;
+  const isN8nMode = settings?.orchestrationMode === "n8n";
+  const n8nTimingQuery = useN8nTiming(isN8nMode);
+  const n8nTiming = n8nTimingQuery.data;
+  const visibleQueue = isN8nMode ? [...queue, ...queuePreview.filter(p => p.isProjected).slice(0, Math.max(0, 30 - queue.length))] : (queue.length > 0 ? queue : queuePreview);
   const displayQueue = interleaveQueueByProfile(visibleQueue);
-  const parsedQueue = visibleQueue
+  const parsedQueue = queue
     .map((item) => ({
       item,
       ts: parseQueueTimestampMs(String(item.scheduledFor || ""), String(item.scheduledTime || ""), adjustedQueueNowMs),
     }))
     .filter((entry) => Number.isFinite(entry.ts));
-  const settings = automationSettingsQuery.data;
   const isEngineRunning = !!engineStatus?.isRunning && !engineStatus?.isPaused;
   const isWaitingSchedule = isEngineRunning && String(engineStatus?.runState || "") === "waiting_schedule";
 
   const activeProfiles = profiles.filter((p) => p.status === "running" || p.status === "ready").length;
   const messagesCount = conversations.reduce((acc, conv) => acc + conv.messages.filter((m) => !m.isDeletedUi).length, 0);
-  const keywordMatches = visibleQueue.length;
+  const keywordMatches = queue.length;
   const nextQueueItem = (() => {
     const nearest = parsedQueue.sort((a, b) => a.ts - b.ts);
-    return nearest.length > 0 ? nearest[0].item : displayQueue[0];
+    return nearest.length > 0 ? nearest[0].item : null;
   })();
   const nextQueueTs = (() => {
     if (!nextQueueItem) return Number.NaN;
@@ -441,12 +445,7 @@ export default function DashboardPage() {
   const configuredRestRounds = Math.max(1, Number(settings?.roundsBeforeConnectionRest ?? connectionRest?.roundsBefore ?? 5));
   const configuredRestMinutes = Math.max(1, Number(settings?.connectionRestMinutes ?? connectionRest?.restMinutes ?? 5));
 
-  const formatCountdown = (seconds: number) => {
-    const safe = Math.max(0, seconds || 0);
-    const m = Math.floor(safe / 60);
-    const sec = safe % 60;
-    return `${m}:${sec.toString().padStart(2, "0")}`;
-  };
+  const formatCountdown = formatLiveCountdown;
 
   const secondsUntilNextMidnight = (() => {
     try {
@@ -471,6 +470,37 @@ export default function DashboardPage() {
   })();
 
   const nextCountdown = (() => {
+    // n8n mode: derive ALL state from queue_items only
+    if (isN8nMode) {
+      if (queue.length === 0) {
+        const armed = settings?.masterEnabled;
+        if (!armed) return "Stopped";
+        // Show projected countdown if available
+        const projParsed = queuePreview
+          .filter((p: any) => p.isProjected && p.scheduledFor)
+          .map((p: any) => ({ ts: new Date(String(p.scheduledFor)).getTime() }))
+          .filter((e: any) => Number.isFinite(e.ts) && e.ts > nowMs)
+          .sort((a: any, b: any) => a.ts - b.ts);
+        if (projParsed.length > 0) {
+          const sec = Math.floor((projParsed[0].ts - nowMs) / 1000);
+          return sec > 0 ? formatCountdown(sec) : "Scanning…";
+        }
+        return "No actions planned";
+      }
+      // Real queue items exist - find earliest future
+      const realParsed = queue.map(item => ({
+        item,
+        ts: parseQueueTimestampMs(String(item.scheduledFor || ""), String(item.scheduledTime || ""), nowMs),
+      })).filter(e => Number.isFinite(e.ts));
+      const sorted = realParsed.sort((a, b) => a.ts - b.ts);
+      const futureItem = sorted.find((e) => e.ts > nowMs);
+      if (futureItem) {
+        const secondsLeft = Math.floor((futureItem.ts - nowMs) / 1000);
+        return formatCountdown(secondsLeft);
+      }
+      return `${queue.length} ready`;
+    }
+    // Internal scheduler mode
     if (!engineStatus?.isRunning || engineStatus?.isPaused) return "Waiting for start";
     if (connectionRest?.active) return formatCountdown(connectionRest.remainingSeconds);
     if (isWaitingSchedule) {
@@ -618,87 +648,115 @@ export default function DashboardPage() {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
         <StatCard icon={Users} label="Active Profiles" value={activeProfiles} sub={`${profiles.length} total В· Cap: ${settings?.globalDailyCapPerAccount ?? "-"}/day`} color="bg-primary/10 text-primary" />
         <StatCard icon={MessageSquare} label="Messages" value={messagesCount} sub={`${conversations.length} conversations`} color="bg-success/10 text-success" />
-        <StatCard icon={Sparkles} label="Keyword Matches" value={keywordMatches} sub={`${visibleQueue.length} queued actions`} color="bg-warning/10 text-warning" />
+        <StatCard icon={Sparkles} label="Queue" value={queue.length} sub={isN8nMode ? `${queue.length} real` + (visibleQueue.length > queue.length ? ` + ${visibleQueue.length - queue.length} projected` : "") : `${visibleQueue.length} queued actions`} color="bg-warning/10 text-warning" />
         <div className="bg-card border border-border rounded-xl p-5 animate-count-up">
           <div className="flex items-center gap-3 mb-3">
             <div className="flex items-center justify-center w-10 h-10 rounded-lg bg-info/10 text-info">
               <Clock className="w-5 h-5" />
             </div>
-            <span className="text-sm font-medium text-muted-foreground">Next Action</span>
+            <span className="text-sm font-medium text-muted-foreground">{isN8nMode ? "n8n Status" : "Next Action"}</span>
           </div>
           <p className="text-2xl font-bold text-foreground">{nextCountdown}</p>
-          {isEngineRunning && connectionRest?.active ? (
+          {isN8nMode ? (
             <>
               <p className="text-xs text-muted-foreground mt-1">
-                Connection rest: pausing for {connectionRest.restMinutes} min
+                {queue.length > 0 ? (
+                  <><span className="text-success font-medium">Running</span>{" \u00b7 "}{queue.length} pending</>
+                ) : queuePreview.length > 0 ? (
+                  <><span className="text-info font-medium">Projected</span>{" \u00b7 "}next planned comment</>
+                ) : (
+                  "No upcoming actions"
+                )}
               </p>
-              <p className="text-[11px] text-muted-foreground mt-1">
-                Completed rounds: {Math.min(connectionRest.roundsCompleted, connectionRest.roundsBefore)} of {connectionRest.roundsBefore}
-              </p>
-              <div className="mt-2 flex items-center gap-2">
-                <button onClick={() => setShowNextActions(true)} className="text-xs text-primary hover:text-primary/80 font-medium transition-colors inline-flex items-center gap-1">
-                  View Next Scheduled &gt;
-                </button>
-              </div>
-            </>
-          ) : null}
-          {!connectionRest?.active && isWaitingSchedule ? (
-            <>
-              <p className="text-xs text-muted-foreground mt-1">
-                Awaiting next schedule window ({formatCountdown(Math.max(0, Number(engineStatus?.countdownSeconds || 0)))})
-              </p>
-              <p className="text-[11px] text-muted-foreground mt-1">
-                Daily counters reset in {formatCountdown(secondsUntilNextMidnight)}
-              </p>
-              <div className="mt-2 flex items-center gap-2">
-                <button onClick={() => setShowNextActions(true)} className="text-xs text-primary hover:text-primary/80 font-medium transition-colors inline-flex items-center gap-1">
-                  View Next Scheduled &gt;
-                </button>
-              </div>
-            </>
-          ) : !connectionRest?.active && isEngineRunning && displayActiveTask ? (
-            <>
-              <p className="text-xs text-muted-foreground mt-1">
-                {displayActiveTask.profile} В· <span className="text-primary font-medium">{displayActiveTask.stage}</span>
-              </p>
-              <div className="mt-2 flex items-center gap-2">
-                <button onClick={() => setShowNextActions(true)} className="text-xs text-primary hover:text-primary/80 font-medium transition-colors inline-flex items-center gap-1">
-                  View Next Scheduled &gt;
-                </button>
-              </div>
-            </>
-          ) : !connectionRest?.active && isEngineRunning && nextQueueItem ? (
-            <>
-              <p className="text-xs text-muted-foreground mt-1">
-                {nextQueueItem.profile} &gt; {nextQueueItem.community} В· <span className="text-primary font-medium">{nextQueueItem.keyword}</span>
-              </p>
-              {recentRequeueTask && (
-                <p className="text-[11px] text-warning mt-1">
-                  Retrying task {recentRequeueTask.taskId.slice(0, 8)}... reason: {recentRequeueTask.reason.replaceAll("_", " ")}
+              {queue.length > 0 && nextQueueItem ? (
+                <p className="text-[11px] text-muted-foreground mt-1">
+                  Next queued: {nextQueueItem.profile} &gt; {nextQueueItem.community}{" \u00b7 "}<span className="text-primary">{nextQueueItem.keyword}</span>
                 </p>
-              )}
-              <div className="mt-2 flex items-center gap-2">
-                <button onClick={() => setShowNextActions(true)} className="text-xs text-primary hover:text-primary/80 font-medium transition-colors inline-flex items-center gap-1">
-                  View Next Scheduled &gt;
-                </button>
-              </div>
+              ) : queue.length === 0 && queuePreview.length > 0 && (() => {
+                const first = queuePreview.find((p: any) => p.isProjected);
+                return first ? (
+                  <p className="text-[11px] text-muted-foreground/70 mt-1 italic">
+                    Next planned: {(first as any).profile} &gt; {(first as any).community}
+                  </p>
+                ) : null;
+              })()}
             </>
           ) : (
-            <p className="text-xs text-muted-foreground mt-1">
-              {engineStatus?.isPaused
-                ? "Automation paused"
-                : engineStatus?.isRunning
-                  ? (connectionRest?.active
-                    ? "Connection rest is active"
-                    : recentRequeueTask
-                      ? `Retry pending: ${recentRequeueTask.reason.replaceAll("_", " ")}`
-                      : "No scheduled actions")
-                  : "Automation stopped"}
-            </p>
+            <>
+              {isEngineRunning && connectionRest?.active ? (
+                <>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Connection rest: pausing for {connectionRest.restMinutes} min
+                  </p>
+                  <p className="text-[11px] text-muted-foreground mt-1">
+                    Completed rounds: {Math.min(connectionRest.roundsCompleted, connectionRest.roundsBefore)} of {connectionRest.roundsBefore}
+                  </p>
+                  <div className="mt-2 flex items-center gap-2">
+                    <button onClick={() => setShowNextActions(true)} className="text-xs text-primary hover:text-primary/80 font-medium transition-colors inline-flex items-center gap-1">
+                      View Next Scheduled &gt;
+                    </button>
+                  </div>
+                </>
+              ) : null}
+              {!connectionRest?.active && isWaitingSchedule ? (
+                <>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Awaiting next schedule window ({formatCountdown(Math.max(0, Number(engineStatus?.countdownSeconds || 0)))})
+                  </p>
+                  <p className="text-[11px] text-muted-foreground mt-1">
+                    Daily counters reset in {formatCountdown(secondsUntilNextMidnight)}
+                  </p>
+                  <div className="mt-2 flex items-center gap-2">
+                    <button onClick={() => setShowNextActions(true)} className="text-xs text-primary hover:text-primary/80 font-medium transition-colors inline-flex items-center gap-1">
+                      View Next Scheduled &gt;
+                    </button>
+                  </div>
+                </>
+              ) : !connectionRest?.active && isEngineRunning && displayActiveTask ? (
+                <>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    {displayActiveTask.profile}{" \u00b7 "}<span className="text-primary font-medium">{displayActiveTask.stage}</span>
+                  </p>
+                  <div className="mt-2 flex items-center gap-2">
+                    <button onClick={() => setShowNextActions(true)} className="text-xs text-primary hover:text-primary/80 font-medium transition-colors inline-flex items-center gap-1">
+                      View Next Scheduled &gt;
+                    </button>
+                  </div>
+                </>
+              ) : !connectionRest?.active && isEngineRunning && nextQueueItem ? (
+                <>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    {nextQueueItem.profile} &gt; {nextQueueItem.community}{" \u00b7 "}<span className="text-primary font-medium">{nextQueueItem.keyword}</span>
+                  </p>
+                  {recentRequeueTask && (
+                    <p className="text-[11px] text-warning mt-1">
+                      Retrying task {recentRequeueTask.taskId.slice(0, 8)}... reason: {recentRequeueTask.reason.replaceAll("_", " ")}
+                    </p>
+                  )}
+                  <div className="mt-2 flex items-center gap-2">
+                    <button onClick={() => setShowNextActions(true)} className="text-xs text-primary hover:text-primary/80 font-medium transition-colors inline-flex items-center gap-1">
+                      View Next Scheduled &gt;
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <p className="text-xs text-muted-foreground mt-1">
+                  {engineStatus?.isPaused
+                    ? "Automation paused"
+                    : engineStatus?.isRunning
+                      ? (connectionRest?.active
+                        ? "Connection rest is active"
+                        : recentRequeueTask
+                          ? `Retry pending: ${recentRequeueTask.reason.replaceAll("_", " ")}`
+                          : "No scheduled actions")
+                      : "Automation stopped"}
+                </p>
+              )}
+              <p className="text-[11px] text-muted-foreground mt-2">
+                Rest policy: every {configuredRestRounds} rounds, pause for {configuredRestMinutes} min.
+              </p>
+            </>
           )}
-          <p className="text-[11px] text-muted-foreground mt-2">
-            Rest policy: every {configuredRestRounds} rounds, pause for {configuredRestMinutes} min.
-          </p>
         </div>
       </div>
 
@@ -798,8 +856,8 @@ export default function DashboardPage() {
           <div className="flex items-center justify-between px-5 py-4 border-b border-border">
             <div className="flex items-center gap-2">
               <Clock className="w-4 h-4 text-muted-foreground" />
-              <h2 className="text-sm font-semibold text-foreground">Action Queue</h2>
-              <span className="text-xs text-muted-foreground">({queue.length > 0 ? `${visibleQueue.length} scheduled` : visibleQueue.length > 0 ? `0 queued + ${visibleQueue.length} forecast` : "0 scheduled"})</span>
+              <h2 className="text-sm font-semibold text-foreground">{queue.length > 0 ? "Action Queue" : "Projected Schedule"}</h2>
+              <span className="text-xs text-muted-foreground">({isN8nMode ? (queue.length > 0 ? `${queue.length} queued` + (visibleQueue.length > queue.length ? ` + ${visibleQueue.length - queue.length} projected` : "") : `${visibleQueue.length} planned`) : queue.length > 0 ? `${queue.length} scheduled` : "0 scheduled"})</span>
               <div className="ml-2 inline-flex items-center rounded-md border border-border bg-background overflow-hidden">
                 <button
                   type="button"
@@ -843,7 +901,19 @@ export default function DashboardPage() {
                 {!queueExpanded && (
                   <div className="text-right">
                     <p className="text-sm font-mono font-semibold text-foreground">
-                      {formatQueueEta(
+                      {isN8nMode ? (() => {
+                        const ts = parseQueueTimestampMs(item.scheduledFor, item.scheduledTime, nowMs);
+                        if (!Number.isFinite(ts)) return "Pending";
+                        const sec = Math.floor((ts - nowMs) / 1000);
+                        if (sec <= 0) return "Ready";
+                        if (sec < 60) return `${sec}s`;
+                        if (sec < 3600) {
+                          const m = Math.floor(sec / 60);
+                          const s = sec % 60;
+                          return `${m}:${String(s).padStart(2, "0")}`;
+                        }
+                        return `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`;
+                      })() : formatQueueEta(
                         item.scheduledFor,
                         item.scheduledTime,
                         adjustedQueueNowMs,
@@ -856,14 +926,16 @@ export default function DashboardPage() {
                       )}
                     </p>
                     <p className="text-[10px] text-muted-foreground">
-                      {engineStatus?.isRunning && !engineStatus?.isPaused ? item.scheduledTime : "Waiting for start"}
+                      {isN8nMode ? ((item as any).isProjected ? <span className="text-warning/70 italic">Projected</span> : item.scheduledFor ? new Date(item.scheduledFor).toLocaleTimeString() : item.scheduledTime) : (engineStatus?.isRunning && !engineStatus?.isPaused ? item.scheduledTime : "Waiting for start")}
                     </p>
                   </div>
                 )}
               </div>
             ))}
             {displayedQueue.length === 0 && (
-              <div className="px-5 py-8 text-sm text-muted-foreground">Queue is empty.</div>
+              <div className="px-5 py-8 text-sm text-muted-foreground">
+                {isN8nMode ? (settings?.masterEnabled ? "Running \u2014 auto-scanning for posts..." : "Stopped") : "Queue is empty."}
+              </div>
             )}
           </div>
           {!queueExpanded && visibleQueue.length > 6 && (

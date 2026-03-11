@@ -1,0 +1,120 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+@layer base {
+  :root {
+    --background: 220 14% 96%;
+    --foreground: 222 47% 11%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+
+    --primary: 217 91% 60%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 220 14% 96%;
+    --secondary-foreground: 222 47% 11%;
+
+    --muted: 220 14% 96%;
+    --muted-foreground: 215 16% 47%;
+
+    --accent: 220 14% 96%;
+    --accent-foreground: 222 47% 11%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 220 13% 91%;
+    --input: 220 13% 91%;
+    --ring: 217 91% 60%;
+
+    --radius: 0.5rem;
+
+    /* Status colors */
+    --status-connected: 142 71% 45%;
+    --status-connected-bg: 142 76% 94%;
+    --status-error: 0 84% 60%;
+    --status-error-bg: 0 93% 94%;
+    --status-warning: 38 92% 50%;
+    --status-warning-bg: 38 100% 94%;
+    --status-info: 217 91% 60%;
+    --status-info-bg: 217 91% 95%;
+    --status-idle: 215 16% 47%;
+    --status-idle-bg: 220 14% 96%;
+    --status-processing: 262 83% 58%;
+    --status-processing-bg: 262 83% 95%;
+
+    --sidebar-background: 0 0% 100%;
+    --sidebar-foreground: 222 47% 11%;
+    --sidebar-primary: 217 91% 60%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 217 91% 97%;
+    --sidebar-accent-foreground: 217 91% 60%;
+    --sidebar-border: 220 13% 91%;
+    --sidebar-ring: 217 91% 60%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-family: 'Inter', sans-serif;
+  }
+}
+
+@layer components {
+  .status-badge {
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium;
+  }
+  .status-connected {
+    background: hsl(var(--status-connected-bg));
+    color: hsl(var(--status-connected));
+  }
+  .status-error {
+    background: hsl(var(--status-error-bg));
+    color: hsl(var(--status-error));
+  }
+  .status-warning {
+    background: hsl(var(--status-warning-bg));
+    color: hsl(var(--status-warning));
+  }
+  .status-info {
+    background: hsl(var(--status-info-bg));
+    color: hsl(var(--status-info));
+  }
+  .status-idle {
+    background: hsl(var(--status-idle-bg));
+    color: hsl(var(--status-idle));
+  }
+  .status-processing {
+    background: hsl(var(--status-processing-bg));
+    color: hsl(var(--status-processing));
+  }
+
+  .text-status-connected {
+    color: hsl(var(--status-connected));
+  }
+  .text-status-error {
+    color: hsl(var(--status-error));
+  }
+  .text-status-warning {
+    color: hsl(var(--status-warning));
+  }
+}
+
+.community-link {
+  color: inherit;
+  text-decoration: none;
+}
+.community-link:hover {
+  text-decoration: underline;
+}

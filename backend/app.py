@@ -62,7 +62,9 @@ except Exception:
     PlaywrightTimeoutError = TimeoutError
     PLAYWRIGHT_AVAILABLE = False
 
-DB_PATH = Path(__file__).parent / "engageflow.db"
+DB_PATH = Path(
+    os.environ.get("ENGAGEFLOW_DB_PATH", str(Path(__file__).parent / "engageflow.db"))
+)
 LOGGER = logging.getLogger("engageflow")
 LOG_LEVEL = str(os.environ.get("ENGAGEFLOW_LOG_LEVEL", "INFO")).strip().upper() or "INFO"
 LOG_RETENTION_DAYS = max(1, int(os.environ.get("ENGAGEFLOW_LOG_RETENTION_DAYS", "14")))
@@ -179,13 +181,312 @@ def _setup_application_logging() -> None:
 _setup_application_logging()
 
 
+# ---------- Built-in n8n-mode executor cron (replaces external n8n dependency) ----------
+
+async def _run_auto_scan(app: FastAPI, settings_dict: dict) -> None:
+    """Auto-scan: simplified version of n8n-scan-now for the executor loop."""
+    engine = app.state.automation_engine
+    with get_db() as db:
+        config = _build_n8n_runtime_config(db)
+    
+    global_daily_cap = max(1, int(settings_dict.get("globalDailyCapPerAccount", 5)))
+    fallback_prompt = str(settings_dict.get("commentFallbackPrompt", "Write a short helpful comment under 40 words.")).strip()
+    openai_key = engine._get_openai_key()
+    
+    import random as _rng
+    delay_min = max(1, int(config.get("delayMin", 3)))
+    delay_max = max(delay_min, int(config.get("delayMax", 10)))
+    max_per_profile = max(1, int(settings_dict.get("queuePrefillMaxPerProfilePerPass", 2)))
+    
+    last_scheduled_per_profile: dict = {}
+    with get_db() as db_sched:
+        for profile in config.get("enabledProfiles", []):
+            pid = profile["id"]
+            row = db_sched.execute(
+                "SELECT scheduledFor FROM queue_items WHERE profileId = ? ORDER BY scheduledFor DESC LIMIT 1",
+                (pid,),
+            ).fetchone()
+            if row and row["scheduledFor"]:
+                try:
+                    last_scheduled_per_profile[pid] = _parse_queue_scheduled_for(str(row["scheduledFor"]))
+                except Exception:
+                    pass
+
+    def _next_sf(pid):
+        now = datetime.now()
+        base = last_scheduled_per_profile.get(pid, now)
+        if base < now:
+            base = now
+        delay = _rng.randint(delay_min, delay_max)
+        scheduled = base + timedelta(seconds=delay)
+        last_scheduled_per_profile[pid] = scheduled
+        return scheduled
+
+    profile_rotation = {}
+    with get_db() as db_rot:
+        for profile in config.get("enabledProfiles", []):
+            pid = profile["id"]
+            rot_row = db_rot.execute("SELECT lastCommunityIndex FROM profiles WHERE id = ?", (pid,)).fetchone()
+            profile_rotation[pid] = int(rot_row["lastCommunityIndex"] or 0) if rot_row else 0
+
+    total_queued = 0
+    for profile in config.get("enabledProfiles", []):
+        pid = profile["id"]
+        daily_usage = int(profile.get("dailyUsage", 0))
+        if daily_usage >= global_daily_cap:
+            continue
+
+        all_communities = config.get("communitiesByProfile", {}).get(pid, [])
+        active_communities = [c for c in all_communities if str(c.get("status", "")).lower() == "active"]
+        if not active_communities:
+            continue
+
+        start_idx = (profile_rotation.get(pid, 0) + 1) % len(active_communities)
+        last_queued_idx = profile_rotation.get(pid, 0)
+        queued_this_profile = 0
+
+        for offset in range(len(active_communities)):
+            idx = (start_idx + offset) % len(active_communities)
+            comm = active_communities[idx]
+            if queued_this_profile >= max_per_profile:
+                break
+            cid = comm["id"]
+            try:
+                scan_result = await asyncio.to_thread(engine.run_scan_community_sync, pid, cid, 10)
+            except Exception:
+                continue
+            if scan_result.get("error"):
+                continue
+
+            for post in scan_result.get("posts", []):
+                if post.get("already_commented") or post.get("blacklisted_match"):
+                    continue
+                post_url = str(post.get("post_url", "")).strip()
+                post_text = str(post.get("post_text", "")).strip()
+                if not post_url or not post_text:
+                    continue
+                if queued_this_profile >= max_per_profile:
+                    break
+
+                kw_rules = config.get("keywordRules", [])
+                matched_kw = "general"
+                prompt_used = fallback_prompt
+                for rule in kw_rules:
+                    if rule.get("keyword", "").lower() in post_text.lower():
+                        matched_kw = rule["keyword"]
+                        prompt_used = rule.get("commentPrompt") or fallback_prompt
+                        break
+                try:
+                    from automation.engine import _openai_generate_comment_rest
+                    generated = _openai_generate_comment_rest(openai_key, prompt_used, post_text[:4000])
+                except Exception:
+                    continue
+                if not generated.strip():
+                    continue
+                scheduled = _next_sf(pid)
+                payload = N8nQueueCommentRequest(
+                    profile_id=pid,
+                    community_id=cid,
+                    post_url=post_url,
+                    keyword=matched_kw,
+                    generated_comment=generated.strip(),
+                    scheduled_for=scheduled.isoformat(timespec="seconds"),
+                    fallback_level_used="keyword_rule" if matched_kw != "general" else "general_comment_fallback",
+                )
+                try:
+                    n8n_queue_comment(payload)
+                    total_queued += 1
+                    queued_this_profile += 1
+                    last_queued_idx = idx
+                    break
+                except Exception:
+                    pass
+
+        with get_db() as db_rot2:
+            db_rot2.execute("UPDATE profiles SET lastCommunityIndex = ? WHERE id = ?", (last_queued_idx, pid))
+            db_rot2.commit()
+
+    with get_db() as db_log:
+        _insert_backend_log(
+            db_log, "SYSTEM", "success",
+            f"auto-scan complete: queued={total_queued}",
+            module="automation", action="auto_scan",
+        )
+        # Also write a scan-now-compatible log so timing endpoint picks it up
+        _insert_backend_log(
+            db_log, "SYSTEM", "success",
+            f"n8n-scan-now complete (auto): queued={total_queued}",
+            module="automation", action="n8n_scan_now",
+        )
+        db_log.commit()
+
+_N8N_EXECUTOR_INTERVAL_SECONDS = 120  # check every 2 minutes
+
+async def _n8n_executor_loop(app: FastAPI) -> None:
+    """Background loop: every 2 min, execute all due queue items (n8n mode only)."""
+    pass  # executor loop
+    await asyncio.sleep(15)  # wait for startup
+    while True:
+        try:
+            with get_db() as db:
+                settings = _load_or_create_automation_settings(db)
+                s = settings.model_dump()
+            if s.get("orchestrationMode") != "n8n" or not s.get("masterEnabled"):
+                await asyncio.sleep(_N8N_EXECUTOR_INTERVAL_SECONDS)
+                continue
+
+            # Call our own execute-due endpoint internally
+            engine = app.state.automation_engine
+            now_iso = datetime.now().isoformat(timespec="seconds")
+            with get_db() as db:
+                due_rows = db.execute(
+                    "SELECT id, profileId, scheduledFor FROM queue_items WHERE scheduledFor <= ? AND status = 'pending' ORDER BY scheduledFor ASC",
+                    (now_iso,),
+                ).fetchall()
+            if not due_rows:
+                # If queue is totally empty, auto-trigger a scan to refill
+                total_pending = 0
+                with get_db() as db_check:
+                    total_pending = db_check.execute("SELECT COUNT(*) as c FROM queue_items WHERE status = 'pending'").fetchone()["c"]
+                if total_pending == 0:
+                    try:
+                        # Check if any profile has capacity
+                        has_capacity = False
+                        global_cap = max(1, int(s.get("globalDailyCapPerAccount", 5)))
+                        with get_db() as db_cap:
+                            for prow in db_cap.execute("SELECT dailyUsage FROM profiles WHERE status IN ('ready','running','idle')").fetchall():
+                                if int(prow["dailyUsage"] or 0) < global_cap:
+                                    has_capacity = True
+                                    break
+                        if has_capacity:
+                            with get_db() as db_log:
+                                _insert_backend_log(
+                                    db_log, "SYSTEM", "info",
+                                    "executor-cron: queue empty, triggering auto-scan",
+                                    module="automation", action="executor_cron",
+                                )
+                                db_log.commit()
+                            await _run_auto_scan(app, s)
+                    except Exception as e:
+                        with get_db() as db_err:
+                            _insert_backend_log(
+                                db_err, "SYSTEM", "error",
+                                f"executor-cron: auto-scan failed: {str(e)[:200]}",
+                                module="automation", action="executor_cron",
+                            )
+                            db_err.commit()
+                await asyncio.sleep(_N8N_EXECUTOR_INTERVAL_SECONDS)
+                continue
+
+            global_daily_cap = max(1, int(s.get("globalDailyCapPerAccount", 5)))
+            executed = 0
+            failed = 0
+            skipped = 0
+
+            with get_db() as db:
+                _insert_backend_log(
+                    db, "SYSTEM", "info",
+                    f"executor-cron: {len(due_rows)} items due at {now_iso}",
+                    module="automation", action="executor_cron",
+                )
+                db.commit()
+
+            for row in due_rows:
+                item_id = str(row["id"])
+                profile_id = str(row["profileId"])
+
+                # Check daily cap
+                with get_db() as db2:
+                    profile_row = db2.execute("SELECT dailyUsage FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+                    if profile_row and int(profile_row["dailyUsage"] or 0) >= global_daily_cap:
+                        skipped += 1
+                        db2.execute("DELETE FROM queue_items WHERE id = ?", (item_id,))
+                        db2.commit()
+                        continue
+
+                result_ok = False
+                try:
+                    result = await asyncio.to_thread(engine.run_execute_comment_sync, item_id)
+                    if result.get("success"):
+                        executed += 1
+                        result_ok = True
+                    else:
+                        failed += 1
+                        error = result.get("error", "unknown")
+                        permanent_errors = ("queue_item_not_found", "generated_comment_missing",
+                                             "missing_profile_or_post", "invalid_post_url", "profile_not_found",
+                                             "daily_cap_reached", "login_required")
+                        if error in permanent_errors:
+                            with get_db() as db3:
+                                db3.execute("DELETE FROM queue_items WHERE id = ?", (item_id,))
+                                db3.commit()
+                except Exception as e:
+                    failed += 1
+
+                # After any failure, increment retry count; remove after 3 retries
+                if not result_ok:
+                    with get_db() as db_retry:
+                        # Use countdown field as retry counter (decrement toward 0)
+                        db_retry.execute(
+                            "UPDATE queue_items SET countdown = MAX(0, COALESCE(countdown, 3) - 1) WHERE id = ?",
+                            (item_id,)
+                        )
+                        retry_row = db_retry.execute("SELECT countdown FROM queue_items WHERE id = ?", (item_id,)).fetchone()
+                        if retry_row and int(retry_row["countdown"] or 0) <= 0:
+                            db_retry.execute("DELETE FROM queue_items WHERE id = ?", (item_id,))
+                            _insert_backend_log(
+                                db_retry, "SYSTEM", "warning",
+                                f"executor-cron: removed item {item_id} after max retries",
+                                module="automation", action="executor_cron",
+                            )
+                        db_retry.commit()
+
+                # Small delay between executions to avoid hammering
+                await asyncio.sleep(3)
+
+            with get_db() as db:
+                _insert_backend_log(
+                    db, "SYSTEM", "success",
+                    f"executor-cron complete: executed={executed} failed={failed} skipped={skipped}",
+                    module="automation", action="executor_cron",
+                )
+                db.commit()
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            try:
+                with get_db() as db:
+                    _insert_backend_log(
+                        db, "SYSTEM", "error",
+                        f"executor-cron error: {str(e)[:200]}",
+                        module="automation", action="executor_cron",
+                    )
+                    db.commit()
+            except Exception:
+                pass
+        await asyncio.sleep(_N8N_EXECUTOR_INTERVAL_SECONDS)
+
+
+# ---------- Built-in daily reset cron ----------
+async def _daily_reset_loop() -> None:
+    """Reset daily counters at midnight."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            _reset_daily_counters_if_needed_for_api()
+        except Exception:
+            pass
+        await asyncio.sleep(3600)  # check every hour
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.automation_engine = AutomationEngine(DB_PATH, Path(__file__).parent)
     await app.state.automation_engine.recover_after_restart()
     global _AUTOMATION_ENGINE_REF
     _AUTOMATION_ENGINE_REF = app.state.automation_engine
-    app.state.automation_engine.set_ensure_profile_auth(ensure_profile_auth)
+    # app.state.automation_engine.set_ensure_profile_auth(ensure_profile_auth)  # disabled - engine lacks method
     app.state.profile_login_monitor_task = asyncio.create_task(
         _profile_login_monitor_loop(app),
         name="profile-login-monitor",
@@ -200,6 +501,15 @@ async def lifespan(app: FastAPI):
     app.state.joiner_worker_task = asyncio.create_task(
         joiner_worker_loop(get_db),
         name="joiner-worker",
+    )
+    # Built-in executor cron for n8n mode
+    app.state.n8n_executor_task = asyncio.create_task(
+        _n8n_executor_loop(app),
+        name="n8n-executor-cron",
+    )
+    app.state.daily_reset_task = asyncio.create_task(
+        _daily_reset_loop(),
+        name="daily-reset",
     )
     try:
         yield
@@ -225,13 +535,27 @@ async def lifespan(app: FastAPI):
                 await joiner_task
             except asyncio.CancelledError:
                 pass
+        executor_task = getattr(app.state, "n8n_executor_task", None)
+        if executor_task:
+            executor_task.cancel()
+            try:
+                await executor_task
+            except asyncio.CancelledError:
+                pass
+        reset_task = getattr(app.state, "daily_reset_task", None)
+        if reset_task:
+            reset_task.cancel()
+            try:
+                await reset_task
+            except asyncio.CancelledError:
+                pass
         try:
             await app.state.automation_engine.shutdown(preserve_run_state=True)
         except Exception:
             pass
 
 
-app = FastAPI(title="EngageFlow Backend", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Skoollindy Backend", version="0.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -242,8 +566,11 @@ app.add_middleware(
 )
 
 
+# Optional API key for /api/n8n/*. If set, all n8n endpoints require header X-N8N-KEY.
+N8N_API_KEY = (os.environ.get("N8N_API_KEY") or os.environ.get("SKOOLLINDY_N8N_API_KEY") or "").strip()
+
+
 @app.middleware("http")
-# Log each request with status code and latency for diagnostics.
 async def request_logging_middleware(request: Request, call_next):
     started = time.perf_counter()
     try:
@@ -263,6 +590,22 @@ async def request_logging_middleware(request: Request, call_next):
     log_fn = LOGGER.warning if status_code >= 400 else LOGGER.info
     log_fn("HTTP %s %s -> %s (%.1fms)", request.method, request.url.path, status_code, elapsed_ms)
     return response
+
+
+@app.middleware("http")
+async def n8n_api_key_middleware(request: Request, call_next):
+    """Require X-N8N-KEY header on /api/n8n/* when N8N_API_KEY (or SKOOLLINDY_N8N_API_KEY) is set."""
+    if not request.url.path.startswith("/api/n8n/"):
+        return await call_next(request)
+    if not N8N_API_KEY:
+        return await call_next(request)
+    key = (request.headers.get("X-N8N-KEY") or "").strip()
+    if not key or key != N8N_API_KEY:
+        return JSONResponse(
+            status_code=401,
+            content={"success": False, "error": "unauthorized", "message": "Missing or invalid X-N8N-KEY"},
+        )
+    return await call_next(request)
 
 
 @app.exception_handler(HTTPException)
@@ -584,7 +927,7 @@ def _infer_log_module_action(message: str) -> Tuple[str, str]:
 def _insert_backend_log(
     db: sqlite3.Connection,
     profile: str,
-    status: Literal["success", "retry", "error", "info"],
+    status: Literal["success", "retry", "error", "info", "warning"],
     message: str,
     module: Optional[str] = None,
     action: Optional[str] = None,
@@ -621,7 +964,7 @@ def _emit_dm_sync_log_once(
     db: sqlite3.Connection,
     profile_id: str,
     profile_name: str,
-    status: Literal["success", "retry", "error", "info"],
+    status: Literal["success", "retry", "error", "info", "warning"],
     dedupe_key: str,
     message: str,
     cooldown_sec: int = 180,
@@ -5014,6 +5357,7 @@ def ensure_tables() -> None:
             """
         )
         db.execute("""CREATE TABLE IF NOT EXISTS analytics (key TEXT PRIMARY KEY,value TEXT NOT NULL)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS skipped_posts (post_url TEXT NOT NULL,profile_id TEXT NOT NULL,reason TEXT NOT NULL,skipped_at TEXT NOT NULL,PRIMARY KEY (post_url, profile_id))""")
         # Stores identity history for deleted profiles to reconnect historical actions on re-add.
         db.execute(
             """
@@ -5034,6 +5378,20 @@ def ensure_tables() -> None:
         if "maxPostAgeDays" not in community_columns:
             db.execute("ALTER TABLE communities ADD COLUMN maxPostAgeDays INTEGER NOT NULL DEFAULT 0")
         db.execute("UPDATE communities SET maxPostAgeDays = 0 WHERE maxPostAgeDays IS NULL OR maxPostAgeDays < 0")
+        # n8n-driven queue: persist generated comment and status for execute-comment
+        qi_cols = {str(r["name"]) for r in db.execute("PRAGMA table_info(queue_items)").fetchall()}
+        for col, default in [
+            ("generatedComment", "''"),
+            ("status", "'pending'"),
+            ("fallbackLevelUsed", "NULL"),
+            ("createdAt", "NULL"),
+            ("updatedAt", "NULL"),
+        ]:
+            if col not in qi_cols:
+                try:
+                    db.execute(f"ALTER TABLE queue_items ADD COLUMN {col} TEXT DEFAULT {default}")
+                except sqlite3.OperationalError:
+                    pass
         pc = {str(r["name"]) for r in db.execute("PRAGMA table_info(profiles)").fetchall()}
         if "cookie_json" not in pc:
             db.execute("ALTER TABLE profiles ADD COLUMN cookie_json TEXT")
@@ -5307,6 +5665,8 @@ class AutomationSettingsModel(BaseModel):
     queuePrefillMaxPerProfilePerPass: int = 2
     blacklistEnabled: bool
     blacklistTerms: List[str]
+    # Who drives comment automation: "internal" (scheduler) or "n8n"
+    orchestrationMode: Literal["internal", "n8n"] = "internal"
 
 
 AUTOMATION_SETTINGS_DEFAULT = AutomationSettingsModel(
@@ -5332,6 +5692,7 @@ AUTOMATION_SETTINGS_DEFAULT = AutomationSettingsModel(
     queuePrefillMaxPerProfilePerPass=max(1, int(os.environ.get("AUTOMATION_QUEUE_PREFILL_MAX_PER_PROFILE", "2"))),
     blacklistEnabled=False,
     blacklistTerms=[],
+    orchestrationMode="internal",
 )
 
 
@@ -5348,6 +5709,12 @@ class QueueItemModel(BaseModel):
     scheduledFor: str
     priorityScore: int
     countdown: int
+
+
+class QueueListResponse(BaseModel):
+    items: List[QueueItemModel]
+    dailyCapExhausted: bool = False
+    nextResetAt: str = ""
 
 
 class QueueItemUpdateModel(BaseModel):
@@ -5368,7 +5735,7 @@ class LogEntryModel(BaseModel):
     id: str
     timestamp: str
     profile: str
-    status: Literal["success", "retry", "error", "info"]
+    status: Literal["success", "retry", "error", "info", "warning"]
     module: str = "system"
     action: str = "event"
     message: str
@@ -5888,13 +6255,664 @@ def release_browser_lock(profile_id: str):
         db.execute('DELETE FROM browser_locks WHERE profile_id = ?', (profile_id,))
         db.commit()
 
+# Build marker so we can verify deployed backend (e.g. after timing-fix deploy).
+ENGAGEFLOW_BUILD_VERSION = os.environ.get("ENGAGEFLOW_BUILD_VERSION", "timing-fix-2026-03")
+
+
+@app.get("/health/live")
+async def health_live():
+    """Liveness probe — always 200 if the process is up. No dependency on scheduler."""
+    return JSONResponse({"status": "ok"})
+
+
+@app.get("/api/version")
+async def api_version():
+    """Return build version so deploy can be verified (e.g. curl after Coolify redeploy)."""
+    return JSONResponse({"build": ENGAGEFLOW_BUILD_VERSION, "backend": "skoolindy"})
+
+
+# ---------- n8n comment automation API (Skoollindy orchestration) ----------
+
+def _build_n8n_runtime_config(db: sqlite3.Connection) -> Dict[str, Any]:
+    """Build normalized config for n8n from DB. Read-only."""
+    settings = _load_or_create_automation_settings(db)
+    s = settings.model_dump()
+    profiles_rows = db.execute(
+        "SELECT id, name, status, dailyUsage FROM profiles ORDER BY name"
+    ).fetchall()
+    enabled_profiles = [
+        {
+            "id": str(r["id"] or ""),
+            "name": str(r["name"] or ""),
+            "status": str(r["status"] or ""),
+            "dailyUsage": int(r["dailyUsage"] or 0),
+        }
+        for r in profiles_rows
+        if str(r["status"] or "").lower() in ("ready", "running", "idle")
+    ]
+    communities_rows = db.execute(
+        "SELECT id, profileId, name, url, dailyLimit, maxPostAgeDays, status, actionsToday FROM communities ORDER BY name"
+    ).fetchall()
+    communities_by_profile: Dict[str, List[Dict[str, Any]]] = {}
+    for r in communities_rows:
+        pid = str(r["profileId"] or "")
+        communities_by_profile.setdefault(pid, []).append({
+            "id": str(r["id"] or ""),
+            "profileId": pid,
+            "name": str(r["name"] or ""),
+            "url": str(r["url"] or ""),
+            "dailyLimit": int(r["dailyLimit"] or 0),
+            "maxPostAgeDays": int(r["maxPostAgeDays"] or 0),
+            "status": str(r["status"] or ""),
+            "actionsToday": int(r["actionsToday"] or 0),
+        })
+    rules_rows = db.execute(
+        "SELECT id, keyword, persona, promptPreview, commentPrompt, active, assignedProfileIds FROM keyword_rules ORDER BY keyword"
+    ).fetchall()
+    keyword_rules = [
+        {
+            "id": str(r["id"] or ""),
+            "keyword": str(r["keyword"] or ""),
+            "persona": str(r["persona"] or ""),
+            "promptPreview": str(r["promptPreview"] or ""),
+            "commentPrompt": str(r["commentPrompt"] or ""),
+            "active": bool(int(r["active"] or 0)),
+            "assignedProfileIds": json.loads(r["assignedProfileIds"] or "[]") if isinstance(r["assignedProfileIds"], str) else (r["assignedProfileIds"] or []),
+        }
+        for r in rules_rows
+    ]
+    return {
+        "masterEnabled": s.get("masterEnabled", False),
+        "activeDays": s.get("activeDays", []),
+        "runFrom": s.get("runFrom", "09:00"),
+        "runTo": s.get("runTo", "18:00"),
+        "delayMin": s.get("delayMin", 30),
+        "delayMax": s.get("delayMax", 90),
+        "roundsBeforeConnectionRest": s.get("roundsBeforeConnectionRest", 5),
+        "connectionRestMinutes": s.get("connectionRestMinutes", 5),
+        "commentFallbackEnabled": s.get("commentFallbackEnabled", True),
+        "commentFallbackPrompt": s.get("commentFallbackPrompt", ""),
+        "blacklistTerms": list(s.get("blacklistTerms", []) or []),
+        "enabledProfiles": enabled_profiles,
+        "communitiesByProfile": communities_by_profile,
+        "keywordRules": keyword_rules,
+    }
+
+
+class N8nScanCommunityRequest(BaseModel):
+    profile_id: str
+    community_id: str
+    max_posts: Optional[int] = 20
+
+
+class N8nQueueCommentRequest(BaseModel):
+    profile_id: str
+    community_id: str
+    post_id: Optional[str] = None
+    post_url: str
+    keyword: str
+    keyword_rule_id: Optional[str] = None
+    prompt_used: Optional[str] = None
+    generated_comment: str
+    scheduled_for: str
+    priority_score: Optional[int] = None
+    fallback_level_used: Literal["keyword_rule", "general_comment_fallback"] = "keyword_rule"
+
+
+class N8nExecuteCommentRequest(BaseModel):
+    queue_item_id: str
+
+
+@app.get("/api/n8n/runtime-config")
+def n8n_runtime_config():
+    """Return normalized config for n8n comment automation. Read-only."""
+    with get_db() as db:
+        data = _build_n8n_runtime_config(db)
+    return JSONResponse(data)
+
+
+@app.post("/api/n8n/scan-community")
+async def n8n_scan_community(payload: N8nScanCommunityRequest, request: Request):
+    """Scan a community for eligible posts. No queue writes, no AI, no posting."""
+    with get_db() as db:
+        _insert_backend_log(
+            db, "SYSTEM", "info",
+            f"n8n scan-community profile={payload.profile_id} community={payload.community_id}",
+            module="automation", action="n8n_scan",
+        )
+        db.commit()
+    engine = get_automation_engine(request)
+    max_posts = max(1, min(50, int(payload.max_posts or 20)))
+    result = await asyncio.to_thread(
+        engine.run_scan_community_sync,
+        payload.profile_id,
+        payload.community_id,
+        max_posts,
+    )
+    with get_db() as db:
+        _insert_backend_log(
+            db, "SYSTEM", "success" if not result.get("error") else "error",
+            f"n8n scan-community done posts={len(result.get('posts') or [])} error={result.get('error') or 'none'}",
+            module="automation", action="n8n_scan",
+        )
+        db.commit()
+    return JSONResponse(result)
+
+
+@app.post("/api/n8n/queue-comment")
+def n8n_queue_comment(payload: N8nQueueCommentRequest):
+    """Upsert a queue item with generated comment. DB source of truth."""
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    now_display = now_display_time()
+    with get_db() as db:
+        try:
+            if payload.scheduled_for and payload.scheduled_for.strip().lower() not in ("auto", ""):
+                scheduled_dt = _parse_queue_scheduled_for(payload.scheduled_for)
+            else:
+                raise ValueError("auto-schedule")
+        except Exception:
+            # Auto-compute: find last scheduledFor for this profile, stagger from there
+            import random as _rng2
+            settings_row = _load_or_create_automation_settings(db)
+            _s = settings_row.model_dump()
+            _delay_min = max(1, int(_s.get("delayMin", 3)))
+            _delay_max = max(_delay_min, int(_s.get("delayMax", 10)))
+            last_row = db.execute(
+                "SELECT scheduledFor FROM queue_items WHERE profileId = ? ORDER BY scheduledFor DESC LIMIT 1",
+                (payload.profile_id,),
+            ).fetchone()
+            base_dt = datetime.now()
+            if last_row and last_row["scheduledFor"]:
+                try:
+                    last_dt = _parse_queue_scheduled_for(str(last_row["scheduledFor"]))
+                    if last_dt > base_dt:
+                        base_dt = last_dt
+                except Exception:
+                    pass
+            scheduled_dt = base_dt + timedelta(seconds=_rng2.randint(_delay_min, _delay_max))
+        scheduled_for = scheduled_dt.isoformat(timespec="seconds")
+        scheduled_time = _format_queue_display_time(scheduled_dt)
+        delta_seconds = max(0, int((scheduled_dt - datetime.now()).total_seconds()))
+        countdown = delta_seconds
+        priority = payload.priority_score if payload.priority_score is not None else max(1, (delta_seconds // 60) * -1 + 100)
+        profile_row = db.execute("SELECT id, name FROM profiles WHERE id = ?", (payload.profile_id,)).fetchone()
+        community_row = db.execute("SELECT id, name FROM communities WHERE id = ?", (payload.community_id,)).fetchone()
+        profile_name = str(profile_row["name"] or payload.profile_id) if profile_row else payload.profile_id
+        community_name = str(community_row["name"] or payload.community_id) if community_row else payload.community_id
+        qi_cols = {str(r["name"]) for r in db.execute("PRAGMA table_info(queue_items)").fetchall()}
+        has_extra = "generatedComment" in qi_cols and "status" in qi_cols
+        existing = db.execute(
+            "SELECT id FROM queue_items WHERE profileId = ? AND postId = ?",
+            (payload.profile_id, payload.post_url),
+        ).fetchone()
+        if existing:
+            item_id = str(existing["id"] or "")
+            if has_extra:
+                db.execute(
+                    """
+                    UPDATE queue_items SET
+                    profile = ?, community = ?, communityId = ?, keyword = ?, keywordId = ?,
+                    scheduledTime = ?, scheduledFor = ?, priorityScore = ?, countdown = ?,
+                    generatedComment = ?, status = ?, fallbackLevelUsed = ?, updatedAt = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        profile_name, community_name, payload.community_id, payload.keyword, (payload.keyword_rule_id or ""),
+                        scheduled_time, scheduled_for, priority, countdown,
+                        payload.generated_comment, "pending", payload.fallback_level_used, now_iso, item_id,
+                    ),
+                )
+            else:
+                db.execute(
+                    """
+                    UPDATE queue_items SET
+                    profile = ?, community = ?, communityId = ?, keyword = ?, keywordId = ?,
+                    scheduledTime = ?, scheduledFor = ?, priorityScore = ?, countdown = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        profile_name, community_name, payload.community_id, payload.keyword, (payload.keyword_rule_id or ""),
+                        scheduled_time, scheduled_for, priority, countdown, item_id,
+                    ),
+                )
+        else:
+            item_id = str(uuid.uuid4())
+            if has_extra:
+                db.execute(
+                    """
+                    INSERT INTO queue_items
+                    (id, profile, profileId, community, communityId, postId, keyword, keywordId, scheduledTime, scheduledFor, priorityScore, countdown, generatedComment, status, fallbackLevelUsed, createdAt, updatedAt)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        item_id, profile_name, payload.profile_id, community_name, payload.community_id,
+                        payload.post_url, payload.keyword, (payload.keyword_rule_id or ""),
+                        scheduled_time, scheduled_for, priority, countdown,
+                        payload.generated_comment, "pending", payload.fallback_level_used, now_iso, now_iso,
+                    ),
+                )
+            else:
+                db.execute(
+                    """
+                    INSERT INTO queue_items
+                    (id, profile, profileId, community, communityId, postId, keyword, keywordId, scheduledTime, scheduledFor, priorityScore, countdown)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        item_id, profile_name, payload.profile_id, community_name, payload.community_id,
+                        payload.post_url, payload.keyword, (payload.keyword_rule_id or ""),
+                        scheduled_time, scheduled_for, priority, countdown,
+                    ),
+                )
+        db.commit()
+        _insert_backend_log(
+            db, profile_name, "success",
+            f"n8n queue-comment item={item_id} post={payload.post_url[:60]}",
+            module="automation", action="n8n_queue",
+        )
+        db.commit()
+    return JSONResponse({"success": True, "queue_item_id": item_id})
+
+
+@app.post("/api/n8n/execute-comment")
+async def n8n_execute_comment(payload: N8nExecuteCommentRequest, request: Request):
+    """Execute a single queue item: post the stored comment via Playwright."""
+    with get_db() as db:
+        _insert_backend_log(
+            db, "SYSTEM", "info",
+            f"n8n execute-comment item={payload.queue_item_id}",
+            module="automation", action="n8n_execute",
+        )
+        db.commit()
+    engine = get_automation_engine(request)
+    result = await asyncio.to_thread(engine.run_execute_comment_sync, payload.queue_item_id)
+    with get_db() as db:
+        _insert_backend_log(
+            db, "SYSTEM", "success" if result.get("success") else "error",
+            f"n8n execute-comment item={payload.queue_item_id} success={result.get('success')} error={result.get('error') or 'none'}",
+            module="automation", action="n8n_execute",
+        )
+        db.commit()
+    return JSONResponse(result)
+
+@app.post("/api/n8n/execute-due")
+async def n8n_execute_due(request: Request):
+    """Execute ALL queue items where scheduledFor <= now. Called by n8n cron."""
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    with get_db() as db:
+        settings = _load_or_create_automation_settings(db)
+        s = settings.model_dump()
+        if s.get("orchestrationMode") != "n8n":
+            return JSONResponse({"success": False, "error": "not_n8n_mode"}, status_code=400)
+        if not s.get("masterEnabled"):
+            return JSONResponse({"success": False, "error": "master_disabled"}, status_code=400)
+
+        # Fetch all due items ordered by scheduledFor
+        due_rows = db.execute(
+            "SELECT id, profileId, scheduledFor FROM queue_items WHERE scheduledFor <= ? ORDER BY scheduledFor ASC",
+            (now_iso,),
+        ).fetchall()
+        _insert_backend_log(
+            db, "SYSTEM", "info",
+            f"n8n execute-due: {len(due_rows)} items due at {now_iso}",
+            module="automation", action="n8n_execute_due",
+        )
+        db.commit()
+
+    if not due_rows:
+        return JSONResponse({"success": True, "executed": 0, "failed": 0, "skipped": 0, "items": []})
+
+    engine = get_automation_engine(request)
+    global_daily_cap = max(1, int(s.get("globalDailyCapPerAccount", 5)))
+    results = {"executed": 0, "failed": 0, "skipped": 0, "items": []}
+
+    for row in due_rows:
+        item_id = str(row["id"])
+        profile_id = str(row["profileId"])
+
+        # Re-check daily cap before each execution
+        with get_db() as db2:
+            profile_row = db2.execute("SELECT dailyUsage FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+            if profile_row and int(profile_row["dailyUsage"] or 0) >= global_daily_cap:
+                results["skipped"] += 1
+                results["items"].append({"id": item_id, "status": "skipped", "reason": "daily_cap"})
+                # Remove capped item from queue to avoid perpetual retry
+                db2.execute("DELETE FROM queue_items WHERE id = ?", (item_id,))
+                db2.commit()
+                continue
+
+        try:
+            result = await asyncio.to_thread(engine.run_execute_comment_sync, item_id)
+            if result.get("success"):
+                results["executed"] += 1
+                results["items"].append({"id": item_id, "status": "success"})
+            else:
+                results["failed"] += 1
+                error = result.get("error", "unknown")
+                results["items"].append({"id": item_id, "status": "failed", "error": error})
+                # Remove failed items that can't succeed on retry (missing data, invalid URL, etc.)
+                permanent_errors = ("queue_item_not_found", "generated_comment_missing",
+                                     "missing_profile_or_post", "invalid_post_url", "profile_not_found", "daily_cap_reached", "login_required")
+                if error in permanent_errors:
+                    with get_db() as db3:
+                        db3.execute("DELETE FROM queue_items WHERE id = ?", (item_id,))
+                        db3.commit()
+        except Exception as e:
+            results["failed"] += 1
+            results["items"].append({"id": item_id, "status": "error", "error": str(e)[:200]})
+
+    with get_db() as db:
+        _insert_backend_log(
+            db, "SYSTEM", "success",
+            f"n8n execute-due complete: executed={results['executed']} failed={results['failed']} skipped={results['skipped']}",
+            module="automation", action="n8n_execute_due",
+        )
+        db.commit()
+
+    return JSONResponse({"success": True, **results})
+
+
+@app.post("/api/n8n/reset-daily")
+async def n8n_reset_daily(request: Request):
+    """Reset daily counters. Idempotent (same day no-op after first run)."""
+    with get_db() as db:
+        _insert_backend_log(db, "SYSTEM", "info", "n8n reset-daily requested", module="automation", action="n8n_reset")
+        db.commit()
+    engine = get_automation_engine(request)
+    await asyncio.to_thread(engine._reset_daily_counters_if_needed)
+    with get_db() as db:
+        _insert_backend_log(db, "SYSTEM", "success", "n8n reset-daily completed", module="automation", action="n8n_reset")
+        db.commit()
+    return JSONResponse({"success": True})
+
+
+
+
+@app.get("/automation/n8n-timing")
+def automation_n8n_timing():
+    """Return last scan/execute/queue timestamps and executor state for n8n mode dashboard."""
+    with get_db() as db:
+        settings = _load_or_create_automation_settings(db)
+        s = settings.model_dump()
+        master_enabled = bool(s.get("masterEnabled"))
+        is_n8n = s.get("orchestrationMode") == "n8n"
+
+        def _latest_iso(pattern: str) -> Optional[str]:
+            """Return full ISO timestamp from logs, not time-only."""
+            row = db.execute(
+                "SELECT id, timestamp FROM logs WHERE message LIKE ? ORDER BY rowid DESC LIMIT 1",
+                (pattern,),
+            ).fetchone()
+            if not row:
+                return None
+            ts = str(row["timestamp"]).strip()
+            # If time-only (HH:MM:SS), try to find createdAt from the row or use rowid-based estimation
+            if len(ts) <= 8 and ":" in ts:
+                # Search for the same row by id to see if there's a date context
+                # Since logs only store time, we reconstruct from the rowid ordering
+                # Best effort: check if the log's time is after current time (meaning it was yesterday)
+                from datetime import datetime, timedelta
+                now = datetime.now()
+                try:
+                    parts = ts.split(":")
+                    log_time = now.replace(hour=int(parts[0]), minute=int(parts[1]),
+                                           second=int(parts[2]) if len(parts) > 2 else 0, microsecond=0)
+                    if log_time > now:
+                        # Time is in the future relative to now, so it must be from yesterday
+                        log_time -= timedelta(days=1)
+                    return log_time.astimezone().isoformat(timespec="seconds")
+                except Exception:
+                    return ts
+            # If already full ISO but missing tz, append local tz
+            from datetime import datetime as _dt
+            try:
+                if "T" in ts and "+" not in ts and "Z" not in ts:
+                    return _dt.fromisoformat(ts).astimezone().isoformat(timespec="seconds")
+            except Exception:
+                pass
+            return ts
+
+        last_scan = _latest_iso("%n8n-scan-now complete%") or _latest_iso("%n8n scan-community done%")
+        last_execute = _latest_iso("%execute-comment success%")
+        last_queue_insert = _latest_iso("%n8n queue-comment item=%")
+        queue_count = db.execute("SELECT COUNT(*) as c FROM queue_items WHERE status = 'pending'").fetchone()["c"]
+
+        # Next scheduled item
+        next_item_row = db.execute(
+            "SELECT scheduledFor FROM queue_items WHERE status = 'pending' ORDER BY scheduledFor ASC LIMIT 1"
+        ).fetchone()
+        next_scheduled_for = str(next_item_row["scheduledFor"]) if next_item_row else None
+
+        # Executor cron interval (for "next scan" estimation)
+        executor_interval = _N8N_EXECUTOR_INTERVAL_SECONDS
+
+    return {
+        "lastScanTime": last_scan,
+        "lastExecuteTime": last_execute,
+        "lastQueueInsert": last_queue_insert,
+        "pendingQueueItems": queue_count,
+        "nextScheduledFor": next_scheduled_for,
+        "masterEnabled": master_enabled,
+        "isN8nMode": is_n8n,
+        "executorIntervalSeconds": executor_interval,
+    }
+
+
+@app.post("/automation/n8n-scan-now")
+async def automation_n8n_scan_now(request: Request):
+    """Trigger an immediate scan cycle: scan all enabled profiles/communities, generate + queue comments."""
+    with get_db() as db:
+        settings = _load_or_create_automation_settings(db)
+        s = settings.model_dump()
+        if s.get("orchestrationMode") != "n8n":
+            return JSONResponse({"success": False, "error": "not_n8n_mode"}, status_code=400)
+        if not s.get("masterEnabled"):
+            return JSONResponse({"success": False, "error": "master_disabled"}, status_code=400)
+
+        config = _build_n8n_runtime_config(db)
+        global_daily_cap = max(1, int(s.get("globalDailyCapPerAccount", 5)))
+        fallback_prompt = str(s.get("commentFallbackPrompt", "Write a short helpful comment under 40 words.")).strip()
+        api_key = db.execute("SELECT value FROM automation_settings WHERE key = 'openai_api_key'").fetchone()
+        _insert_backend_log(db, "SYSTEM", "info", "n8n-scan-now triggered manually", module="automation", action="n8n_scan_now")
+        db.commit()
+
+    engine = get_automation_engine(request)
+    openai_key = engine._get_openai_key()
+    results = {"scanned": 0, "posts_found": 0, "queued": 0, "skipped": 0, "errors": []}
+
+    # Scheduling: stagger queue items using delay settings
+    import random as _rng
+    delay_min = max(1, int(config.get("delayMin", 3)))
+    delay_max = max(delay_min, int(config.get("delayMax", 10)))
+    max_per_profile = max(1, int(s.get("queuePrefillMaxPerProfilePerPass", 2)))
+
+    # Track last scheduledFor per profile for staggering
+    last_scheduled_per_profile: dict[str, datetime] = {}
+    with get_db() as db_sched:
+        for profile in config.get("enabledProfiles", []):
+            pid = profile["id"]
+            row = db_sched.execute(
+                "SELECT scheduledFor FROM queue_items WHERE profileId = ? ORDER BY scheduledFor DESC LIMIT 1",
+                (pid,),
+            ).fetchone()
+            if row and row["scheduledFor"]:
+                try:
+                    last_scheduled_per_profile[pid] = _parse_queue_scheduled_for(str(row["scheduledFor"]))
+                except Exception:
+                    pass
+
+    def _next_scheduled_for(pid: str) -> datetime:
+        now = datetime.now()
+        base = last_scheduled_per_profile.get(pid, now)
+        if base < now:
+            base = now
+        delay = _rng.randint(delay_min, delay_max)
+        scheduled = base + timedelta(seconds=delay)
+        last_scheduled_per_profile[pid] = scheduled
+        return scheduled
+
+    queued_per_profile: dict[str, int] = {}
+
+    # Load last community rotation index per profile from DB
+    profile_rotation: dict[str, int] = {}
+    with get_db() as db_rot:
+        for profile in config.get("enabledProfiles", []):
+            pid = profile["id"]
+            rot_row = db_rot.execute("SELECT lastCommunityIndex FROM profiles WHERE id = ?", (pid,)).fetchone()
+            profile_rotation[pid] = int(rot_row["lastCommunityIndex"] or 0) if rot_row else 0
+
+    for profile in config.get("enabledProfiles", []):
+        pid = profile["id"]
+        daily_usage = int(profile.get("dailyUsage", 0))
+        if daily_usage >= global_daily_cap:
+            continue
+        queued_per_profile[pid] = 0
+
+        all_communities = config.get("communitiesByProfile", {}).get(pid, [])
+        active_communities = [c for c in all_communities if str(c.get("status", "")).lower() == "active"]
+        if not active_communities:
+            continue
+
+        # Round-robin: start from lastCommunityIndex + 1
+        start_idx = (profile_rotation.get(pid, 0) + 1) % len(active_communities)
+        last_queued_idx = profile_rotation.get(pid, 0)
+
+        for offset in range(len(active_communities)):
+            idx = (start_idx + offset) % len(active_communities)
+            comm = active_communities[idx]
+
+            if queued_per_profile.get(pid, 0) >= max_per_profile:
+                break
+
+            cid = comm["id"]
+            results["scanned"] += 1
+            try:
+                scan_result = await asyncio.to_thread(engine.run_scan_community_sync, pid, cid, 10)
+            except Exception as e:
+                results["errors"].append(f"{comm.get('name','?')}: {str(e)[:100]}")
+                continue
+
+            if scan_result.get("error"):
+                results["errors"].append(f"{comm.get('name','?')}: {scan_result['error']}")
+                continue
+
+            for post in scan_result.get("posts", []):
+                results["posts_found"] += 1
+                if post.get("already_commented") or post.get("blacklisted_match"):
+                    results["skipped"] += 1
+                    continue
+
+                post_url = str(post.get("post_url", "")).strip()
+                post_text = str(post.get("post_text", "")).strip()
+                if not post_url or not post_text:
+                    results["skipped"] += 1
+                    continue
+
+                # Respect max per profile per pass
+                if queued_per_profile.get(pid, 0) >= max_per_profile:
+                    results["skipped"] += 1
+                    continue
+
+                # Re-check cap after each queue
+                with get_db() as db2:
+                    usage_row = db2.execute("SELECT dailyUsage FROM profiles WHERE id = ?", (pid,)).fetchone()
+                    if usage_row and int(usage_row["dailyUsage"] or 0) >= global_daily_cap:
+                        break
+
+                # Generate comment via AI
+                kw_rules = config.get("keywordRules", [])
+                matched_kw = "general"
+                prompt_used = fallback_prompt
+                for rule in kw_rules:
+                    if rule.get("keyword", "").lower() in post_text.lower():
+                        matched_kw = rule["keyword"]
+                        prompt_used = rule.get("commentPrompt") or rule.get("promptPreview") or fallback_prompt
+                        break
+
+                try:
+                    from automation.engine import _openai_generate_comment_rest
+                    generated = _openai_generate_comment_rest(openai_key, prompt_used, post_text[:4000])
+                except Exception as e:
+                    results["errors"].append(f"AI generation failed: {str(e)[:100]}")
+                    continue
+
+                if not generated.strip():
+                    results["skipped"] += 1
+                    continue
+
+                # Queue with staggered scheduledFor
+                scheduled = _next_scheduled_for(pid)
+                payload = N8nQueueCommentRequest(
+                    profile_id=pid,
+                    community_id=cid,
+                    post_url=post_url,
+                    keyword=matched_kw,
+                    generated_comment=generated.strip(),
+                    scheduled_for=scheduled.isoformat(timespec="seconds"),
+                    fallback_level_used="keyword_rule" if matched_kw != "general" else "general_comment_fallback",
+                )
+                try:
+                    n8n_queue_comment(payload)
+                    results["queued"] += 1
+                    queued_per_profile[pid] = queued_per_profile.get(pid, 0) + 1
+                    last_queued_idx = idx
+                    break  # 1 post per community, then rotate to next community
+                except Exception as e:
+                    results["errors"].append(f"Queue failed: {str(e)[:100]}")
+
+        # Persist rotation pointer for this profile
+        with get_db() as db_rot2:
+            db_rot2.execute("UPDATE profiles SET lastCommunityIndex = ? WHERE id = ?", (last_queued_idx, pid))
+            db_rot2.commit()
+
+        # After scanning communities for this profile, move to next
+        if results["queued"] >= global_daily_cap * len(config.get("enabledProfiles", [1])):
+            break
+
+    with get_db() as db:
+        _insert_backend_log(
+            db, "SYSTEM", "success",
+            f"n8n-scan-now complete: scanned={results['scanned']} found={results['posts_found']} queued={results['queued']} skipped={results['skipped']}",
+            module="automation", action="n8n_scan_now",
+        )
+        db.commit()
+
+    return JSONResponse({"success": True, **results})
+
+
+@app.get("/api/n8n/health")
+def n8n_health():
+    """Health for n8n: master enabled, orchestration mode, queue count, enabled profiles, timestamp."""
+    with get_db() as db:
+        settings = _load_or_create_automation_settings(db)
+        s = settings.model_dump()
+        master_enabled = s.get("masterEnabled", False)
+        orchestration_mode = s.get("orchestrationMode", "internal")
+        queue_row = db.execute("SELECT COUNT(*) AS cnt FROM queue_items").fetchone()
+        queue_count = int(queue_row["cnt"] or 0) if queue_row else 0
+        profiles_row = db.execute(
+            "SELECT COUNT(*) AS cnt FROM profiles WHERE status IN ('ready','running','idle')"
+        ).fetchone()
+        enabled_profiles = int(profiles_row["cnt"] or 0) if profiles_row else 0
+    return JSONResponse({
+        "masterEnabled": master_enabled,
+        "orchestrationMode": orchestration_mode,
+        "schedulerDrivesComments": orchestration_mode == "internal",
+        "queueCount": queue_count,
+        "enabledProfilesCount": enabled_profiles,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    })
+
+
 @app.get("/health")
 async def health_check(request: Request):
     engine: AutomationEngine = get_automation_engine(request)
     status = await engine.get_status()
     if not status.get("isRunning"):
         return JSONResponse({"status": "ok", "running": False})
-    hb_path = engine.heartbeat_file
+    hb_path = getattr(engine, "heartbeat_file", None)
+    if hb_path is None:
+        return JSONResponse({"status": "ok", "running": True})
     try:
         data = json.loads(hb_path.read_text(encoding="utf-8"))
         age = time.time() - float(data.get("ts", 0))
@@ -6735,7 +7753,7 @@ def queue_preview(limit: int = 50, days: int = 2):
     return items
 
 
-@app.get("/queue", response_model=List[QueueItemModel])
+@app.get("/queue", response_model=QueueListResponse)
 def read_queue(profile_id: Optional[str] = None):
     query = "SELECT * FROM queue_items"
     params: List[Any] = []
@@ -6744,6 +7762,49 @@ def read_queue(profile_id: Optional[str] = None):
         params.append(profile_id)
     with get_db() as db:
         rows = db.execute(query + " ORDER BY julianday(scheduledFor) ASC, id ASC", params).fetchall()
+        # Compute dailyCapExhausted: every enabled community for every enabled
+        # profile has actionsToday >= dailyLimit AND queue has no real items.
+        daily_cap_exhausted = False
+        next_reset_at = ""
+        if not rows:
+            try:
+                settings_row = db.execute(
+                    "SELECT value FROM automation_settings WHERE key = 'default'"
+                ).fetchone()
+                _settings: Dict[str, Any] = {}
+                if settings_row:
+                    import json as _json
+                    _settings = _json.loads(settings_row["value"])
+                global_cap = max(1, int(_settings.get("globalDailyCapPerAccount", 5)))
+                enabled_profiles = db.execute(
+                    "SELECT id, dailyUsage FROM profiles WHERE status IN ('ready', 'running', 'idle')"
+                ).fetchall()
+                active_comms = db.execute(
+                    "SELECT profileId, dailyLimit, actionsToday FROM communities WHERE status = 'active'"
+                ).fetchall()
+                if enabled_profiles and active_comms:
+                    # Check profile caps
+                    all_profiles_capped = all(
+                        int(p["dailyUsage"] or 0) >= global_cap for p in enabled_profiles
+                    )
+                    # Check community caps (only communities with a dailyLimit > 0)
+                    comms_with_limit = [c for c in active_comms if int(c["dailyLimit"] or 0) > 0]
+                    all_comms_capped = (
+                        len(comms_with_limit) > 0
+                        and all(
+                            int(c["actionsToday"] or 0) >= int(c["dailyLimit"] or 0)
+                            for c in comms_with_limit
+                        )
+                    )
+                    daily_cap_exhausted = all_profiles_capped or all_comms_capped
+                if daily_cap_exhausted:
+                    now = datetime.now()
+                    midnight = (now + timedelta(days=1)).replace(
+                        hour=0, minute=0, second=5, microsecond=0
+                    )
+                    next_reset_at = midnight.isoformat(timespec="seconds")
+            except Exception:
+                pass
     ordered_rows = [dict(row) for row in rows]
     # Dashboard readability: interleave queue by profile while preserving
     # per-profile scheduled order to reflect round-robin intent.
@@ -6766,7 +7827,12 @@ def read_queue(profile_id: Optional[str] = None):
             took_any = True
         if not took_any:
             break
-    return [QueueItemModel(**_queue_row_to_api_payload(row)) for row in interleaved]
+    items = [QueueItemModel(**_queue_row_to_api_payload(row)) for row in interleaved]
+    return QueueListResponse(
+        items=items,
+        dailyCapExhausted=daily_cap_exhausted,
+        nextResetAt=next_reset_at,
+    )
 
 
 @app.put("/queue/{item_id}", response_model=QueueItemModel)
@@ -7463,6 +8529,154 @@ def automation_set_openai_key(payload: OpenAIKeyUpdateRequest, request: Request)
         json.dump(current_data, f, ensure_ascii=False, indent=2)
 
     return {"success": True, "isConfigured": True}
+
+
+# ---------------------------------------------------------------------------
+# Admin Dashboard Endpoints (FIX 3)
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/summary")
+async def admin_summary(request: Request):
+    engine: AutomationEngine = get_automation_engine(request)
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    # Profiles
+    profiles_out = []
+    with get_db() as db:
+        profile_rows = db.execute("SELECT id, name, email, status, dailyUsage FROM profiles").fetchall()
+        settings_row = db.execute("SELECT value FROM automation_settings WHERE key = 'default'").fetchone()
+        if settings_row:
+            try:
+                settings_data = json.loads(settings_row["value"])
+            except (TypeError, ValueError, KeyError):
+                settings_data = {}
+        else:
+            settings_data = {}
+        global_cap = int(settings_data.get("globalDailyCapPerAccount", 10) or 10)
+
+        for pr in profile_rows:
+            pid = str(pr["id"] or "")
+            # Count failures today from logs
+            fail_count = db.execute(
+                "SELECT COUNT(*) as cnt FROM logs WHERE profile = ? AND status = 'error' AND timestamp >= ?",
+                (str(pr["name"] or pr["email"] or pid), today_str),
+            ).fetchone()
+            # Last action
+            last_action = db.execute(
+                "SELECT timestamp FROM logs WHERE profile = ? AND status = 'success' ORDER BY rowid DESC LIMIT 1",
+                (str(pr["name"] or pr["email"] or pid),),
+            ).fetchone()
+            profiles_out.append({
+                "email": str(pr["email"] or pr["name"] or pid),
+                "actionsToday": int(pr["dailyUsage"] or 0),
+                "dailyCap": global_cap,
+                "status": str(pr["status"] or "unknown"),
+                "lastActionAt": str(last_action["timestamp"]) if last_action else None,
+                "failuresToday": int(fail_count["cnt"]) if fail_count else 0,
+            })
+
+        # Communities
+        community_rows = db.execute("SELECT id, profileId, name, dailyLimit, actionsToday, status FROM communities").fetchall()
+    communities_out = []
+    editor_failures = engine.get_community_editor_failures()
+    for cr in community_rows:
+        cid = str(cr["id"] or "")
+        pid = str(cr["profileId"] or "")
+        key = f"{pid}:{cid}"
+        fail_count = editor_failures.get(key, 0)
+        is_skipped = engine._is_community_skipped_today(pid, cid)
+        # Find profile email for display
+        profile_email = pid
+        for po in profiles_out:
+            if po["email"] and pid:
+                profile_email = po["email"]
+                break
+        communities_out.append({
+            "name": str(cr["name"] or cid),
+            "profile": profile_email,
+            "actionsToday": int(cr["actionsToday"] or 0),
+            "dailyCap": int(cr["dailyLimit"] or 2),
+            "editorFailures": fail_count,
+            "skippedToday": is_skipped,
+            "lastFailureReason": "editor_not_visible" if fail_count > 0 else None,
+        })
+
+    # Queue stats
+    with get_db() as db:
+        pending = db.execute("SELECT COUNT(*) as cnt FROM queue_items WHERE scheduledFor > ?", (now_iso,)).fetchone()
+        retrying = db.execute(
+            "SELECT COUNT(*) as cnt FROM queue_items"
+        ).fetchone()
+        total_queue = int(retrying["cnt"]) if retrying else 0
+        pending_count = int(pending["cnt"]) if pending else 0
+        failed_today = db.execute(
+            "SELECT COUNT(*) as cnt FROM logs WHERE status = 'error' AND timestamp >= ?",
+            (today_str,),
+        ).fetchone()
+
+    skipped_posts = engine._get_skipped_posts()
+    skipped_posts_out = []
+    for sp in skipped_posts:
+        skipped_posts_out.append({
+            "url": sp.get("post_url", ""),
+            "profile": sp.get("profile_id", ""),
+            "reason": sp.get("reason", ""),
+            "skippedAt": sp.get("skipped_at", ""),
+        })
+
+    return {
+        "profiles": profiles_out,
+        "communities": communities_out,
+        "queue": {
+            "pending": pending_count,
+            "retrying": total_queue - pending_count,
+            "skipped": len(skipped_posts),
+            "failedToday": int(failed_today["cnt"]) if failed_today else 0,
+        },
+        "skippedPosts": skipped_posts_out,
+    }
+
+
+@app.post("/admin/reset-community-failures")
+async def admin_reset_community_failures(request: Request):
+    engine: AutomationEngine = get_automation_engine(request)
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    community_id = body.get("communityId") if body else None
+    engine.reset_community_editor_failures(community_id)
+    return {"success": True}
+
+
+@app.post("/admin/unskip-post")
+async def admin_unskip_post(request: Request):
+    engine: AutomationEngine = get_automation_engine(request)
+    body = await request.json()
+    post_url = body.get("postUrl", "")
+    if post_url:
+        engine._remove_skipped_post(post_url)
+    return {"success": True}
+
+
+@app.post("/admin/clear-skipped-posts")
+async def admin_clear_skipped_posts(request: Request):
+    engine: AutomationEngine = get_automation_engine(request)
+    engine._clear_all_skipped_posts()
+    return {"success": True}
+
+
+@app.post("/admin/reset-daily-counts")
+async def admin_reset_daily_counts(request: Request):
+    with get_db() as db:
+        db.execute("UPDATE profiles SET dailyUsage = 0")
+        db.execute("UPDATE communities SET actionsToday = 0, matchesToday = 0")
+        db.commit()
+    engine: AutomationEngine = get_automation_engine(request)
+    engine.reset_community_editor_failures()
+    return {"success": True}
 
 
 ensure_tables()

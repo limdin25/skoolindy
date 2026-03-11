@@ -3,8 +3,12 @@ import { useCommunities, useProfiles } from "@/hooks/useEngageFlow";
 import { api } from "@/lib/api";
 import type { CommunityFetchStatus } from "@/lib/api";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Plus, Globe, X, RefreshCw, LogIn, Pause, Play, Upload } from "lucide-react";
+import { Plus, Globe, X, RefreshCw, LogIn } from "lucide-react";
 import { toast } from "sonner";
+import { AccountsTab } from "@/components/joiner/AccountsTab";
+import { QueueTab } from "@/components/joiner/QueueTab";
+import { SurveyTab } from "@/components/joiner/SurveyTab";
+import { LogsTab } from "@/components/joiner/LogsTab";
 
 export default function CommunitiesPage() {
   const communitiesQuery = useCommunities();
@@ -24,18 +28,6 @@ export default function CommunitiesPage() {
   const lastCompletionRefreshKeyRef = useRef("");
   const [viewProfile, setViewProfile] = useState("");
   const [loginInProgress, setLoginInProgress] = useState<string | null>(null);
-
-  // Join tab mock state
-  const [joinUrls, setJoinUrls] = useState("");
-  const [joinProfileIds, setJoinProfileIds] = useState<string[]>([]);
-  const [joinAllProfiles, setJoinAllProfiles] = useState(false);
-  const [mockJob, setMockJob] = useState<{
-    id: string;
-    completed: number;
-    total: number;
-    rows: { profile: string; url: string; status: string; attempts: number; reason: string }[];
-    paused: boolean;
-  } | null>(null);
 
   useEffect(() => {
     if (!newProfile && profiles.length > 0) {
@@ -234,44 +226,6 @@ export default function CommunitiesPage() {
     await communitiesQuery.refetch();
   };
 
-  // Join tab mock handlers
-  const handleCreateJoinJob = () => {
-    const urls = joinUrls
-      .split("\n")
-      .map((u) => u.trim())
-      .filter(Boolean);
-    if (urls.length === 0) {
-      toast.error("Add at least one URL");
-      return;
-    }
-    const profileIds = joinAllProfiles ? profiles.map((p) => p.id) : joinProfileIds;
-    if (profileIds.length === 0) {
-      toast.error("Select at least one profile");
-      return;
-    }
-    const rows: { profile: string; url: string; status: string; attempts: number; reason: string }[] = [];
-    for (const p of profiles.filter((pr) => profileIds.includes(pr.id))) {
-      for (const url of urls) {
-        rows.push({ profile: p.name, url, status: "pending", attempts: 0, reason: "" });
-      }
-    }
-    setMockJob({
-      id: "mock-" + Date.now(),
-      completed: 0,
-      total: rows.length,
-      rows,
-      paused: false,
-    });
-    toast.info("Join job created (mock)");
-  };
-
-  const handlePauseJob = () => mockJob && setMockJob({ ...mockJob, paused: true });
-  const handleResumeJob = () => mockJob && setMockJob({ ...mockJob, paused: false });
-  const handleCancelJob = () => {
-    setMockJob(null);
-    toast.info("Job cancelled (mock)");
-  };
-
   const fetching = !!fetchStatus?.running;
   const fetchProgressText = fetching
     ? `(${fetchStatus?.profilesDone ?? 0}/${fetchStatus?.profilesTotal ?? 0}) ${fetchStatus?.currentProfileName ? `- ${fetchStatus.currentProfileName}` : ""}`
@@ -461,131 +415,19 @@ export default function CommunitiesPage() {
           )}
         </TabsContent>
 
-        <TabsContent value="join" className="mt-4">
-          <div className="space-y-6">
-            <div className="bg-card border border-border rounded-xl p-6">
-              <h3 className="text-sm font-semibold text-foreground mb-4">Upload list</h3>
-              <div className="space-y-4">
-                <div>
-                  <label className="text-xs text-muted-foreground mb-1 block">CSV file (optional)</label>
-                  <input
-                    type="file"
-                    accept=".csv"
-                    className="w-full text-sm text-foreground file:mr-2 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-primary file:text-primary-foreground file:text-sm file:font-medium"
-                  />
-                </div>
-                <div>
-                  <label className="text-xs text-muted-foreground mb-1 block">Community URLs (one per line)</label>
-                  <textarea
-                    value={joinUrls}
-                    onChange={e => setJoinUrls(e.target.value)}
-                    placeholder="https://facebook.com/groups/xxx\nhttps://facebook.com/groups/yyy"
-                    rows={5}
-                    className="w-full px-3 py-2 rounded-lg border border-border bg-background text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring placeholder:text-muted-foreground"
-                  />
-                </div>
-                <div>
-                  <label className="text-xs text-muted-foreground mb-1 block">Profiles</label>
-                  <div className="flex items-center gap-3 mb-2">
-                    <label className="flex items-center gap-2 text-sm cursor-pointer">
-                      <input type="checkbox" checked={joinAllProfiles} onChange={e => setJoinAllProfiles(e.target.checked)} className="rounded border-border" />
-                      All profiles
-                    </label>
-                  </div>
-                  {!joinAllProfiles && (
-                    <div className="flex flex-wrap gap-2">
-                      {profiles.map((p) => (
-                        <label key={p.id} className="flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-card text-sm cursor-pointer hover:bg-muted/50">
-                          <input
-                            type="checkbox"
-                            checked={joinProfileIds.includes(p.id)}
-                            onChange={e => {
-                              if (e.target.checked) setJoinProfileIds((prev) => [...prev, p.id]);
-                              else setJoinProfileIds((prev) => prev.filter((id) => id !== p.id));
-                            }}
-                            className="rounded border-border"
-                          />
-                          {p.name}
-                        </label>
-                      ))}
-                    </div>
-                  )}
-                </div>
-                <button
-                  onClick={handleCreateJoinJob}
-                  className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors"
-                >
-                  <Upload className="w-4 h-4" /> Create Join Job
-                </button>
-              </div>
-            </div>
-
-            {mockJob && (
-              <div className="bg-card border border-border rounded-xl p-6">
-                <h3 className="text-sm font-semibold text-foreground mb-4">Active job</h3>
-                <div className="mb-4">
-                  <div className="flex justify-between text-xs text-muted-foreground mb-1">
-                    <span>{mockJob.completed} / {mockJob.total}</span>
-                  </div>
-                  <div className="h-2 w-full rounded-full bg-muted overflow-hidden">
-                    <div
-                      className="h-full bg-primary transition-all"
-                      style={{ width: `${mockJob.total ? (mockJob.completed / mockJob.total) * 100 : 0}%` }}
-                    />
-                  </div>
-                </div>
-                <div className="overflow-x-auto rounded-lg border border-border">
-                  <table className="w-full text-sm">
-                    <thead>
-                      <tr className="border-b border-border bg-muted/30">
-                        <th className="text-left px-3 py-2 font-medium text-foreground">Profile</th>
-                        <th className="text-left px-3 py-2 font-medium text-foreground">Community URL</th>
-                        <th className="text-left px-3 py-2 font-medium text-foreground">Status</th>
-                        <th className="text-left px-3 py-2 font-medium text-foreground">Attempts</th>
-                        <th className="text-left px-3 py-2 font-medium text-foreground">Reason</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {mockJob.rows.slice(0, 10).map((row, i) => (
-                        <tr key={i} className="border-b border-border last:border-0">
-                          <td className="px-3 py-2 text-foreground">{row.profile}</td>
-                          <td className="px-3 py-2 text-muted-foreground truncate max-w-[200px]">{row.url}</td>
-                          <td className="px-3 py-2 text-foreground">{row.status}</td>
-                          <td className="px-3 py-2 text-foreground">{row.attempts}</td>
-                          <td className="px-3 py-2 text-muted-foreground">{row.reason}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                  {mockJob.rows.length > 10 && (
-                    <p className="text-xs text-muted-foreground px-3 py-2 border-t border-border">+{mockJob.rows.length - 10} more rows</p>
-                  )}
-                </div>
-                <div className="flex flex-wrap gap-2 mt-4">
-                  <button
-                    onClick={handlePauseJob}
-                    disabled={mockJob.paused}
-                    className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-card text-sm font-medium text-foreground hover:bg-muted disabled:opacity-50"
-                  >
-                    <Pause className="w-4 h-4" /> Pause
-                  </button>
-                  <button
-                    onClick={handleResumeJob}
-                    disabled={!mockJob.paused}
-                    className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-card text-sm font-medium text-foreground hover:bg-muted disabled:opacity-50"
-                  >
-                    <Play className="w-4 h-4" /> Resume
-                  </button>
-                  <button
-                    onClick={handleCancelJob}
-                    className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-destructive/50 bg-destructive/10 text-destructive text-sm font-medium hover:bg-destructive/20"
-                  >
-                    <X className="w-4 h-4" /> Cancel
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
+                <TabsContent value="join" className="mt-4">
+          <Tabs defaultValue="accounts" className="w-full">
+            <TabsList className="mb-4">
+              <TabsTrigger value="accounts">Accounts</TabsTrigger>
+              <TabsTrigger value="survey">Survey Info</TabsTrigger>
+              <TabsTrigger value="queue">Communities & Queue</TabsTrigger>
+              <TabsTrigger value="logs">Live Logs</TabsTrigger>
+            </TabsList>
+            <TabsContent value="accounts"><AccountsTab /></TabsContent>
+            <TabsContent value="survey"><SurveyTab /></TabsContent>
+            <TabsContent value="queue"><QueueTab /></TabsContent>
+            <TabsContent value="logs"><LogsTab /></TabsContent>
+          </Tabs>
         </TabsContent>
       </Tabs>
     </div>

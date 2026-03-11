@@ -10,6 +10,8 @@ export interface Profile {
   status: "running" | "paused" | "idle" | "checking" | "ready" | "blocked" | "captcha" | "logged_out" | string;
   dailyUsage: number;
   groupsConnected: number;
+  source?: string;
+  connected_at?: string;
 }
 
 export interface Community {
@@ -46,6 +48,8 @@ export interface KeywordRule {
   assignedProfileIds: string[];
 }
 
+export type OrchestrationMode = "internal" | "n8n";
+
 export interface AutomationSettings {
   masterEnabled: boolean;
   globalDailyCapPerAccount: number;
@@ -69,6 +73,7 @@ export interface AutomationSettings {
   queuePrefillMaxPerProfilePerPass: number;
   blacklistEnabled: boolean;
   blacklistTerms: string[];
+  orchestrationMode?: OrchestrationMode;
 }
 
 export interface QueueItem {
@@ -84,6 +89,12 @@ export interface QueueItem {
   scheduledFor: string;
   priorityScore: number;
   countdown: number;
+}
+
+export interface QueueListResponse {
+  items: QueueItem[];
+  dailyCapExhausted: boolean;
+  nextResetAt: string;
 }
 
 export interface QueuePreviewItem extends QueueItem {

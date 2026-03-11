@@ -17,6 +17,7 @@ import AnalyticsPage from "./pages/AnalyticsPage";
 import NotFound from "./pages/NotFound";
 import LockScreen from "./pages/LockScreen";
 import OwnerPage from "./pages/OwnerPage";
+import ConnectPage from "./pages/ConnectPage";
 import { isUnlocked } from "./lib/lockscreen";
 import { BackendProvider } from "./context/BackendContext";
 
@@ -54,6 +55,7 @@ const App = () => (
           <Routes>
             <Route path="/lock" element={<LockScreen />} />
             <Route path="/owner" element={<OwnerPage />} />
+            <Route path="/connect" element={<ConnectPage />} />
             <Route element={<RequireUnlock><AppLayout /></RequireUnlock>}>
               <Route path="/" element={<DashboardPage />} />
               <Route path="/inbox" element={<InboxPage />} />

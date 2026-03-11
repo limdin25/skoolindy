@@ -54,3 +54,35 @@ playwright/.cache/
 *.njsproj
 *.sln
 *.sw?
+
+# Environment files
+backend/.env
+backend/.env.*
+
+# Backup and patch files
+*.bak*
+*.backup*
+*.patch.py
+backend/engageflow.db-shm
+backend/engageflow.db-wal
+engageflow.db
+engageflow-backup-*.tar.gz
+
+# Snapshot archives
+skoollindy-stable-snapshot.tar.gz
+*_stable_backup.db
+
+# Misc
+tatus
+backend/artifacts/
+engageflow-*.py
+frontend/engageflow-*.py
+
+# Joiner debug artifacts
+joiner/backend/debug_screenshots/
+joiner/backend/*.db
+joiner/backend/*.db-shm
+joiner/backend/*.db-wal
+
+# Non-essential docs/meta files
+tatus*

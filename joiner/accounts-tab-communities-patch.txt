@@ -1,0 +1,55 @@
+{fetchingId === p.id && fetchProgress && (
+                                    <p className="text-xs text-muted-foreground">
+                                      {fetchProgress.status}
+                                      {fetchProgress.total > 0 && ` (${fetchProgress.current}/${fetchProgress.total})`}
+                                      {fetchProgress.community && ` — ${fetchProgress.community}`}
+                                    </p>
+                                  )}
+                                </div>
+                                {(() => {
+                                  const data = fetchResultsByProfile[p.id];
+                                  if (!data || (data.joined.length === 0 && data.pending.length === 0)) return null;
+                                  const daysPending = (req: string | null) => {
+                                    if (!req) return null;
+                                    const m = req.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+                                    if (!m) return null;
+                                    const d = new Date(parseInt(m[3]), parseInt(m[1]) - 1, parseInt(m[2]));
+                                    return Math.floor((Date.now() - d.getTime()) / 86400000);
+                                  };
+                                  return (
+                                    <div className="mt-3 pt-3 border-t border-border">
+                                      <span className="text-muted-foreground text-xs font-medium">Communities from Skool</span>
+                                      <div className="mt-2 space-y-1.5 max-h-48 overflow-y-auto">
+                                        {data.joined.map((c: any) => (
+                                          <div key={(c.slug || c) + '-j'} className="flex items-center justify-between gap-2 text-xs py-1">
+                                            <span className="truncate">{(c.name || c.slug || c)}</span>
+                                            <span className="text-green-600 text-xs font-medium">Already inside</span>
+                                          </div>
+                                        ))}
+                                        {data.pending.map((c: any) => {
+                                          const slug = c.slug || c;
+                                          const days = daysPending(c.requestedAt);
+                                          return (
+                                            <div key={(c.slug || c) + '-p'} className="flex items-center justify-between gap-2 text-xs py-1">
+                                              <div className="min-w-0 flex-1">
+                                                <span className="truncate block">{(c.name || c.slug || c)}</span>
+                                                <span className="text-yellow-600 text-[10px] font-medium">Pending</span>
+                                                <span className="text-muted-foreground text-[10px] block">
+                                                  {c.requestedAt ? `Requested ${c.requestedAt}` : 'Pending'}
+                                                  {days != null ? ` · ${days} day${days !== 1 ? 's' : ''} pending` : ''}
+                                                </span>
+                                              </div>
+                                              <Button variant="ghost" size="sm" className="h-6 text-xs gap-1 text-destructive shrink-0"
+                                                onClick={async () => { if (!confirm('Cancel this request?')) return; try { await api.cancelRequest(p.id, slug); setFetchResultsByProfile(prev => ({ ...prev, [p.id]: prev[p.id] ? { ...prev[p.id], pending: prev[p.id].pending.filter((x: any) => (x.slug || x) !== slug) } : prev[p.id] })); } catch (e: any) { alert(e.message); } }}>
+                                                <XCircle className="h-3 w-3" /> Cancel Request
+                                              </Button>
+                                            </div>
+                                          );
+                                        })}
+                                      </div>
+                                    </div>
+                                  );
+                                })()}
+                              </div>
+                            </div>
+                            {/* Countdown + Cookies */}

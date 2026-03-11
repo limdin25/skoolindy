@@ -6186,17 +6186,24 @@ def _extract_task_ref_from_post_url(post_url: str) -> str:
     return raw[:32]
 
 
+def _needs_max_completion_tokens(model: str) -> bool:
+    """GPT-5.x, GPT-4.1, and o-series models require max_completion_tokens instead of max_tokens."""
+    m = model.lower()
+    return m.startswith(("gpt-5", "gpt-4.1", "o1", "o3", "o4"))
+
+
 def _openai_generate_comment_rest(api_key: str, prompt: str, post_text: str, model: str = "") -> str:
     if not api_key:
         raise RuntimeError("OpenAI API key missing")
     _model = model.strip() if model else os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo")
+    token_param = "max_completion_tokens" if _needs_max_completion_tokens(_model) else "max_tokens"
     payload = {
         "model": _model,
         "messages": [
             {"role": "system", "content": prompt or "Write a short helpful comment under 40 words."},
             {"role": "user", "content": f"Post:\n{post_text}\n\nWrite a single comment reply."},
         ],
-        "max_tokens": 120,
+        token_param: 120,
         "temperature": 0.7,
     }
     resp = requests.post(

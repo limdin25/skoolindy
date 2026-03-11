@@ -448,37 +448,24 @@ export default function InboxPage() {
     setShowBulkLabel(false);
   };
 
-  const [bulkAiPending, setBulkAiPending] = useState(false);
-  const [showAiAutoMenu, setShowAiAutoMenu] = useState(false);
+  const [globalAiAutoNewChats, setGlobalAiAutoNewChats] = useState(false);
+  const [globalAiAutoLoading, setGlobalAiAutoLoading] = useState(false);
 
-  const handleBulkAiAuto = async (enabled: boolean) => {
-    if (selectedIds.length === 0) return;
-    setBulkAiPending(true);
-    try {
-      await Promise.all(selectedIds.map((id) => api.patchConversation(id, { aiAutoEnabled: enabled })));
-      setConversations((prev) => prev.map((c) =>
-        selectedIds.includes(c.id) ? { ...c, aiAutoEnabled: enabled } : c
-      ));
-      await refresh();
-      setSelectedIds([]);
-    } finally {
-      setBulkAiPending(false);
-    }
-  };
+  useEffect(() => {
+    api.getAutomationSettings().then((s) => setGlobalAiAutoNewChats(Boolean(s.globalAiAutoNewChats))).catch(() => {});
+  }, []);
 
-  const handleAllFilteredAiAuto = async (enabled: boolean) => {
-    const ids = sortedFiltered.map((c) => c.id);
-    if (ids.length === 0) return;
-    setBulkAiPending(true);
+  const handleToggleGlobalAiAuto = async () => {
+    const next = !globalAiAutoNewChats;
+    setGlobalAiAutoNewChats(next);
+    setGlobalAiAutoLoading(true);
     try {
-      await Promise.all(ids.map((id) => api.patchConversation(id, { aiAutoEnabled: enabled })));
-      setConversations((prev) => prev.map((c) =>
-        ids.includes(c.id) ? { ...c, aiAutoEnabled: enabled } : c
-      ));
-      await refresh();
-      setSelectedIds([]);
+      const current = await api.getAutomationSettings();
+      await api.updateAutomationSettings({ ...current, globalAiAutoNewChats: next });
+    } catch {
+      setGlobalAiAutoNewChats(!next);
     } finally {
-      setBulkAiPending(false);
+      setGlobalAiAutoLoading(false);
     }
   };
 
@@ -537,33 +524,18 @@ export default function InboxPage() {
             <div className="flex items-center justify-between">
               <h2 className="text-base font-semibold text-foreground">Inbox</h2>
               <div className="flex items-center gap-1">
-                <div className="relative">
-                  <button onClick={() => setShowAiAutoMenu(!showAiAutoMenu)} className="p-1.5 rounded-md hover:bg-muted transition-colors" title="AI Auto Controls">
-                    <Sparkles className="w-4 h-4 text-muted-foreground" />
-                  </button>
-                  {showAiAutoMenu && (
-                    <div className="absolute top-full right-0 mt-1 w-52 bg-card border border-border rounded-lg shadow-lg z-20 py-1">
-                      <div className="px-3 py-1.5 text-[10px] font-medium text-muted-foreground uppercase tracking-wider">AI Auto DM</div>
-                      {selectedIds.length > 0 && (
-                        <>
-                          <button onClick={() => { handleBulkAiAuto(true); setShowAiAutoMenu(false); }} disabled={bulkAiPending} className="w-full text-left px-3 py-1.5 text-xs text-foreground hover:bg-muted flex items-center gap-2">
-                            <Sparkles className="w-3 h-3 text-green-500" /> ON — {selectedIds.length} selected
-                          </button>
-                          <button onClick={() => { handleBulkAiAuto(false); setShowAiAutoMenu(false); }} disabled={bulkAiPending} className="w-full text-left px-3 py-1.5 text-xs text-foreground hover:bg-muted flex items-center gap-2">
-                            <X className="w-3 h-3 text-orange-500" /> OFF — {selectedIds.length} selected
-                          </button>
-                          <div className="border-t border-border my-1" />
-                        </>
-                      )}
-                      <button onClick={() => { handleAllFilteredAiAuto(true); setShowAiAutoMenu(false); }} disabled={bulkAiPending || sortedFiltered.length === 0} className="w-full text-left px-3 py-1.5 text-xs text-foreground hover:bg-muted flex items-center gap-2 disabled:opacity-50">
-                        <Sparkles className="w-3 h-3 text-green-500" /> ON — all {sortedFiltered.length} filtered
-                      </button>
-                      <button onClick={() => { handleAllFilteredAiAuto(false); setShowAiAutoMenu(false); }} disabled={bulkAiPending || sortedFiltered.length === 0} className="w-full text-left px-3 py-1.5 text-xs text-foreground hover:bg-muted flex items-center gap-2 disabled:opacity-50">
-                        <X className="w-3 h-3 text-orange-500" /> OFF — all {sortedFiltered.length} filtered
-                      </button>
-                    </div>
-                  )}
-                </div>
+                <button
+                  onClick={handleToggleGlobalAiAuto}
+                  disabled={globalAiAutoLoading}
+                  className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md hover:bg-muted transition-colors disabled:opacity-60"
+                  title="Auto-enable AI Auto for new incoming chats"
+                >
+                  <Sparkles className={`w-3.5 h-3.5 ${globalAiAutoNewChats ? 'text-green-500' : 'text-muted-foreground'}`} />
+                  <span className="text-[11px] text-muted-foreground whitespace-nowrap">Auto new chats</span>
+                  <span className={`relative w-7 h-4 rounded-full transition-colors inline-flex items-center flex-shrink-0 ${globalAiAutoNewChats ? 'bg-green-500' : 'bg-muted'}`}>
+                    <span className={`absolute top-0.5 left-0.5 w-3 h-3 bg-card rounded-full shadow transition-transform ${globalAiAutoNewChats ? 'translate-x-3' : ''}`} />
+                  </span>
+                </button>
                 <button onClick={() => setShowLabelManager(true)} className="p-1.5 rounded-md hover:bg-muted transition-colors" title="Manage Labels">
                   <Tag className="w-4 h-4 text-muted-foreground" />
                 </button>
@@ -611,8 +583,7 @@ export default function InboxPage() {
                   </div>
                 )}
               </div>
-              <button onClick={() => handleBulkAiAuto(true)} disabled={bulkAiPending} className="p-1.5 rounded-md hover:bg-muted" title="AI Auto ON for selected"><Sparkles className="w-3.5 h-3.5 text-green-500" /></button>
-              <button onClick={() => handleBulkAiAuto(false)} disabled={bulkAiPending} className="p-1.5 rounded-md hover:bg-muted" title="AI Auto OFF for selected"><X className="w-3.5 h-3.5 text-orange-500" /></button>
+
               <button onClick={handleBulkArchive} className="p-1.5 rounded-md hover:bg-muted" title="Archive"><Archive className="w-3.5 h-3.5 text-muted-foreground" /></button>
               <button onClick={handleBulkDelete} className="p-1.5 rounded-md hover:bg-muted" title="Delete"><Trash2 className="w-3.5 h-3.5 text-destructive" /></button>
             </div>

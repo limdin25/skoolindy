@@ -4308,12 +4308,16 @@ def _upsert_skool_chat_card(db: sqlite3.Connection, card: Dict[str, Any]) -> Opt
             ),
         )
     else:
+        # Check if global AI Auto for new chats should auto-enable this conversation
+        _gaa_settings = _load_or_create_automation_settings(db)
+        _gaa_s = _gaa_settings.model_dump() if hasattr(_gaa_settings, "model_dump") else {}
+        _ai_auto_new = 1 if (_gaa_s.get("globalAiAutoNewChats") and _gaa_s.get("masterEnabled")) else 0
         db.execute(
             """
             INSERT INTO conversations (
                 id, contactName, profileId, profileName, keyword, originGroup, lastMessage, lastMessageTime,
                 unread, labelId, isArchived, isDeletedUi, aiAutoEnabled, contactInfo, commentAttribution, keywordContext
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, 0, 0, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, 0, ?, ?, ?, ?)
             """,
             (
                 conversation_id,
@@ -4325,6 +4329,7 @@ def _upsert_skool_chat_card(db: sqlite3.Connection, card: Dict[str, Any]) -> Opt
                 message_text,
                 last_message_time,
                 unread_value,
+                _ai_auto_new,
                 contact_info,
                 attribution,
                 keyword_context,
@@ -4430,6 +4435,21 @@ def _try_ai_auto_reply(
         latest_sender = str((latest_row["sender"] if latest_row else "") or "").strip().lower()
         if latest_sender != "inbound":
             return False
+
+        # Cooldown: do not auto-reply if we sent an AI message to this conversation recently (within 5 minutes)
+        last_ai_outbound = db.execute(
+            """SELECT timestamp FROM messages
+               WHERE conversationId = ? AND sender = 'outbound' AND isAiGenerated = 1
+               ORDER BY rowid DESC LIMIT 1""",
+            (conversation_id,),
+        ).fetchone()
+        if last_ai_outbound:
+            try:
+                last_ts = datetime.fromisoformat(str(last_ai_outbound["timestamp"]).replace("Z", "+00:00"))
+                if (datetime.now(timezone.utc) - last_ts).total_seconds() < 300:
+                    return False
+            except Exception:
+                pass
 
         ai_reply = _generate_conversation_ai_suggest(db, conversation_id, "Friendly")
         profile_name = str(conversation_row["profileName"] or "SYSTEM")
@@ -5523,6 +5543,11 @@ def ensure_tables() -> None:
         db.execute("""CREATE TABLE IF NOT EXISTS automation_comment_events (id TEXT PRIMARY KEY,profileId TEXT NOT NULL,profile TEXT NOT NULL,community TEXT NOT NULL,postUrl TEXT NOT NULL,keyword TEXT NOT NULL,prompt TEXT NOT NULL,commentText TEXT NOT NULL,createdAt TEXT NOT NULL)""")
         db.execute("""CREATE TABLE IF NOT EXISTS conversations (id TEXT PRIMARY KEY,contactName TEXT NOT NULL,profileId TEXT NOT NULL,profileName TEXT NOT NULL,keyword TEXT NOT NULL,originGroup TEXT NOT NULL,lastMessage TEXT NOT NULL,lastMessageTime TEXT NOT NULL,unread INTEGER NOT NULL,labelId TEXT,isArchived INTEGER NOT NULL,isDeletedUi INTEGER NOT NULL,contactInfo TEXT NOT NULL,commentAttribution TEXT NOT NULL,keywordContext TEXT NOT NULL)""")
         db.execute("""CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY,conversationId TEXT NOT NULL,text TEXT NOT NULL,sender TEXT NOT NULL,timestamp TEXT NOT NULL,isDeletedUi INTEGER NOT NULL,FOREIGN KEY(conversationId) REFERENCES conversations(id))""")
+        # Migration: add isAiGenerated column for tracking AI-generated outbound messages
+        try:
+            db.execute("ALTER TABLE messages ADD COLUMN isAiGenerated INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass  # Column already exists
         _dedupe_imported_conversations(db)
         _prune_orphan_imported_conversations(db)
         _normalize_legacy_chat_metadata(db)
@@ -5560,6 +5585,8 @@ def ensure_tables() -> None:
             db.execute("ALTER TABLE conversations ADD COLUMN followUpDueAt TEXT")
         if "lastAiOutboundAt" not in conversation_columns:
             db.execute("ALTER TABLE conversations ADD COLUMN lastAiOutboundAt TEXT")
+        if "aiAutoManualOff" not in conversation_columns:
+            db.execute("ALTER TABLE conversations ADD COLUMN aiAutoManualOff INTEGER NOT NULL DEFAULT 0")
         # -- Follow-up automation column (messages) --
         message_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(messages)").fetchall()}
         if "isAiGenerated" not in message_columns:
@@ -5873,6 +5900,7 @@ class AutomationSettingsModel(BaseModel):
     commentModel: str = "gpt-3.5-turbo"
     # -- Staged DM prompts (JSON-encoded dict) --
     dmPromptStages: Dict[str, str] = {}
+    globalAiAutoNewChats: bool = False
 
 
 AUTOMATION_SETTINGS_DEFAULT = AutomationSettingsModel(
@@ -6002,6 +6030,7 @@ class ConversationModel(BaseModel):
     isArchived: bool
     isDeletedUi: bool
     aiAutoEnabled: bool
+    aiAutoManualOff: bool = False
     followUpCount: int = 0
     followUpDueAt: Optional[str] = None
     lastAiOutboundAt: Optional[str] = None
@@ -6251,16 +6280,23 @@ def _local_dm_template(tone: str, contact_name: str, keyword: str, origin_group:
     return f"Hey {first_name}, noticed your activity in {origin_group}. I work in a similar space around {keyword}. Open to a quick chat?"
 
 
+def _needs_max_completion_tokens(model: str) -> bool:
+    """GPT-5.x, GPT-4.1, and o-series models require max_completion_tokens instead of max_tokens."""
+    m = model.lower()
+    return m.startswith(("gpt-5", "gpt-4.1", "o1", "o3", "o4"))
+
+
 def _openai_generate_dm_rest(api_key: str, model: str, system_prompt: str, user_prompt: str) -> str:
     if not api_key:
         raise RuntimeError("OpenAI API key missing")
+    token_param = "max_completion_tokens" if _needs_max_completion_tokens(model) else "max_tokens"
     payload = {
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "max_tokens": 160,
+        token_param: 160,
         "temperature": 0.65,
     }
     resp = requests.post(
@@ -6325,11 +6361,15 @@ def _generate_conversation_ai_suggest(
 
     conversation = dict(row)
     profile_id = str(conversation.get("profileId") or "").strip()
-    keyword = str(conversation.get("keyword") or "").strip() or "your topic"
+    raw_keyword = str(conversation.get("keyword") or "").strip()
+    # Treat em-dash, single dash, and other placeholder-only values as empty keyword
+    keyword = raw_keyword if raw_keyword and raw_keyword not in ("\u2014", "\u2013", "-", "--", "\u2014", "\u2013", "n/a", "N/A", "none", "None") else ""
+    keyword = keyword or "your topic"
     origin_group = str(conversation.get("originGroup") or "").strip() or "the group"
     contact_name = str(conversation.get("contactName") or "").strip() or "there"
 
-    matched_rule = _find_matching_keyword_rule(db, profile_id, keyword)
+    # Skip keyword rule matching entirely when keyword is a placeholder
+    matched_rule = _find_matching_keyword_rule(db, profile_id, keyword) if raw_keyword and keyword != "your topic" else None
     dm_prompt = str((matched_rule["dmPrompt"] if matched_rule else "") or "").strip()
 
     settings = _load_or_create_automation_settings(db)
@@ -6414,7 +6454,7 @@ def _generate_conversation_ai_suggest(
         return ConversationAISuggestResponse(
             success=True,
             text=_local_dm_template(tone, contact_name, keyword, origin_group),
-            source=f"{source}:local_template_no_api_key",
+            source="suggest_only_no_send:local_template_no_api_key",
             model=None,
         )
 
@@ -6423,11 +6463,12 @@ def _generate_conversation_ai_suggest(
         if not generated:
             raise RuntimeError("empty_generation")
         return ConversationAISuggestResponse(success=True, text=generated, source=source, model=model)
-    except Exception:
+    except Exception as exc:
+        LOGGER.error("DM generation failed for conversation %s (model=%s): %s", conversation_id, model, exc)
         return ConversationAISuggestResponse(
-            success=True,
+            success=False,
             text=_local_dm_template(tone, contact_name, keyword, origin_group),
-            source=f"{source}:local_template_on_error",
+            source="suggest_only_no_send:local_template_on_error",
             model=None,
         )
 
@@ -6451,6 +6492,7 @@ def build_conversation_model(row: sqlite3.Row, messages: Dict[str, List[MessageM
         keyword=data["keyword"], originGroup=_normalize_origin_group_name(data["originGroup"]) or "Skool Inbox", lastMessage=data["lastMessage"], lastMessageTime=data["lastMessageTime"],
         unread=bool(data["unread"]), labelId=data["labelId"], isArchived=bool(data["isArchived"]), isDeletedUi=bool(data["isDeletedUi"]),
         aiAutoEnabled=bool(data.get("aiAutoEnabled", 0)),
+        aiAutoManualOff=bool(data.get("aiAutoManualOff", 0)),
         followUpCount=int(data.get("followUpCount", 0) or 0),
         followUpDueAt=data.get("followUpDueAt"),
         lastAiOutboundAt=data.get("lastAiOutboundAt"),
@@ -8327,8 +8369,14 @@ def patch_conversation(conversation_id: str, payload: ConversationPatchModel):
         updates["unread"] = bool_to_int(updates["unread"])
     if "aiAutoEnabled" in updates:
         updates["aiAutoEnabled"] = bool_to_int(updates["aiAutoEnabled"])
-    clauses = [f"{field} = ?" for field in updates if field in {"labelId", "isArchived", "isDeletedUi", "unread", "aiAutoEnabled"}]
-    params = [updates[field] for field in updates if field in {"labelId", "isArchived", "isDeletedUi", "unread", "aiAutoEnabled"}]
+        # Manual OFF sets aiAutoManualOff=1 so global toggle never re-enables
+        if not updates["aiAutoEnabled"]:
+            updates["aiAutoManualOff"] = 1
+        else:
+            # Manual ON clears the manual-off override
+            updates["aiAutoManualOff"] = 0
+    clauses = [f"{field} = ?" for field in updates if field in {"labelId", "isArchived", "isDeletedUi", "unread", "aiAutoEnabled", "aiAutoManualOff"}]
+    params = [updates[field] for field in updates if field in {"labelId", "isArchived", "isDeletedUi", "unread", "aiAutoEnabled", "aiAutoManualOff"}]
     if not clauses:
         raise HTTPException(400, "No valid fields")
     with get_db() as db:

@@ -82,6 +82,7 @@ export interface AutomationSettings {
   followUpModel?: string;
   commentModel?: string;
   dmPromptStages?: Record<string, string>;
+  globalAiAutoNewChats?: boolean;
 }
 
 export interface QueueItem {
@@ -170,6 +171,7 @@ export interface Conversation {
   isArchived: boolean;
   isDeletedUi: boolean;
   aiAutoEnabled: boolean;
+  aiAutoManualOff?: boolean;
   followUpCount?: number;
   followUpDueAt?: string | null;
   lastAiOutboundAt?: string | null;

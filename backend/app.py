@@ -337,7 +337,7 @@ async def _follow_up_checker_loop(app: FastAPI) -> None:
                 await asyncio.sleep(_FOLLOW_UP_CHECK_INTERVAL_SECONDS)
                 continue
 
-            global_delay = int(s.get("followUpDelaySeconds", 86400))
+            global_delay = max(int(s.get("followUpDelaySeconds", 86400)), 3600)  # Floor: minimum 1 hour
             global_max = int(s.get("followUpMaxCount", 2))
             now_iso = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
 
@@ -424,7 +424,7 @@ async def _follow_up_checker_loop(app: FastAPI) -> None:
                         if latest_out:
                             db.execute("UPDATE messages SET isAiGenerated = 1 WHERE id = ?", (latest_out["id"],))
                         new_count = current_count + 1
-                        delay_sec = int(matched_rule["dmReplyDelay"]) if matched_rule and matched_rule["dmReplyDelay"] else global_delay
+                        delay_sec = max(int(matched_rule["dmReplyDelay"]) if matched_rule and matched_rule["dmReplyDelay"] else global_delay, 3600)
                         new_due = None if new_count >= max_fu else (datetime.now(tz=timezone.utc) + timedelta(seconds=delay_sec)).isoformat(timespec="seconds")
                         fu_now = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
                         db.execute(
@@ -4336,8 +4336,14 @@ def _upsert_skool_chat_card(db: sqlite3.Connection, card: Dict[str, Any]) -> Opt
             ),
         )
 
-    # Replace imported message snapshot for this conversation to avoid stale/incorrect carry-over
-    # from previous fallback parses when API detail was unavailable.
+    # Replace imported message snapshot — preserve isAiGenerated flags across reimport
+    _ai_gen_map = {}
+    for _ag_row in db.execute(
+        "SELECT id, text, sender, timestamp, isAiGenerated FROM messages WHERE conversationId = ? AND isAiGenerated = 1",
+        (conversation_id,),
+    ).fetchall():
+        _sig = f"{_ag_row['sender']}|{_ag_row['timestamp']}|{str(_ag_row['text'] or '')[:200]}"
+        _ai_gen_map[_sig] = 1
     db.execute("DELETE FROM messages WHERE conversationId = ?", (conversation_id,))
 
     for item in raw_messages:
@@ -4360,6 +4366,14 @@ def _upsert_skool_chat_card(db: sqlite3.Connection, card: Dict[str, Any]) -> Opt
         )
     _dedupe_imported_messages(db, conversation_id)
     _dedupe_adjacent_imported_messages(db, conversation_id)
+    # Restore isAiGenerated flags after reimport using signature matching
+    if _ai_gen_map:
+        for _restored in db.execute(
+            "SELECT id, text, sender, timestamp FROM messages WHERE conversationId = ?", (conversation_id,),
+        ).fetchall():
+            _sig = f"{_restored['sender']}|{_restored['timestamp']}|{str(_restored['text'] or '')[:200]}"
+            if _sig in _ai_gen_map:
+                db.execute("UPDATE messages SET isAiGenerated = 1 WHERE id = ?", (_restored["id"],))
 
     # Reset follow-up state if new inbound message arrived
     if message_changed:
@@ -4436,17 +4450,25 @@ def _try_ai_auto_reply(
         if latest_sender != "inbound":
             return False
 
-        # Cooldown: do not auto-reply if we sent an AI message to this conversation recently (within 5 minutes)
-        last_ai_outbound = db.execute(
-            """SELECT timestamp FROM messages
-               WHERE conversationId = ? AND sender = 'outbound' AND isAiGenerated = 1
-               ORDER BY rowid DESC LIMIT 1""",
+        # Hard guard: never send stacked outbound AI messages without an inbound reply between them
+        _last_outbound_ai = db.execute(
+            "SELECT id FROM messages WHERE conversationId = ? AND sender = 'outbound' AND isAiGenerated = 1 ORDER BY rowid DESC LIMIT 1",
             (conversation_id,),
         ).fetchone()
-        if last_ai_outbound:
+        if _last_outbound_ai:
+            _inbound_after = db.execute(
+                "SELECT COUNT(*) FROM messages WHERE conversationId = ? AND sender = 'inbound' AND isDeletedUi = 0 AND rowid > (SELECT rowid FROM messages WHERE id = ?)",
+                (conversation_id, _last_outbound_ai["id"]),
+            ).fetchone()[0]
+            if _inbound_after == 0:
+                return False
+
+        # Cooldown: also use lastAiOutboundAt from conversation row (survives message reimport)
+        _conv_last_ai = str(conversation_row.get("lastAiOutboundAt") or "").strip()
+        if _conv_last_ai:
             try:
-                last_ts = datetime.fromisoformat(str(last_ai_outbound["timestamp"]).replace("Z", "+00:00"))
-                if (datetime.now(timezone.utc) - last_ts).total_seconds() < 300:
+                _last_ts = datetime.fromisoformat(_conv_last_ai.replace("Z", "+00:00"))
+                if (datetime.now(timezone.utc) - _last_ts).total_seconds() < 300:
                     return False
             except Exception:
                 pass
@@ -4529,7 +4551,8 @@ def _try_ai_auto_reply(
             _global_delay = int(_fu_s.get("followUpDelaySeconds", 86400))
             _kw = str(conversation_row["keyword"] if conversation_row else "").strip()
             _matched_rule = _find_matching_keyword_rule(db, profile_id, _kw)
-            _delay = int(_matched_rule["dmReplyDelay"]) if _matched_rule and _matched_rule["dmReplyDelay"] else _global_delay
+            _raw_delay = int(_matched_rule["dmReplyDelay"]) if _matched_rule and _matched_rule["dmReplyDelay"] else _global_delay
+            _delay = max(_raw_delay, 3600)  # Floor: minimum 1 hour between follow-ups
             _due_at = (datetime.now(tz=timezone.utc) + timedelta(seconds=_delay)).isoformat(timespec="seconds") if _fu_enabled and _delay > 0 else None
             db.execute(
                 "UPDATE conversations SET lastAiOutboundAt = ?, followUpCount = 0, followUpDueAt = ? WHERE id = ?",
@@ -6332,18 +6355,32 @@ def _get_openai_key_for_dm() -> str:
 
 
 def _resolve_stage(db: sqlite3.Connection, conversation_id: str, is_follow_up: bool = False) -> str:
-    """Determine the conversation stage: first, second, third, fourth_plus, or follow_up."""
+    """Determine conversation stage based on completed reply turns (inbound after AI outbound).
+
+    A reply turn = one AI outbound followed by one inbound reply.
+    Stage advances only when the contact replies, never by time or outbound count alone.
+    """
     if is_follow_up:
         return "follow_up"
-    ai_count = db.execute(
-        "SELECT COUNT(*) FROM messages WHERE conversationId = ? AND isAiGenerated = 1",
+    rows = db.execute(
+        "SELECT sender, isAiGenerated FROM messages WHERE conversationId = ? AND isDeletedUi = 0 ORDER BY rowid ASC",
         (conversation_id,),
-    ).fetchone()[0]
-    if ai_count <= 0:
+    ).fetchall()
+    completed_turns = 0
+    awaiting_reply = False
+    for row in rows:
+        sender = str(row["sender"]).strip().lower()
+        is_ai = bool(row["isAiGenerated"])
+        if sender == "outbound" and is_ai:
+            awaiting_reply = True
+        elif sender == "inbound" and awaiting_reply:
+            completed_turns += 1
+            awaiting_reply = False
+    if completed_turns == 0:
         return "first"
-    if ai_count == 1:
+    if completed_turns == 1:
         return "second"
-    if ai_count == 2:
+    if completed_turns == 2:
         return "third"
     return "fourth_plus"
 

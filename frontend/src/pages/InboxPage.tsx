@@ -449,6 +449,7 @@ export default function InboxPage() {
   };
 
   const [bulkAiPending, setBulkAiPending] = useState(false);
+  const [showAiAutoMenu, setShowAiAutoMenu] = useState(false);
 
   const handleBulkAiAuto = async (enabled: boolean) => {
     if (selectedIds.length === 0) return;
@@ -534,30 +535,39 @@ export default function InboxPage() {
         <div className={`${isMobile ? 'w-full' : 'w-[380px]'} flex-shrink-0 border-r border-border flex flex-col bg-card overflow-hidden`}>
           <div className="p-4 border-b border-border space-y-3 flex-shrink-0">
             <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <h2 className="text-base font-semibold text-foreground">Inbox</h2>
-                <div className="flex items-center gap-1 ml-2">
-                  <button
-                    onClick={() => handleAllFilteredAiAuto(true)}
-                    disabled={bulkAiPending || sortedFiltered.length === 0}
-                    className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-green-500/10 text-green-600 hover:bg-green-500/20 transition-colors disabled:opacity-50"
-                    title="Enable AI Auto for all filtered conversations"
-                  >
-                    <Sparkles className="w-3 h-3" /> All ON
+              <h2 className="text-base font-semibold text-foreground">Inbox</h2>
+              <div className="flex items-center gap-1">
+                <div className="relative">
+                  <button onClick={() => setShowAiAutoMenu(!showAiAutoMenu)} className="p-1.5 rounded-md hover:bg-muted transition-colors" title="AI Auto Controls">
+                    <Sparkles className="w-4 h-4 text-muted-foreground" />
                   </button>
-                  <button
-                    onClick={() => handleAllFilteredAiAuto(false)}
-                    disabled={bulkAiPending || sortedFiltered.length === 0}
-                    className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-red-500/10 text-red-500 hover:bg-red-500/20 transition-colors disabled:opacity-50"
-                    title="Disable AI Auto for all filtered conversations"
-                  >
-                    <Sparkles className="w-3 h-3" /> All OFF
-                  </button>
+                  {showAiAutoMenu && (
+                    <div className="absolute top-full right-0 mt-1 w-52 bg-card border border-border rounded-lg shadow-lg z-20 py-1">
+                      <div className="px-3 py-1.5 text-[10px] font-medium text-muted-foreground uppercase tracking-wider">AI Auto DM</div>
+                      {selectedIds.length > 0 && (
+                        <>
+                          <button onClick={() => { handleBulkAiAuto(true); setShowAiAutoMenu(false); }} disabled={bulkAiPending} className="w-full text-left px-3 py-1.5 text-xs text-foreground hover:bg-muted flex items-center gap-2">
+                            <Sparkles className="w-3 h-3 text-green-500" /> ON — {selectedIds.length} selected
+                          </button>
+                          <button onClick={() => { handleBulkAiAuto(false); setShowAiAutoMenu(false); }} disabled={bulkAiPending} className="w-full text-left px-3 py-1.5 text-xs text-foreground hover:bg-muted flex items-center gap-2">
+                            <X className="w-3 h-3 text-orange-500" /> OFF — {selectedIds.length} selected
+                          </button>
+                          <div className="border-t border-border my-1" />
+                        </>
+                      )}
+                      <button onClick={() => { handleAllFilteredAiAuto(true); setShowAiAutoMenu(false); }} disabled={bulkAiPending || sortedFiltered.length === 0} className="w-full text-left px-3 py-1.5 text-xs text-foreground hover:bg-muted flex items-center gap-2 disabled:opacity-50">
+                        <Sparkles className="w-3 h-3 text-green-500" /> ON — all {sortedFiltered.length} filtered
+                      </button>
+                      <button onClick={() => { handleAllFilteredAiAuto(false); setShowAiAutoMenu(false); }} disabled={bulkAiPending || sortedFiltered.length === 0} className="w-full text-left px-3 py-1.5 text-xs text-foreground hover:bg-muted flex items-center gap-2 disabled:opacity-50">
+                        <X className="w-3 h-3 text-orange-500" /> OFF — all {sortedFiltered.length} filtered
+                      </button>
+                    </div>
+                  )}
                 </div>
+                <button onClick={() => setShowLabelManager(true)} className="p-1.5 rounded-md hover:bg-muted transition-colors" title="Manage Labels">
+                  <Tag className="w-4 h-4 text-muted-foreground" />
+                </button>
               </div>
-              <button onClick={() => setShowLabelManager(true)} className="p-1.5 rounded-md hover:bg-muted transition-colors" title="Manage Labels">
-                <Tag className="w-4 h-4 text-muted-foreground" />
-              </button>
             </div>
             <div className="relative">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
@@ -642,6 +652,7 @@ export default function InboxPage() {
                         <div className="flex items-center gap-1.5 mt-0.5 min-w-0 overflow-hidden">
                           <span className="inline-flex px-1.5 py-0.5 rounded text-[10px] font-medium bg-primary/10 text-primary whitespace-nowrap flex-shrink-0">{conv.keyword}</span>
                           {label && <span className={`inline-flex px-1.5 py-0.5 rounded text-[10px] font-medium text-white whitespace-nowrap flex-shrink-0 ${label.color}`}>{label.name}</span>}
+                          {conv.aiAutoEnabled && <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-500/10 text-amber-600 whitespace-nowrap flex-shrink-0" title="AI Auto DM enabled"><Sparkles className="w-2.5 h-2.5" />Auto</span>}
                         </div>
                         <p className="text-xs text-muted-foreground mt-1 truncate max-w-full">{conv.lastMessage}</p>
                       </div>

@@ -826,7 +826,7 @@ export default function DashboardPage() {
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
                   <span className="text-xs text-muted-foreground whitespace-nowrap">{formatRelativeTime(item.timestamp)}</span>
-                  <a href={item.postUrl} className="text-primary hover:text-primary/80"><ExternalLink className="w-3 h-3" /></a>
+                  <a href={item.postUrl} target="_blank" rel="noopener noreferrer" className="text-primary hover:text-primary/80"><ExternalLink className="w-3 h-3" /></a>
                 </div>
               </div>
             ))}

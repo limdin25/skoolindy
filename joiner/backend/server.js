@@ -727,7 +727,7 @@ app.post('/api/communities/cancel-request', async (req, res) => {
 
 app.post('/api/communities/fetch-all', async (req, res) => {
   if (fetchAllProgress.running) return res.status(429).json({ error: 'Already in progress' });
-  const profiles = engageflowDb.prepare('SELECT id, email FROM profiles WHERE cookie_json IS NOT NULL AND cookie_json != ""').all();
+  const profiles = engageflowDb.prepare(`SELECT id, email FROM profiles WHERE cookie_json IS NOT NULL AND cookie_json != ''`).all();
   fetchAllProgress = { running: true, total: profiles.length, done: 0, current: null, resolved: 0 };
   res.json({ started: true, total: profiles.length });
   (async () => {
@@ -854,7 +854,7 @@ app.put('/api/profiles/:id/discovery-info', (req, res) => {
 
 // ==================== START ====================
 cron.schedule('0 8,20 * * *', async () => {
-  const profiles = engageflowDb.prepare('SELECT id FROM profiles WHERE cookie_json IS NOT NULL AND cookie_json != ""').all();
+  const profiles = engageflowDb.prepare(`SELECT id FROM profiles WHERE cookie_json IS NOT NULL AND cookie_json != ''`).all();
   for (const p of profiles) { try { await fetchCommunitiesForProfile(p.id); } catch (e) { console.error(e.message); } }
 });
 

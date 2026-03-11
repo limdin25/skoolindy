@@ -15,7 +15,7 @@ joinerDb.pragma('foreign_keys = ON');
 joinerDb.exec(`
     CREATE TABLE IF NOT EXISTS join_queue (
         id TEXT PRIMARY KEY,
-        profile_id TEXT NOT NULL,
+        profile_id TEXT,
         group_slug TEXT NOT NULL,
         group_id TEXT,
         group_name TEXT,

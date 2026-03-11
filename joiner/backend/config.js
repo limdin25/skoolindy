@@ -11,5 +11,5 @@ module.exports = {
     BROWSER_PROFILES_DIR: path.resolve(__dirname, '../../backend/skool_accounts'),
 
     // EngageFlow API for webhook
-    ENGAGEFLOW_API: 'http://127.0.0.1:3103',
+    ENGAGEFLOW_API: 'http://127.0.0.1:3113',
 };

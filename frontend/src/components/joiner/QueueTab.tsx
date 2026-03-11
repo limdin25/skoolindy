@@ -298,7 +298,7 @@ export function QueueTab() {
                 </Button>
               </div>
               <Textarea rows={8} placeholder="Name,Members,Online,Private,Pricing,Price,URL,Bio,Description" value={csvContent} onChange={e => setCsvContent(e.target.value)} className="font-mono text-xs" />
-              <p className="text-xs text-muted-foreground mt-1">Expected: Name, Members, URL. Paid auto-skipped. Duplicates skipped.</p>
+              <p className="text-xs text-muted-foreground mt-1">Expected: Name, Members, URL. Duplicates skipped. Paid and trial communities detected during join.</p>
             </div>
           </div>
           <DialogFooter>

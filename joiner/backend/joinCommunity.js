@@ -108,7 +108,7 @@ async function joinCommunity(profileId, groupSlug, profileInfo = {}) {
         const title = (await btn.getAttribute('title') || '').trim();
         const combined = `${text} ${aria} ${title}`;
         
-        if (JOIN_BUTTON_PATTERNS.test(combined) && await btn.isVisible()) {
+        if (JOIN_BUTTON_PATTERNS.test(combined) && await btn.isVisible() && !await btn.isDisabled()) {
           // Check if free trial (button says "START FREE TRIAL" etc.)
           if (/free\s*trial|start\s*trial/i.test(text)) {
             await context.close();
@@ -135,8 +135,18 @@ async function joinCommunity(profileId, groupSlug, profileInfo = {}) {
       return { success: false, status: 'failed', message: 'No join button found (page is live but no join CTA)' };
     }
 
-    await joinBtn.click();
-    await page.waitForTimeout(2500);
+    await joinBtn.click({ force: true, timeout: 10000 });
+    // Smart wait: race between modal, joined, pending, or paid state
+    try {
+      await Promise.race([
+        page.locator('[role="dialog"], dialog, [class*="modal"], [class*="Modal"]').first().waitFor({ timeout: 6000 }),
+        page.locator('text=/leave\\s+group/i').first().waitFor({ timeout: 6000 }),
+        page.locator('text=/membership.*pending|cancel.*membership/i').first().waitFor({ timeout: 6000 }),
+        page.locator('text=/free.*trial|pricing|per\\s+month/i').first().waitFor({ timeout: 6000 }),
+        new Promise(r => setTimeout(r, 6000)),
+      ]);
+    } catch {}
+    await page.waitForTimeout(500);
 
     // Debug screenshot
     const debugDir = path.join(__dirname, 'debug_screenshots');
@@ -148,6 +158,16 @@ async function joinCommunity(profileId, groupSlug, profileInfo = {}) {
     if (/leave\s+group/i.test(afterText)) {
       await context.close();
       return { success: true, status: 'joined', message: 'Joined directly (no survey)' };
+    }
+
+    // Check for pending/membership-request state before entering survey
+    // Use scoped button/text locators instead of body text to avoid false positives
+    const hasPendingButton = await page.locator('button:has-text("Membership Pending"), button:has-text("MEMBERSHIP PENDING")').first().isVisible().catch(() => false);
+    const hasCancelRequest = await page.locator('text=/cancel\s+membership\s+request/i').first().isVisible().catch(() => false);
+    if (hasPendingButton || hasCancelRequest) {
+      try { await page.locator('button:has-text("GOT IT"), button:has-text("Got it"), button:has-text("OK"), button:has-text("Ok")').first().click({ timeout: 2000 }); } catch {}
+      await context.close();
+      return { success: true, status: 'pending', message: 'Membership pending — admins reviewing request' };
     }
 
     // ========== GOD-MODE SURVEY HANDLER ==========
@@ -215,6 +235,9 @@ async function joinCommunity(profileId, groupSlug, profileInfo = {}) {
 
         const ctx = [placeholder, fieldType, fieldName, fieldId, ariaLabel, parentText].join(' ');
 
+        // Skip search fields
+        if (/search/i.test(placeholder) || /search/i.test(ariaLabel) || /search/i.test(fieldName)) continue;
+
         // Fuzzy match against canonical patterns
         let value = '';
         for (const [key, pattern] of Object.entries(FIELD_PATTERNS)) {
@@ -254,6 +277,7 @@ async function joinCommunity(profileId, groupSlug, profileInfo = {}) {
         if (!await btn.isVisible()) continue;
         const text = (await btn.textContent() || '').trim();
         if (text.length > 50) continue; // Too long to be an option button
+        if (/^(previous|next|prev|\d+)$/i.test(text)) continue; // Skip pagination
         if (clickedTexts.has(text.toLowerCase())) continue;
         
         // Check if this looks like an option (not a navigation/submit button)
@@ -275,6 +299,7 @@ async function joinCommunity(profileId, groupSlug, profileInfo = {}) {
           if (!await btn.isVisible()) continue;
           const text = (await btn.textContent() || '').trim();
           if (text.length > 30) continue;
+          if (/^(previous|next|prev|\d+)$/i.test(text)) continue; // Skip pagination
           if (DECLINE_PATTERNS.test(text)) continue;
           if (JOIN_BUTTON_PATTERNS.test(text)) continue; // Don't click submit yet
           if (/log\s*in|sign\s*in/i.test(text)) continue; // Auth links - would navigate away
@@ -376,27 +401,34 @@ async function joinCommunity(profileId, groupSlug, profileInfo = {}) {
 
     console.log(`[${groupSlug}] Survey filled: ${fieldsFilled} fields, ${optionsClicked} options`);
 
-    // --- CLICK SUBMIT/JOIN BUTTON ---
+    // --- CLICK SUBMIT/JOIN BUTTON (modal-scoped first, then page-wide) ---
     let submitted = false;
-    
-    // Re-scan buttons after filling (some may have become enabled)
-    const submitButtons = await page.locator('button').all();
-    for (const btn of submitButtons) {
-      try {
-        if (!await btn.isVisible()) continue;
-        const isDisabled = await btn.isDisabled();
-        const text = (await btn.textContent() || '').trim();
-        const aria = (await btn.getAttribute('aria-label') || '').trim();
-        const combined = `${text} ${aria}`;
 
-        if (JOIN_BUTTON_PATTERNS.test(combined) && !isDisabled) {
-          console.log(`  [${groupSlug}] Clicking submit: "${text}" (disabled=${isDisabled})`);
-          submitted = true;
-          await btn.click();
+    const submitScopes = [
+      page.locator('[role="dialog"], [role="alertdialog"], dialog, [class*="modal"], [class*="Modal"], [class*="dialog"], [class*="Dialog"]').first(),
+      page,
+    ];
 
-          break;
-        }
-      } catch {}
+    for (const scope of submitScopes) {
+      if (submitted) break;
+      let scopeButtons;
+      try { scopeButtons = await scope.locator('button').all(); } catch { continue; }
+      for (const btn of scopeButtons) {
+        try {
+          if (!await btn.isVisible()) continue;
+          if (await btn.isDisabled()) continue;
+          const text = (await btn.textContent() || '').trim();
+          if (/^(previous|next|prev|\d+|close|cancel|back)$/i.test(text)) continue;
+          const aria = (await btn.getAttribute('aria-label') || '').trim();
+          const combined = `${text} ${aria}`;
+          if (JOIN_BUTTON_PATTERNS.test(combined)) {
+            console.log(`  [${groupSlug}] Clicking submit: "${text}"`);
+            submitted = true;
+            await btn.click({ force: true, timeout: 10000 });
+            break;
+          }
+        } catch {}
+      }
     }
 
     await page.waitForTimeout(3000);

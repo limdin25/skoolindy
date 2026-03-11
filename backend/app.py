@@ -384,6 +384,11 @@ async def _follow_up_checker_loop(app: FastAPI) -> None:
 
                         if not _reserve_skool_send_dedupe(conv_id, reply_text, ttl_seconds=180.0):
                             continue
+                        # Persistent dedupe (survives restarts)
+                        if _check_persistent_dedupe(db, conv_id, reply_text, window_seconds=600):
+                            LOGGER.info("[FOLLOW_UP] %s: BLOCKED persistent dedupe", conv_id[-12:])
+                            _release_skool_send_dedupe(conv_id, reply_text)
+                            continue
 
                         attr = parse_json_field(str(conv["commentAttribution"] or "{}"), {})
                         post_url = str(attr.get("postUrl") or "")
@@ -415,6 +420,8 @@ async def _follow_up_checker_loop(app: FastAPI) -> None:
                         continue
 
                     with get_db() as db:
+                        # Record send BEFORE upsert (prevents recursive triggers)
+                        _record_persistent_send(db, conv_id, reply_text)
                         _upsert_skool_chat_card(db, sent_card)
                         _update_live_cache_with_skool_card(sent_card)
                         latest_out = db.execute(
@@ -1678,6 +1685,56 @@ def _release_skool_send_dedupe(conversation_id: str, text: str) -> None:
         return
     with _SKOOL_DM_SEND_DEDUPE_LOCK:
         _SKOOL_DM_SEND_DEDUPE.pop(key, None)
+
+
+# -- Persistent DB-backed send dedupe (survives restarts) --
+import hashlib as _hashlib
+
+_CONVERSATION_SEND_LOCKS: dict = {}
+_CONVERSATION_SEND_LOCKS_LOCK = threading.Lock()
+
+
+def _get_conversation_send_lock(conversation_id: str) -> threading.Lock:
+    """Per-conversation non-blocking lock to prevent concurrent sends."""
+    with _CONVERSATION_SEND_LOCKS_LOCK:
+        if conversation_id not in _CONVERSATION_SEND_LOCKS:
+            _CONVERSATION_SEND_LOCKS[conversation_id] = threading.Lock()
+        return _CONVERSATION_SEND_LOCKS[conversation_id]
+
+
+def _text_hash(text: str) -> str:
+    normalized = " ".join(str(text or "").lower().split())
+    return _hashlib.sha256(normalized.encode()).hexdigest()[:32]
+
+
+def _check_persistent_dedupe(db, conversation_id: str, text: str, window_seconds: int = 600) -> bool:
+    """Returns True if a duplicate send exists within the time window."""
+    h = _text_hash(text)
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=window_seconds)).isoformat(timespec="seconds")
+    try:
+        row = db.execute(
+            "SELECT 1 FROM outbound_send_log WHERE conversationId = ? AND textHash = ? AND sentAt > ?",
+            (conversation_id, h, cutoff),
+        ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+
+def _record_persistent_send(db, conversation_id: str, text: str) -> None:
+    """Record a send in the persistent dedupe log."""
+    h = _text_hash(text)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        db.execute(
+            "INSERT INTO outbound_send_log (conversationId, textHash, sentAt) VALUES (?, ?, ?)",
+            (conversation_id, h, now),
+        )
+        # Cleanup entries older than 24h
+        old_cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec="seconds")
+        db.execute("DELETE FROM outbound_send_log WHERE sentAt < ?", (old_cutoff,))
+    except Exception:
+        pass
 
 
 def _format_first_interaction_date(value: str) -> str:
@@ -4516,8 +4573,19 @@ def _try_ai_auto_reply(
                 db,
                 profile_name,
                 "info",
-                f"AI Auto ({trigger_reason}): duplicate send suppressed for {contact_name}",
+                f"AI Auto ({trigger_reason}): in-memory dedupe blocked for {contact_name}",
             )
+            return False
+        # Persistent DB-backed dedupe (survives restarts, 10-min window)
+        if _check_persistent_dedupe(db, conversation_id, reply_text, window_seconds=600):
+            LOGGER.info("[AI_AUTO] %s %s (%s): BLOCKED persistent dedupe", conversation_id[-12:], _dbg_contact, trigger_reason)
+            _release_skool_send_dedupe(conversation_id, reply_text)
+            return False
+        # Per-conversation send lock (prevents concurrent/recursive sends)
+        _conv_lock = _get_conversation_send_lock(conversation_id)
+        if not _conv_lock.acquire(blocking=False):
+            LOGGER.info("[AI_AUTO] %s %s (%s): BLOCKED send lock (concurrent send in progress)", conversation_id[-12:], _dbg_contact, trigger_reason)
+            _release_skool_send_dedupe(conversation_id, reply_text)
             return False
 
         profile_id = str(conversation_row["profileId"] or "").strip()
@@ -4552,13 +4620,13 @@ def _try_ai_auto_reply(
         )
         if not sent_card:
             _release_skool_send_dedupe(conversation_id, reply_text)
+            _conv_lock.release()
             _insert_backend_log(db, str(profile_row["name"] or profile_name), "error", f"AI Auto ({trigger_reason}): failed to send reply")
             return False
 
-        _upsert_skool_chat_card(db, sent_card)
-        _update_live_cache_with_skool_card(sent_card)
-        db.execute("UPDATE conversations SET unread = 0 WHERE id = ?", (conversation_id,))
-        # -- Mark outbound as AI-generated & schedule follow-up --
+        # -- CRITICAL ORDER: Mark isAiGenerated + lastAiOutboundAt BEFORE upsert --
+        # This prevents the recursive _try_ai_auto_reply inside upsert from bypassing guards.
+        _now_iso = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
         try:
             _latest_out = db.execute(
                 "SELECT id FROM messages WHERE conversationId = ? AND sender != 'inbound' ORDER BY rowid DESC LIMIT 1",
@@ -4566,7 +4634,6 @@ def _try_ai_auto_reply(
             ).fetchone()
             if _latest_out:
                 db.execute("UPDATE messages SET isAiGenerated = 1 WHERE id = ?", (_latest_out["id"],))
-            _now_iso = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
             _fu_settings = _load_or_create_automation_settings(db)
             _fu_s = _fu_settings.model_dump() if hasattr(_fu_settings, "model_dump") else {}
             _fu_enabled = _fu_s.get("followUpEnabled", False)
@@ -4582,6 +4649,12 @@ def _try_ai_auto_reply(
             )
         except Exception:
             LOGGER.exception("follow-up schedule failed for %s", conversation_id)
+        # Record in persistent dedupe log
+        _record_persistent_send(db, conversation_id, reply_text)
+        # Now safe to upsert (guards are set, dedupe is recorded)
+        _upsert_skool_chat_card(db, sent_card)
+        _update_live_cache_with_skool_card(sent_card)
+        db.execute("UPDATE conversations SET unread = 0 WHERE id = ?", (conversation_id,))
         _insert_backend_log(
             db,
             str(profile_row["name"] or profile_name),
@@ -4621,9 +4694,14 @@ def _try_ai_auto_reply(
                 )
         except Exception:
             pass
+        _conv_lock.release()
         return True
     except Exception:
         LOGGER.exception("AI Auto failed for conversation '%s' (%s)", conversation_id, trigger_reason)
+        try:
+            _conv_lock.release()
+        except Exception:
+            pass
         return False
 
 
@@ -5634,6 +5712,17 @@ def ensure_tables() -> None:
             db.execute("ALTER TABLE conversations ADD COLUMN aiAutoManualOff INTEGER NOT NULL DEFAULT 0")
         if "continuedAt" not in conversation_columns:
             db.execute("ALTER TABLE conversations ADD COLUMN continuedAt TEXT")
+        # -- Persistent outbound send dedupe log --
+        db.execute("""CREATE TABLE IF NOT EXISTS outbound_send_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversationId TEXT NOT NULL,
+            textHash TEXT NOT NULL,
+            sentAt TEXT NOT NULL
+        )""")
+        try:
+            db.execute("CREATE INDEX IF NOT EXISTS idx_send_log_conv_hash ON outbound_send_log (conversationId, textHash)")
+        except Exception:
+            pass
         # -- Follow-up automation column (messages) --
         message_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(messages)").fetchall()}
         if "isAiGenerated" not in message_columns:
@@ -8574,6 +8663,7 @@ def add_message(conversation_id: str, payload: MessageCreateModel):
                 _insert_backend_log(db, str(row["profileName"] or "SYSTEM"), "error", "DM send failed: unable to confirm sent message in Skool")
                 _release_skool_send_dedupe(conversation_id, payload_text)
                 raise HTTPException(502, "Failed to send message to Skool chat")
+            _record_persistent_send(db, conversation_id, payload_text)
             _upsert_skool_chat_card(db, sent_card)
             _update_live_cache_with_skool_card(sent_card)
             db.execute("UPDATE conversations SET unread = 0 WHERE id = ?", (conversation_id,))

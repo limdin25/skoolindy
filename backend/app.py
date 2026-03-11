@@ -5632,6 +5632,8 @@ def ensure_tables() -> None:
             db.execute("ALTER TABLE conversations ADD COLUMN lastAiOutboundAt TEXT")
         if "aiAutoManualOff" not in conversation_columns:
             db.execute("ALTER TABLE conversations ADD COLUMN aiAutoManualOff INTEGER NOT NULL DEFAULT 0")
+        if "continuedAt" not in conversation_columns:
+            db.execute("ALTER TABLE conversations ADD COLUMN continuedAt TEXT")
         # -- Follow-up automation column (messages) --
         message_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(messages)").fetchall()}
         if "isAiGenerated" not in message_columns:
@@ -6080,6 +6082,7 @@ class ConversationModel(BaseModel):
     followUpDueAt: Optional[str] = None
     lastAiOutboundAt: Optional[str] = None
     aiDmCount: int = 0
+    continuedAt: Optional[str] = None
     contactInfo: ContactInfoModel
     commentAttribution: CommentAttributionModel
     keywordContext: KeywordContextModel
@@ -6556,6 +6559,7 @@ def build_conversation_model(row: sqlite3.Row, messages: Dict[str, List[MessageM
         followUpDueAt=data.get("followUpDueAt"),
         lastAiOutboundAt=data.get("lastAiOutboundAt"),
         aiDmCount=int(data.get("_aiDmCount", 0) or 0),
+        continuedAt=str(data.get("continuedAt") or "") or None,
         contactInfo=ContactInfoModel(**parse_json_field(data["contactInfo"], {})),
         commentAttribution=CommentAttributionModel(**parse_json_field(data["commentAttribution"], {})),
         keywordContext=KeywordContextModel(**parse_json_field(data["keywordContext"], {})),
@@ -8480,6 +8484,10 @@ def continue_automation(conversation_id: str):
             message_changed=True,
             trigger_reason="continue_automation",
         )
+        if result:
+            # Mark conversation as manually continued (audit label)
+            _now_iso = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+            db.execute("UPDATE conversations SET continuedAt = ? WHERE id = ? AND continuedAt IS NULL", (_now_iso, conversation_id))
         db.commit()
         if result:
             row = db.execute("SELECT * FROM conversations WHERE id = ?", (conversation_id,)).fetchone()

@@ -176,6 +176,7 @@ export interface Conversation {
   followUpDueAt?: string | null;
   lastAiOutboundAt?: string | null;
   aiDmCount?: number;
+  continuedAt?: string | null;
   contactInfo: ContactInfo;
   commentAttribution: CommentAttribution;
   keywordContext: KeywordContext;

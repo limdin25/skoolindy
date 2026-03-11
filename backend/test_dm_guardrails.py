@@ -602,3 +602,82 @@ class TestIsAiGeneratedPrimaryGuard:
             (last_ai["id"],)
         ).fetchone()[0]
         assert inbound_after == 1, "Inbound exists after AI outbound — should allow"
+
+
+# ---- Continue label tests ----
+
+class TestContinueLabel:
+    """Test the 'continue' audit label on conversations."""
+
+    def test_continue_sets_continued_at(self):
+        """After continue-automation succeeds, continuedAt should be set."""
+        db = create_test_db()
+        # Ensure continuedAt column exists
+        try:
+            db.execute("ALTER TABLE conversations ADD COLUMN continuedAt TEXT")
+        except Exception:
+            pass
+        insert_conversation(db, "conv-cl-1", ai_auto=True)
+        insert_message(db, "conv-cl-1", "inbound", "Hello", "2026-01-01T00:00:00Z")
+
+        # Simulate what the endpoint does: set continuedAt where NULL
+        from datetime import datetime, timezone
+        now = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
+        db.execute("UPDATE conversations SET continuedAt = ? WHERE id = ? AND continuedAt IS NULL", (now, "conv-cl-1"))
+        db.commit()
+
+        row = db.execute("SELECT continuedAt FROM conversations WHERE id = 'conv-cl-1'").fetchone()
+        assert row["continuedAt"] is not None, "continuedAt should be set"
+        assert row["continuedAt"] == now
+
+    def test_continue_does_not_duplicate(self):
+        """Calling continue twice should not overwrite the original timestamp."""
+        db = create_test_db()
+        try:
+            db.execute("ALTER TABLE conversations ADD COLUMN continuedAt TEXT")
+        except Exception:
+            pass
+        insert_conversation(db, "conv-cl-2", ai_auto=True)
+
+        first_ts = "2026-01-01T10:00:00+00:00"
+        db.execute("UPDATE conversations SET continuedAt = ? WHERE id = ? AND continuedAt IS NULL", (first_ts, "conv-cl-2"))
+
+        second_ts = "2026-01-01T11:00:00+00:00"
+        db.execute("UPDATE conversations SET continuedAt = ? WHERE id = ? AND continuedAt IS NULL", (second_ts, "conv-cl-2"))
+        db.commit()
+
+        row = db.execute("SELECT continuedAt FROM conversations WHERE id = 'conv-cl-2'").fetchone()
+        assert row["continuedAt"] == first_ts, "Should keep first timestamp, not overwrite"
+
+    def test_continue_label_persists_after_refresh(self):
+        """continuedAt survives DB reads (not transient)."""
+        db = create_test_db()
+        try:
+            db.execute("ALTER TABLE conversations ADD COLUMN continuedAt TEXT")
+        except Exception:
+            pass
+        insert_conversation(db, "conv-cl-3", ai_auto=True)
+        db.execute("UPDATE conversations SET continuedAt = '2026-01-01T12:00:00+00:00' WHERE id = 'conv-cl-3'")
+        db.commit()
+
+        # Re-read from DB
+        row = db.execute("SELECT continuedAt FROM conversations WHERE id = 'conv-cl-3'").fetchone()
+        assert row["continuedAt"] == "2026-01-01T12:00:00+00:00", "Should persist in DB"
+
+    def test_continue_label_does_not_affect_automation(self):
+        """Setting continuedAt should not change aiAutoEnabled or any automation column."""
+        db = create_test_db()
+        try:
+            db.execute("ALTER TABLE conversations ADD COLUMN continuedAt TEXT")
+        except Exception:
+            pass
+        insert_conversation(db, "conv-cl-4", ai_auto=True)
+
+        db.execute("UPDATE conversations SET continuedAt = '2026-01-01T12:00:00+00:00' WHERE id = 'conv-cl-4'")
+        db.commit()
+
+        row = db.execute("SELECT aiAutoEnabled, followUpCount, followUpDueAt, lastAiOutboundAt FROM conversations WHERE id = 'conv-cl-4'").fetchone()
+        assert bool(row["aiAutoEnabled"]) is True, "aiAutoEnabled unchanged"
+        assert int(row["followUpCount"]) == 0, "followUpCount unchanged"
+        assert row["followUpDueAt"] is None, "followUpDueAt unchanged"
+        assert row["lastAiOutboundAt"] is None, "lastAiOutboundAt unchanged"

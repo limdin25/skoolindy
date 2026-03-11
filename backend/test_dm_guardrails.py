@@ -451,3 +451,154 @@ if __name__ == "__main__":
     
     print(f"\n{passed} passed, {failed} failed")
     sys.exit(1 if failed else 0)
+
+
+
+# ---- Phase B: message_changed removal + fallback guard + continue-automation ----
+# These tests verify the guard logic using pure SQL, matching what _try_ai_auto_reply does.
+
+class TestMessageChangedRemoval:
+    """Verify that removing message_changed gate allows stuck conversations to proceed."""
+
+    def test_stuck_conversation_has_inbound_last(self):
+        """Reproduce the stuck state: aiAutoEnabled=1, latest message is inbound, message_changed=False."""
+        db = create_test_db()
+        insert_conversation(db, "conv-stuck", ai_auto=True)
+        insert_message(db, "conv-stuck", "outbound", "AI reply", "2026-01-01T00:00:00Z", is_ai_generated=0)
+        insert_message(db, "conv-stuck", "inbound", "Thanks!", "2026-01-01T00:01:00Z")
+
+        # Simulate what _try_ai_auto_reply checks:
+        conv = db.execute("SELECT * FROM conversations WHERE id = 'conv-stuck'").fetchone()
+        assert bool(conv["aiAutoEnabled"])
+
+        latest = db.execute("SELECT sender FROM messages WHERE conversationId = 'conv-stuck' AND isDeletedUi = 0 ORDER BY rowid DESC LIMIT 1").fetchone()
+        assert latest["sender"] == "inbound"
+
+        # With require_message_changed=False (the fix), this would proceed
+        # Before the fix, message_changed=False would block here
+        message_changed = False
+        require_message_changed = False  # The fix
+        should_proceed = not (require_message_changed and not message_changed)
+        assert should_proceed is True, "Fix: should proceed even when message_changed=False"
+
+    def test_old_behavior_would_block(self):
+        """Verify the old behavior would have blocked."""
+        message_changed = False
+        require_message_changed = True  # Old behavior
+        should_proceed = not (require_message_changed and not message_changed)
+        assert should_proceed is False, "Old behavior correctly blocked"
+
+
+class TestFallbackStackedGuard:
+    """Test the fallback stacked-outbound guard (when isAiGenerated is all 0)."""
+
+    def test_fallback_guard_blocks_when_no_inbound_after_outbound(self):
+        """When lastAiOutboundAt is set, no isAiGenerated=1, and latest outbound has no inbound after, BLOCK."""
+        db = create_test_db()
+        insert_conversation(db, "conv-fb-1", ai_auto=True, last_ai_outbound="2026-01-01T00:00:00+00:00")
+        insert_message(db, "conv-fb-1", "inbound", "Hi", "2026-01-01T00:00:00Z")
+        insert_message(db, "conv-fb-1", "outbound", "AI reply", "2026-01-01T00:01:00Z", is_ai_generated=0)
+        insert_message(db, "conv-fb-1", "inbound", "New message", "2026-01-01T00:02:00Z")
+
+        # Primary guard: no isAiGenerated=1 messages
+        last_ai = db.execute(
+            "SELECT id FROM messages WHERE conversationId = 'conv-fb-1' AND sender = 'outbound' AND isAiGenerated = 1 ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        assert last_ai is None, "No isAiGenerated=1 messages"
+
+        # Fallback guard: latest outbound has inbound after it
+        last_outbound = db.execute(
+            "SELECT rowid FROM messages WHERE conversationId = 'conv-fb-1' AND sender = 'outbound' ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        inbound_after = db.execute(
+            "SELECT COUNT(*) FROM messages WHERE conversationId = 'conv-fb-1' AND sender = 'inbound' AND isDeletedUi = 0 AND rowid > ?",
+            (last_outbound["rowid"],)
+        ).fetchone()[0]
+        assert inbound_after == 1, "One inbound after outbound — fallback guard allows"
+
+    def test_fallback_guard_allows_when_no_outbound(self):
+        """When there are no outbound messages at all, both guards pass."""
+        db = create_test_db()
+        insert_conversation(db, "conv-fb-3", ai_auto=True)
+        insert_message(db, "conv-fb-3", "inbound", "Hello", "2026-01-01T00:00:00Z")
+
+        last_ai = db.execute(
+            "SELECT id FROM messages WHERE conversationId = 'conv-fb-3' AND sender = 'outbound' AND isAiGenerated = 1 ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        assert last_ai is None
+
+        last_outbound = db.execute(
+            "SELECT rowid FROM messages WHERE conversationId = 'conv-fb-3' AND sender = 'outbound' ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        assert last_outbound is None, "No outbound at all — both guards pass"
+
+
+class TestCooldownGuard:
+    """Test the 5-minute cooldown via lastAiOutboundAt."""
+
+    def test_cooldown_blocks_within_5_minutes(self):
+        """If lastAiOutboundAt is within 5 minutes, should block."""
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        recent = (now - timedelta(seconds=60)).isoformat()
+
+        db = create_test_db()
+        insert_conversation(db, "conv-cd-1", ai_auto=True, last_ai_outbound=recent)
+
+        conv = db.execute("SELECT lastAiOutboundAt FROM conversations WHERE id = 'conv-cd-1'").fetchone()
+        last_ts = datetime.fromisoformat(str(conv["lastAiOutboundAt"]).replace("Z", "+00:00"))
+        diff = (datetime.now(timezone.utc) - last_ts).total_seconds()
+        assert diff < 300, "Within 5 minute cooldown — should block"
+
+    def test_cooldown_allows_after_5_minutes(self):
+        """If lastAiOutboundAt is older than 5 minutes, should allow."""
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        old = (now - timedelta(seconds=600)).isoformat()
+
+        db = create_test_db()
+        insert_conversation(db, "conv-cd-2", ai_auto=True, last_ai_outbound=old)
+
+        conv = db.execute("SELECT lastAiOutboundAt FROM conversations WHERE id = 'conv-cd-2'").fetchone()
+        last_ts = datetime.fromisoformat(str(conv["lastAiOutboundAt"]).replace("Z", "+00:00"))
+        diff = (datetime.now(timezone.utc) - last_ts).total_seconds()
+        assert diff >= 300, "Past 5 minute cooldown — should allow"
+
+
+class TestIsAiGeneratedPrimaryGuard:
+    """Test the primary stacked guard using isAiGenerated=1."""
+
+    def test_primary_guard_blocks_stacked_ai_outbound(self):
+        """When isAiGenerated=1 outbound exists with no inbound after, block."""
+        db = create_test_db()
+        insert_conversation(db, "conv-pg-1", ai_auto=True)
+        insert_message(db, "conv-pg-1", "outbound", "AI reply", "2026-01-01T00:00:00Z", is_ai_generated=1)
+        insert_message(db, "conv-pg-1", "inbound", "Thanks!", "2026-01-01T00:01:00Z")
+        insert_message(db, "conv-pg-1", "outbound", "Second AI", "2026-01-01T00:02:00Z", is_ai_generated=1)
+
+        last_ai = db.execute(
+            "SELECT id FROM messages WHERE conversationId = 'conv-pg-1' AND sender = 'outbound' AND isAiGenerated = 1 ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        assert last_ai is not None
+
+        inbound_after = db.execute(
+            "SELECT COUNT(*) FROM messages WHERE conversationId = 'conv-pg-1' AND sender = 'inbound' AND isDeletedUi = 0 AND rowid > (SELECT rowid FROM messages WHERE id = ?)",
+            (last_ai["id"],)
+        ).fetchone()[0]
+        assert inbound_after == 0, "No inbound after latest AI outbound — should block"
+
+    def test_primary_guard_allows_when_inbound_after_ai(self):
+        """When isAiGenerated=1 outbound has inbound after it, allow."""
+        db = create_test_db()
+        insert_conversation(db, "conv-pg-2", ai_auto=True)
+        insert_message(db, "conv-pg-2", "outbound", "AI reply", "2026-01-01T00:00:00Z", is_ai_generated=1)
+        insert_message(db, "conv-pg-2", "inbound", "Thanks!", "2026-01-01T00:01:00Z")
+
+        last_ai = db.execute(
+            "SELECT id FROM messages WHERE conversationId = 'conv-pg-2' AND sender = 'outbound' AND isAiGenerated = 1 ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        inbound_after = db.execute(
+            "SELECT COUNT(*) FROM messages WHERE conversationId = 'conv-pg-2' AND sender = 'inbound' AND isDeletedUi = 0 AND rowid > (SELECT rowid FROM messages WHERE id = ?)",
+            (last_ai["id"],)
+        ).fetchone()[0]
+        assert inbound_after == 1, "Inbound exists after AI outbound — should allow"

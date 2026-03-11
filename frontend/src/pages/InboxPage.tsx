@@ -448,6 +448,39 @@ export default function InboxPage() {
     setShowBulkLabel(false);
   };
 
+  const [bulkAiPending, setBulkAiPending] = useState(false);
+
+  const handleBulkAiAuto = async (enabled: boolean) => {
+    if (selectedIds.length === 0) return;
+    setBulkAiPending(true);
+    try {
+      await Promise.all(selectedIds.map((id) => api.patchConversation(id, { aiAutoEnabled: enabled })));
+      setConversations((prev) => prev.map((c) =>
+        selectedIds.includes(c.id) ? { ...c, aiAutoEnabled: enabled } : c
+      ));
+      await refresh();
+      setSelectedIds([]);
+    } finally {
+      setBulkAiPending(false);
+    }
+  };
+
+  const handleAllFilteredAiAuto = async (enabled: boolean) => {
+    const ids = sortedFiltered.map((c) => c.id);
+    if (ids.length === 0) return;
+    setBulkAiPending(true);
+    try {
+      await Promise.all(ids.map((id) => api.patchConversation(id, { aiAutoEnabled: enabled })));
+      setConversations((prev) => prev.map((c) =>
+        ids.includes(c.id) ? { ...c, aiAutoEnabled: enabled } : c
+      ));
+      await refresh();
+      setSelectedIds([]);
+    } finally {
+      setBulkAiPending(false);
+    }
+  };
+
   const handleAddLabel = async () => {
     if (!newLabelName.trim()) return;
     await api.createLabel({ name: newLabelName, color: "bg-primary" });
@@ -501,7 +534,27 @@ export default function InboxPage() {
         <div className={`${isMobile ? 'w-full' : 'w-[380px]'} flex-shrink-0 border-r border-border flex flex-col bg-card overflow-hidden`}>
           <div className="p-4 border-b border-border space-y-3 flex-shrink-0">
             <div className="flex items-center justify-between">
-              <h2 className="text-base font-semibold text-foreground">Inbox</h2>
+              <div className="flex items-center gap-2">
+                <h2 className="text-base font-semibold text-foreground">Inbox</h2>
+                <div className="flex items-center gap-1 ml-2">
+                  <button
+                    onClick={() => handleAllFilteredAiAuto(true)}
+                    disabled={bulkAiPending || sortedFiltered.length === 0}
+                    className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-green-500/10 text-green-600 hover:bg-green-500/20 transition-colors disabled:opacity-50"
+                    title="Enable AI Auto for all filtered conversations"
+                  >
+                    <Sparkles className="w-3 h-3" /> All ON
+                  </button>
+                  <button
+                    onClick={() => handleAllFilteredAiAuto(false)}
+                    disabled={bulkAiPending || sortedFiltered.length === 0}
+                    className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-red-500/10 text-red-500 hover:bg-red-500/20 transition-colors disabled:opacity-50"
+                    title="Disable AI Auto for all filtered conversations"
+                  >
+                    <Sparkles className="w-3 h-3" /> All OFF
+                  </button>
+                </div>
+              </div>
               <button onClick={() => setShowLabelManager(true)} className="p-1.5 rounded-md hover:bg-muted transition-colors" title="Manage Labels">
                 <Tag className="w-4 h-4 text-muted-foreground" />
               </button>
@@ -548,6 +601,8 @@ export default function InboxPage() {
                   </div>
                 )}
               </div>
+              <button onClick={() => handleBulkAiAuto(true)} disabled={bulkAiPending} className="p-1.5 rounded-md hover:bg-muted" title="AI Auto ON for selected"><Sparkles className="w-3.5 h-3.5 text-green-500" /></button>
+              <button onClick={() => handleBulkAiAuto(false)} disabled={bulkAiPending} className="p-1.5 rounded-md hover:bg-muted" title="AI Auto OFF for selected"><X className="w-3.5 h-3.5 text-orange-500" /></button>
               <button onClick={handleBulkArchive} className="p-1.5 rounded-md hover:bg-muted" title="Archive"><Archive className="w-3.5 h-3.5 text-muted-foreground" /></button>
               <button onClick={handleBulkDelete} className="p-1.5 rounded-md hover:bg-muted" title="Delete"><Trash2 className="w-3.5 h-3.5 text-destructive" /></button>
             </div>

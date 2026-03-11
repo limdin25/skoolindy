@@ -100,3 +100,11 @@ export const useN8nTiming = (enabled = false) =>
     refetchOnWindowFocus: false,
     enabled,
   });
+
+export const useOpenAIModels = () =>
+  useQuery({
+    queryKey: ["openai-models"],
+    queryFn: () => api.getOpenAIModels(),
+    staleTime: 60000,
+    refetchInterval: 120000,
+  });

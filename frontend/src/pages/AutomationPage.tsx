@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { formatLiveCountdown } from "@/lib/utils";
 import { Clock3, Download, Info, Loader2, Play, Square, Upload, RotateCcw, Zap, Search, AlertCircle } from "lucide-react";
-import { useAutomationSettings, useN8nTiming, useQueue, useQueuePreview } from "@/hooks/useEngageFlow";
+import { useAutomationSettings, useN8nTiming, useOpenAIModels, useQueue, useQueuePreview } from "@/hooks/useEngageFlow";
 import { api } from "@/lib/api";
 import type { AutomationSettings } from "@/lib/types";
 import { toast } from "sonner";
@@ -39,35 +39,36 @@ function buildTime(hour12: number, minute: number, meridiem: "AM" | "PM") {
   return `${String(h24).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }
 
-const MODEL_PRESETS = [
-  { group: "Recommended", models: [
-    { value: "gpt-4o-mini", label: "gpt-4o-mini", desc: "Fast, affordable" },
-    { value: "gpt-4o", label: "gpt-4o", desc: "Strong general-purpose" },
-  ]},
-  { group: "Reasoning", models: [
-    { value: "o3-mini", label: "o3-mini", desc: "Reasoning, cost-effective" },
-    { value: "o1-mini", label: "o1-mini", desc: "Reasoning, compact" },
-    { value: "o1", label: "o1", desc: "Full reasoning" },
-  ]},
-  { group: "Legacy / Compatibility", models: [
-    { value: "gpt-4-turbo", label: "gpt-4-turbo", desc: "Previous flagship" },
-    { value: "gpt-3.5-turbo", label: "gpt-3.5-turbo", desc: "Cheapest, fast" },
-  ]},
-];
-const ALL_PRESET_VALUES = MODEL_PRESETS.flatMap(g => g.models.map(m => m.value));
+const FALLBACK_MODELS = ["gpt-4o-mini", "gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo", "o3-mini", "o1-mini"];
 
-function ModelPicker({ label, value, defaultVal, onChange, allowEmpty, emptyLabel }: {
+// Filter to text chat completion models — exclude non-chat variants and dated snapshots
+const CHAT_EXCLUDE_PATTERNS = ["-audio", "-realtime", "-tts", "-transcribe", "-search", "-diarize", "-instruct", "-image", "chatgpt-image", "gpt-image", "gpt-audio", "gpt-realtime", "-codex"];
+const DATE_SNAPSHOT_RE = /-(20\d{2})-/;
+function isChatModel(id: string): boolean {
+  if (!id.startsWith("gpt-") && !id.startsWith("o1") && !id.startsWith("o3") && !id.startsWith("o4")) return false;
+  if (CHAT_EXCLUDE_PATTERNS.some(p => id.includes(p))) return false;
+  // Exclude dated snapshots (e.g. gpt-4o-2024-08-06) — keep canonical aliases only
+  if (DATE_SNAPSHOT_RE.test(id)) return false;
+  return true;
+}
+
+function ModelPicker({ label, value, defaultVal, onChange, allowEmpty, emptyLabel, liveModels, liveLoading, liveError }: {
   label: string;
   value: string;
   defaultVal: string;
   onChange: (v: string) => void;
   allowEmpty?: boolean;
   emptyLabel?: string;
+  liveModels: string[];
+  liveLoading: boolean;
+  liveError?: string;
 }) {
   const [customMode, setCustomMode] = useState(false);
   const [customText, setCustomText] = useState("");
-  const isPreset = ALL_PRESET_VALUES.includes(value) || (allowEmpty && value === "");
-  const showCustom = customMode || (!isPreset && value !== "");
+
+  const models = liveModels.length > 0 ? liveModels : FALLBACK_MODELS;
+  const isInList = models.includes(value) || (allowEmpty && value === "");
+  const showCustom = customMode || (!isInList && value !== "");
 
   return (
     <div>
@@ -75,7 +76,7 @@ function ModelPicker({ label, value, defaultVal, onChange, allowEmpty, emptyLabe
       {!showCustom ? (
         <select
           className="w-full rounded-md border bg-background px-3 py-2 text-sm"
-          value={value}
+          value={isInList ? value : "__custom__"}
           onChange={(e) => {
             if (e.target.value === "__custom__") {
               setCustomMode(true);
@@ -86,18 +87,10 @@ function ModelPicker({ label, value, defaultVal, onChange, allowEmpty, emptyLabe
           }}
         >
           {allowEmpty && <option value="">{emptyLabel}</option>}
-          {MODEL_PRESETS.map(g => (
-            <optgroup key={g.group} label={g.group}>
-              {g.models.map(m => (
-                <option key={m.value} value={m.value}>
-                  {m.label}{m.value === defaultVal && !allowEmpty ? " (default)" : ""} — {m.desc}
-                </option>
-              ))}
-            </optgroup>
+          {models.map(m => (
+            <option key={m} value={m}>{m}{m === defaultVal && !allowEmpty ? " (default)" : ""}</option>
           ))}
-          <optgroup label="Other">
-            <option value="__custom__">Custom model name...</option>
-          </optgroup>
+          <option value="__custom__">Custom model name...</option>
         </select>
       ) : (
         <div className="flex gap-2 items-center">
@@ -109,21 +102,21 @@ function ModelPicker({ label, value, defaultVal, onChange, allowEmpty, emptyLabe
               setCustomText(e.target.value);
               if (e.target.value.trim()) onChange(e.target.value.trim());
             }}
-            onBlur={() => {
-              if (customText.trim()) onChange(customText.trim());
-            }}
-            placeholder="e.g. gpt-4.1-mini"
+            onBlur={() => { if (customText.trim()) onChange(customText.trim()); }}
+            placeholder="e.g. ft:gpt-4o-mini:my-org:name:id"
             autoFocus={customMode}
           />
           <button
             className="px-2.5 py-2 rounded-md text-xs text-muted-foreground hover:bg-muted border border-border whitespace-nowrap"
             onClick={() => { setCustomMode(false); setCustomText(""); onChange(defaultVal); }}
-            title="Back to presets"
-          >Presets</button>
+          >List</button>
         </div>
       )}
-      {showCustom && value && !isPreset && (
-        <p className="text-[10px] text-muted-foreground/60 mt-1">Using custom model: <span className="font-mono">{value}</span></p>
+      {showCustom && value && !isInList && (
+        <p className="text-[10px] text-muted-foreground/60 mt-1">Custom: <span className="font-mono">{value}</span></p>
+      )}
+      {liveError && liveModels.length === 0 && (
+        <p className="text-[10px] text-orange-500/80 mt-1">Live model list unavailable. Showing fallback presets.</p>
       )}
     </div>
   );
@@ -131,6 +124,7 @@ function ModelPicker({ label, value, defaultVal, onChange, allowEmpty, emptyLabe
 
 export default function AutomationPage() {
   const settingsQuery = useAutomationSettings();
+  const openaiModelsQuery = useOpenAIModels();
   const { engineStatus, logs, refresh } = useBackend();
   const [settings, setSettings] = useState<AutomationSettings | null>(settingsQuery.data ?? null);
   const [showTooltip, setShowTooltip] = useState(false);
@@ -783,12 +777,12 @@ export default function AutomationPage() {
         </SettingsCard>
 
         <SettingsCard title="AI Model Selection">
-          <p className="text-xs text-muted-foreground mb-3">Choose which OpenAI model to use for each type of AI generation.</p>
-          <p className="text-[11px] text-muted-foreground/70 mb-3">Available models depend on your OpenAI API account. Use "Custom" for newer or fine-tuned models.</p>
+          <p className="text-xs text-muted-foreground mb-3">Models loaded live from your OpenAI API key. Use "Custom" for fine-tuned or unlisted models.</p>
           <div className="space-y-3">
-            <ModelPicker label="DM Reply Model" value={settings.dmModel ?? "gpt-4o-mini"} defaultVal="gpt-4o-mini" onChange={(v) => updateAndSaveNow({ dmModel: v })} />
-            <ModelPicker label="Follow-Up Model" value={settings.followUpModel ?? ""} defaultVal="" onChange={(v) => updateAndSaveNow({ followUpModel: v })} allowEmpty emptyLabel="Same as DM model" />
-            <ModelPicker label="Comment Model" value={settings.commentModel ?? "gpt-3.5-turbo"} defaultVal="gpt-3.5-turbo" onChange={(v) => updateAndSaveNow({ commentModel: v })} />
+            {openaiModelsQuery.isLoading && <p className="text-[11px] text-muted-foreground animate-pulse">Loading models from OpenAI...</p>}
+            <ModelPicker label="DM Reply Model" value={settings.dmModel ?? "gpt-4o-mini"} defaultVal="gpt-4o-mini" onChange={(v) => updateAndSaveNow({ dmModel: v })} liveModels={(openaiModelsQuery.data?.models ?? []).map(m => m.id).filter(isChatModel)} liveLoading={openaiModelsQuery.isLoading} liveError={openaiModelsQuery.data?.error} />
+            <ModelPicker label="Follow-Up Model" value={settings.followUpModel ?? ""} defaultVal="" onChange={(v) => updateAndSaveNow({ followUpModel: v })} allowEmpty emptyLabel="Same as DM model" liveModels={(openaiModelsQuery.data?.models ?? []).map(m => m.id).filter(isChatModel)} liveLoading={openaiModelsQuery.isLoading} liveError={openaiModelsQuery.data?.error} />
+            <ModelPicker label="Comment Model" value={settings.commentModel ?? "gpt-3.5-turbo"} defaultVal="gpt-3.5-turbo" onChange={(v) => updateAndSaveNow({ commentModel: v })} liveModels={(openaiModelsQuery.data?.models ?? []).map(m => m.id).filter(isChatModel)} liveLoading={openaiModelsQuery.isLoading} liveError={openaiModelsQuery.data?.error} />
           </div>
         </SettingsCard>
 

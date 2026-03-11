@@ -358,6 +358,7 @@ export const api = {
   automationTestOpenAI: (payload: { apiKey: string; prompt?: string }) =>
     request<{ success: boolean; message: string; response: string }>(`/automation/test-openai`, { method: "POST", body: JSON.stringify(payload) }),
 
+  getOpenAIModels: () => request<{ success: boolean; models: Array<{ id: string; owned_by: string }>; error?: string }>(`/automation/openai-models`),
   getOpenAIKey: () => request<{ success: boolean; apiKey: string; isConfigured: boolean }>(`/automation/openai-key`),
   updateOpenAIKey: (payload: { apiKey: string }) =>
     request<{ success: boolean; isConfigured: boolean }>(`/automation/openai-key`, { method: "PUT", body: JSON.stringify(payload) }),

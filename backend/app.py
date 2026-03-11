@@ -8773,6 +8773,34 @@ def automation_get_openai_key(request: Request):
     }
 
 
+@app.get("/automation/openai-models")
+def automation_list_openai_models():
+    """Fetch available models from the OpenAI API using the saved key."""
+    api_key = _get_openai_key_for_dm()
+    if not api_key:
+        return {"success": False, "models": [], "error": "No OpenAI API key configured"}
+    try:
+        resp = requests.get(
+            "https://api.openai.com/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return {"success": False, "models": [], "error": f"OpenAI API returned {resp.status_code}"}
+        data = resp.json()
+        raw_models = data.get("data") or []
+        # Return id and owned_by for each model, sorted by id
+        models = sorted(
+            [{"id": str(m.get("id", "")), "owned_by": str(m.get("owned_by", ""))} for m in raw_models if m.get("id")],
+            key=lambda m: m["id"],
+        )
+        return {"success": True, "models": models}
+    except requests.Timeout:
+        return {"success": False, "models": [], "error": "OpenAI API request timed out"}
+    except Exception as e:
+        return {"success": False, "models": [], "error": str(e)[:200]}
+
+
 @app.put("/automation/openai-key")
 def automation_set_openai_key(payload: OpenAIKeyUpdateRequest, request: Request):
     engine = get_automation_engine(request)

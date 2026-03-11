@@ -470,22 +470,23 @@ export default function DashboardPage() {
   })();
 
   const nextCountdown = (() => {
-    // n8n mode: derive ALL state from queue_items only
+    // n8n mode: use real queue items and n8nTiming as source of truth
     if (isN8nMode) {
       if (queue.length === 0) {
         const armed = settings?.masterEnabled;
         if (!armed) return "Stopped";
-        // Show projected countdown if available
-        const projParsed = queuePreview
-          .filter((p: any) => p.isProjected && p.scheduledFor)
-          .map((p: any) => ({ ts: new Date(String(p.scheduledFor)).getTime() }))
-          .filter((e: any) => Number.isFinite(e.ts) && e.ts > nowMs)
-          .sort((a: any, b: any) => a.ts - b.ts);
-        if (projParsed.length > 0) {
-          const sec = Math.floor((projParsed[0].ts - nowMs) / 1000);
-          return sec > 0 ? formatCountdown(sec) : "Scanning…";
+        // Use real nextScheduledFor from backend (persisted queue item timestamp)
+        const realNext = n8nTiming?.nextScheduledFor;
+        if (realNext) {
+          const realTs = new Date(String(realNext)).getTime();
+          if (Number.isFinite(realTs) && realTs > nowMs) {
+            const sec = Math.floor((realTs - nowMs) / 1000);
+            return sec > 0 ? formatCountdown(sec) : "Executing…";
+          }
+          return "Executing…";
         }
-        return "No actions planned";
+        // No real scheduled item — show idle, not fake projection
+        return "Idle";
       }
       // Real queue items exist - find earliest future
       const realParsed = queue.map(item => ({
@@ -662,24 +663,21 @@ export default function DashboardPage() {
               <p className="text-xs text-muted-foreground mt-1">
                 {queue.length > 0 ? (
                   <><span className="text-success font-medium">Running</span>{" \u00b7 "}{queue.length} pending</>
-                ) : queuePreview.length > 0 ? (
-                  <><span className="text-info font-medium">Projected</span>{" \u00b7 "}next planned comment</>
+                ) : n8nTiming?.nextScheduledFor ? (
+                  <><span className="text-info font-medium">Scheduled</span>{" \u00b7 "}next queued action</>
                 ) : (
-                  "No upcoming actions"
+                  <><span className="text-muted-foreground">Idle</span>{" \u00b7 "}no actions in queue</>
                 )}
               </p>
               {queue.length > 0 && nextQueueItem ? (
                 <p className="text-[11px] text-muted-foreground mt-1">
                   Next queued: {nextQueueItem.profile} &gt; {nextQueueItem.community}{" \u00b7 "}<span className="text-primary">{nextQueueItem.keyword}</span>
                 </p>
-              ) : queue.length === 0 && queuePreview.length > 0 && (() => {
-                const first = queuePreview.find((p: any) => p.isProjected);
-                return first ? (
-                  <p className="text-[11px] text-muted-foreground/70 mt-1 italic">
-                    Next planned: {(first as any).profile} &gt; {(first as any).community}
-                  </p>
-                ) : null;
-              })()}
+              ) : queue.length === 0 && n8nTiming?.nextScheduledFor ? (
+                <p className="text-[11px] text-muted-foreground/70 mt-1 italic">
+                  Next: {new Date(String(n8nTiming.nextScheduledFor)).toLocaleString()}
+                </p>
+              ) : null}
             </>
           ) : (
             <>

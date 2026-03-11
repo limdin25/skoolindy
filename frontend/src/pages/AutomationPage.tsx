@@ -39,6 +39,96 @@ function buildTime(hour12: number, minute: number, meridiem: "AM" | "PM") {
   return `${String(h24).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }
 
+const MODEL_PRESETS = [
+  { group: "Recommended", models: [
+    { value: "gpt-4o-mini", label: "gpt-4o-mini", desc: "Fast, affordable" },
+    { value: "gpt-4o", label: "gpt-4o", desc: "Strong general-purpose" },
+  ]},
+  { group: "Reasoning", models: [
+    { value: "o3-mini", label: "o3-mini", desc: "Reasoning, cost-effective" },
+    { value: "o1-mini", label: "o1-mini", desc: "Reasoning, compact" },
+    { value: "o1", label: "o1", desc: "Full reasoning" },
+  ]},
+  { group: "Legacy / Compatibility", models: [
+    { value: "gpt-4-turbo", label: "gpt-4-turbo", desc: "Previous flagship" },
+    { value: "gpt-3.5-turbo", label: "gpt-3.5-turbo", desc: "Cheapest, fast" },
+  ]},
+];
+const ALL_PRESET_VALUES = MODEL_PRESETS.flatMap(g => g.models.map(m => m.value));
+
+function ModelPicker({ label, value, defaultVal, onChange, allowEmpty, emptyLabel }: {
+  label: string;
+  value: string;
+  defaultVal: string;
+  onChange: (v: string) => void;
+  allowEmpty?: boolean;
+  emptyLabel?: string;
+}) {
+  const [customMode, setCustomMode] = useState(false);
+  const [customText, setCustomText] = useState("");
+  const isPreset = ALL_PRESET_VALUES.includes(value) || (allowEmpty && value === "");
+  const showCustom = customMode || (!isPreset && value !== "");
+
+  return (
+    <div>
+      <label className="block text-xs font-medium text-muted-foreground mb-1">{label}</label>
+      {!showCustom ? (
+        <select
+          className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+          value={value}
+          onChange={(e) => {
+            if (e.target.value === "__custom__") {
+              setCustomMode(true);
+              setCustomText(value || "");
+              return;
+            }
+            onChange(e.target.value);
+          }}
+        >
+          {allowEmpty && <option value="">{emptyLabel}</option>}
+          {MODEL_PRESETS.map(g => (
+            <optgroup key={g.group} label={g.group}>
+              {g.models.map(m => (
+                <option key={m.value} value={m.value}>
+                  {m.label}{m.value === defaultVal && !allowEmpty ? " (default)" : ""} — {m.desc}
+                </option>
+              ))}
+            </optgroup>
+          ))}
+          <optgroup label="Other">
+            <option value="__custom__">Custom model name...</option>
+          </optgroup>
+        </select>
+      ) : (
+        <div className="flex gap-2 items-center">
+          <input
+            type="text"
+            className="flex-1 rounded-md border bg-background px-3 py-2 text-sm font-mono"
+            value={customMode ? customText : value}
+            onChange={(e) => {
+              setCustomText(e.target.value);
+              if (e.target.value.trim()) onChange(e.target.value.trim());
+            }}
+            onBlur={() => {
+              if (customText.trim()) onChange(customText.trim());
+            }}
+            placeholder="e.g. gpt-4.1-mini"
+            autoFocus={customMode}
+          />
+          <button
+            className="px-2.5 py-2 rounded-md text-xs text-muted-foreground hover:bg-muted border border-border whitespace-nowrap"
+            onClick={() => { setCustomMode(false); setCustomText(""); onChange(defaultVal); }}
+            title="Back to presets"
+          >Presets</button>
+        </div>
+      )}
+      {showCustom && value && !isPreset && (
+        <p className="text-[10px] text-muted-foreground/60 mt-1">Using custom model: <span className="font-mono">{value}</span></p>
+      )}
+    </div>
+  );
+}
+
 export default function AutomationPage() {
   const settingsQuery = useAutomationSettings();
   const { engineStatus, logs, refresh } = useBackend();
@@ -693,61 +783,13 @@ export default function AutomationPage() {
         </SettingsCard>
 
         <SettingsCard title="AI Model Selection">
-          <p className="text-xs text-muted-foreground mb-3">Choose which OpenAI model to use for each type of AI generation. Pick a preset or type a custom model name.</p>
-          <p className="text-[11px] text-muted-foreground/70 mb-3">Custom model names must exist in your OpenAI account. Invalid names will cause API errors (logged, not crashes).</p>
-          {(() => {
-            const presets = ["gpt-4o-mini", "gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo", "o1-mini"];
-            const ModelPicker = ({ label, settingsKey, defaultVal, allowEmpty, emptyLabel }: { label: string; settingsKey: "dmModel" | "followUpModel" | "commentModel"; defaultVal: string; allowEmpty?: boolean; emptyLabel?: string }) => {
-              const current = (settings as any)[settingsKey] ?? defaultVal;
-              const isCustom = current !== "" && !presets.includes(current) && !(allowEmpty && current === "");
-              return (
-                <div>
-                  <label className="block text-xs font-medium text-muted-foreground mb-1">{label}</label>
-                  <div className="flex gap-2">
-                    <select
-                      className="flex-1 rounded-md border bg-background px-3 py-2 text-sm"
-                      value={isCustom ? "__custom__" : current}
-                      onChange={(e) => {
-                        if (e.target.value === "__custom__") {
-                          updateAndSaveNow({ [settingsKey]: current || "custom-model" });
-                          return;
-                        }
-                        updateAndSaveNow({ [settingsKey]: e.target.value });
-                      }}
-                    >
-                      {allowEmpty && <option value="">{emptyLabel}</option>}
-                      {presets.map(m => <option key={m} value={m}>{m}{m === defaultVal && !allowEmpty ? " (default)" : ""}</option>)}
-                      <option value="__custom__">Custom...</option>
-                    </select>
-                  </div>
-                  {isCustom && (
-                    <div className="mt-1.5 flex gap-2 items-center">
-                      <input
-                        type="text"
-                        className="flex-1 rounded-md border bg-background px-3 py-2 text-sm font-mono"
-                        value={current}
-                        onChange={(e) => updateAndSaveNow({ [settingsKey]: e.target.value })}
-                        placeholder="e.g. gpt-5-turbo"
-                      />
-                      <button
-                        className="px-2 py-2 rounded-md text-xs text-muted-foreground hover:bg-muted border border-border"
-                        onClick={() => updateAndSaveNow({ [settingsKey]: defaultVal })}
-                        title="Reset to default"
-                      >Reset</button>
-                    </div>
-                  )}
-                  {!isCustom && current === "__custom__" ? null : null}
-                </div>
-              );
-            };
-            return (
-              <div className="space-y-3">
-                <ModelPicker label="DM Reply Model" settingsKey="dmModel" defaultVal="gpt-4o-mini" />
-                <ModelPicker label="Follow-Up Model" settingsKey="followUpModel" defaultVal="" allowEmpty emptyLabel="Same as DM model" />
-                <ModelPicker label="Comment Model" settingsKey="commentModel" defaultVal="gpt-3.5-turbo" />
-              </div>
-            );
-          })()}
+          <p className="text-xs text-muted-foreground mb-3">Choose which OpenAI model to use for each type of AI generation.</p>
+          <p className="text-[11px] text-muted-foreground/70 mb-3">Available models depend on your OpenAI API account. Use "Custom" for newer or fine-tuned models.</p>
+          <div className="space-y-3">
+            <ModelPicker label="DM Reply Model" value={settings.dmModel ?? "gpt-4o-mini"} defaultVal="gpt-4o-mini" onChange={(v) => updateAndSaveNow({ dmModel: v })} />
+            <ModelPicker label="Follow-Up Model" value={settings.followUpModel ?? ""} defaultVal="" onChange={(v) => updateAndSaveNow({ followUpModel: v })} allowEmpty emptyLabel="Same as DM model" />
+            <ModelPicker label="Comment Model" value={settings.commentModel ?? "gpt-3.5-turbo"} defaultVal="gpt-3.5-turbo" onChange={(v) => updateAndSaveNow({ commentModel: v })} />
+          </div>
         </SettingsCard>
 
         <SettingsCard title="Follow-Up Automation">

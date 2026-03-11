@@ -693,52 +693,61 @@ export default function AutomationPage() {
         </SettingsCard>
 
         <SettingsCard title="AI Model Selection">
-          <p className="text-xs text-muted-foreground mb-3">Choose which OpenAI model to use for each type of AI generation.</p>
-          <div className="space-y-3">
-            <div>
-              <label className="block text-xs font-medium text-muted-foreground mb-1">DM Reply Model</label>
-              <select
-                className="w-full rounded-md border bg-background px-3 py-2 text-sm"
-                value={settings.dmModel ?? "gpt-4o-mini"}
-                onChange={(e) => updateAndSaveNow({ dmModel: e.target.value })}
-              >
-                <option value="gpt-4o-mini">gpt-4o-mini (default)</option>
-                <option value="gpt-4o">gpt-4o</option>
-                <option value="gpt-4-turbo">gpt-4-turbo</option>
-                <option value="gpt-3.5-turbo">gpt-3.5-turbo</option>
-                <option value="o1-mini">o1-mini</option>
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-muted-foreground mb-1">Follow-Up Model</label>
-              <select
-                className="w-full rounded-md border bg-background px-3 py-2 text-sm"
-                value={settings.followUpModel ?? ""}
-                onChange={(e) => updateAndSaveNow({ followUpModel: e.target.value })}
-              >
-                <option value="">Same as DM model</option>
-                <option value="gpt-4o-mini">gpt-4o-mini</option>
-                <option value="gpt-4o">gpt-4o</option>
-                <option value="gpt-4-turbo">gpt-4-turbo</option>
-                <option value="gpt-3.5-turbo">gpt-3.5-turbo</option>
-                <option value="o1-mini">o1-mini</option>
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-muted-foreground mb-1">Comment Model</label>
-              <select
-                className="w-full rounded-md border bg-background px-3 py-2 text-sm"
-                value={settings.commentModel ?? "gpt-3.5-turbo"}
-                onChange={(e) => updateAndSaveNow({ commentModel: e.target.value })}
-              >
-                <option value="gpt-3.5-turbo">gpt-3.5-turbo (default)</option>
-                <option value="gpt-4o-mini">gpt-4o-mini</option>
-                <option value="gpt-4o">gpt-4o</option>
-                <option value="gpt-4-turbo">gpt-4-turbo</option>
-                <option value="o1-mini">o1-mini</option>
-              </select>
-            </div>
-          </div>
+          <p className="text-xs text-muted-foreground mb-3">Choose which OpenAI model to use for each type of AI generation. Pick a preset or type a custom model name.</p>
+          <p className="text-[11px] text-muted-foreground/70 mb-3">Custom model names must exist in your OpenAI account. Invalid names will cause API errors (logged, not crashes).</p>
+          {(() => {
+            const presets = ["gpt-4o-mini", "gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo", "o1-mini"];
+            const ModelPicker = ({ label, settingsKey, defaultVal, allowEmpty, emptyLabel }: { label: string; settingsKey: "dmModel" | "followUpModel" | "commentModel"; defaultVal: string; allowEmpty?: boolean; emptyLabel?: string }) => {
+              const current = (settings as any)[settingsKey] ?? defaultVal;
+              const isCustom = current !== "" && !presets.includes(current) && !(allowEmpty && current === "");
+              return (
+                <div>
+                  <label className="block text-xs font-medium text-muted-foreground mb-1">{label}</label>
+                  <div className="flex gap-2">
+                    <select
+                      className="flex-1 rounded-md border bg-background px-3 py-2 text-sm"
+                      value={isCustom ? "__custom__" : current}
+                      onChange={(e) => {
+                        if (e.target.value === "__custom__") {
+                          updateAndSaveNow({ [settingsKey]: current || "custom-model" });
+                          return;
+                        }
+                        updateAndSaveNow({ [settingsKey]: e.target.value });
+                      }}
+                    >
+                      {allowEmpty && <option value="">{emptyLabel}</option>}
+                      {presets.map(m => <option key={m} value={m}>{m}{m === defaultVal && !allowEmpty ? " (default)" : ""}</option>)}
+                      <option value="__custom__">Custom...</option>
+                    </select>
+                  </div>
+                  {isCustom && (
+                    <div className="mt-1.5 flex gap-2 items-center">
+                      <input
+                        type="text"
+                        className="flex-1 rounded-md border bg-background px-3 py-2 text-sm font-mono"
+                        value={current}
+                        onChange={(e) => updateAndSaveNow({ [settingsKey]: e.target.value })}
+                        placeholder="e.g. gpt-5-turbo"
+                      />
+                      <button
+                        className="px-2 py-2 rounded-md text-xs text-muted-foreground hover:bg-muted border border-border"
+                        onClick={() => updateAndSaveNow({ [settingsKey]: defaultVal })}
+                        title="Reset to default"
+                      >Reset</button>
+                    </div>
+                  )}
+                  {!isCustom && current === "__custom__" ? null : null}
+                </div>
+              );
+            };
+            return (
+              <div className="space-y-3">
+                <ModelPicker label="DM Reply Model" settingsKey="dmModel" defaultVal="gpt-4o-mini" />
+                <ModelPicker label="Follow-Up Model" settingsKey="followUpModel" defaultVal="" allowEmpty emptyLabel="Same as DM model" />
+                <ModelPicker label="Comment Model" settingsKey="commentModel" defaultVal="gpt-3.5-turbo" />
+              </div>
+            );
+          })()}
         </SettingsCard>
 
         <SettingsCard title="Follow-Up Automation">

@@ -6,7 +6,7 @@ import { Plus, Pencil, X, Sparkles, Users } from "lucide-react";
 
 const defaultPersonas = ["Growth Consultant", "Outreach Specialist", "Product Expert", "Marketing Strategist", "Tech Advisor"];
 
-export function KeywordsContent() {
+export function KeywordsContent({ compact }: { compact?: boolean } = {}) {
   const keywordRulesQuery = useKeywordRules();
   const profilesQuery = useProfiles();
 
@@ -122,8 +122,8 @@ export function KeywordsContent() {
             <tr className="border-b border-border bg-muted/30">
               <th className="text-left px-5 py-3 text-xs font-semibold text-muted-foreground uppercase tracking-wider">Keyword</th>
               <th className="text-left px-5 py-3 text-xs font-semibold text-muted-foreground uppercase tracking-wider">Persona</th>
-              <th className="text-left px-5 py-3 text-xs font-semibold text-muted-foreground uppercase tracking-wider hidden lg:table-cell">Prompt Preview</th>
-              <th className="text-left px-5 py-3 text-xs font-semibold text-muted-foreground uppercase tracking-wider hidden md:table-cell">Profiles</th>
+              <th className={`text-left px-5 py-3 text-xs font-semibold text-muted-foreground uppercase tracking-wider ${compact ? "hidden" : "hidden lg:table-cell"}`}>Prompt Preview</th>
+              <th className={`text-left px-5 py-3 text-xs font-semibold text-muted-foreground uppercase tracking-wider ${compact ? "hidden" : "hidden md:table-cell"}`}>Profiles</th>
               <th className="text-center px-5 py-3 text-xs font-semibold text-muted-foreground uppercase tracking-wider">Active</th>
               <th className="px-5 py-3"></th>
             </tr>
@@ -137,8 +137,8 @@ export function KeywordsContent() {
                   </span>
                 </td>
                 <td className="px-5 py-3.5 text-sm text-muted-foreground">{rule.persona}</td>
-                <td className="px-5 py-3.5 text-xs text-muted-foreground max-w-xs truncate hidden lg:table-cell">{rule.promptPreview}</td>
-                <td className="px-5 py-3.5 hidden md:table-cell">
+                <td className={`px-5 py-3.5 text-xs text-muted-foreground max-w-xs truncate ${compact ? "hidden" : "hidden lg:table-cell"}`}>{rule.promptPreview}</td>
+                <td className={`px-5 py-3.5 ${compact ? "hidden" : "hidden md:table-cell"}`}>
                   {rule.assignedProfileIds.length === 0 ? (
                     <span className="text-xs text-muted-foreground">All profiles</span>
                   ) : (

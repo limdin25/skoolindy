@@ -932,8 +932,8 @@ export default function AutomationPage() {
         </button>
       </div>
     </div>
-      <div className="hidden xl:block w-[480px] flex-shrink-0">
-        <KeywordsContent />
+      <div className="hidden xl:block w-[560px] flex-shrink-0 overflow-x-auto">
+        <KeywordsContent compact />
       </div>
     </div>
   );

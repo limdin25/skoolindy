@@ -278,8 +278,9 @@ async def _run_auto_scan(app: FastAPI, settings_dict: dict) -> None:
                         break
                 try:
                     from automation.engine import _openai_generate_comment_rest
-                    _cm_settings = _load_or_create_automation_settings(db)
-                    _cm_model = str(getattr(_cm_settings, "commentModel", "") or "").strip()
+                    with get_db() as db_cm:
+                        _cm_settings = _load_or_create_automation_settings(db_cm)
+                        _cm_model = str(getattr(_cm_settings, "commentModel", "") or "").strip()
                     generated = _openai_generate_comment_rest(openai_key, prompt_used, post_text[:4000], model=_cm_model)
                 except Exception:
                     continue

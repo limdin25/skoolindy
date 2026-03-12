@@ -6442,16 +6442,18 @@ def _needs_max_completion_tokens(model: str) -> bool:
     return m.startswith(("gpt-5", "gpt-4.1", "o1", "o3", "o4"))
 
 
-def _openai_generate_dm_rest(api_key: str, model: str, system_prompt: str, user_prompt: str) -> str:
+def _openai_generate_dm_rest(api_key: str, model: str, system_prompt: str, user_prompt: str, messages: list = None) -> str:
     if not api_key:
         raise RuntimeError("OpenAI API key missing")
     token_param = "max_completion_tokens" if _needs_max_completion_tokens(model) else "max_tokens"
-    payload = {
-        "model": model,
-        "messages": [
+    if messages is None:
+        messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
-        ],
+        ]
+    payload = {
+        "model": model,
+        "messages": messages,
         token_param: 160,
         "temperature": 0.65,
     }
@@ -6572,26 +6574,33 @@ def _generate_conversation_ai_suggest(
     source = source_parts[0]
 
     message_rows = db.execute(
-        "SELECT sender, text, timestamp FROM messages WHERE conversationId = ? AND isDeletedUi = 0 ORDER BY rowid DESC LIMIT 8",
+        "SELECT text, sender, timestamp FROM messages WHERE conversationId = ? AND isDeletedUi = 0 ORDER BY rowid ASC LIMIT 20",
         (conversation_id,),
     ).fetchall()
-    history_rows = list(reversed(message_rows))
-    history_lines = []
-    for item in history_rows:
-        sender = "me" if str(item["sender"]).strip().lower() == "outbound" else "them"
-        text = str(item["text"] or "").strip().replace("\n", " ")
-        if not text:
-            continue
-        history_lines.append(f"{sender}: {text[:280]}")
-    history = "\n".join(history_lines) if history_lines else "(no prior messages)"
 
     system_prompt = (
         "You write direct-response outreach DMs. English only. "
         f"{_tone_instruction(tone)} "
         "Keep it short (1-3 sentences), natural, specific, and non-spammy. "
         "Do not mention being an AI. Avoid emojis unless user asks. "
-        "Do not use placeholders."
+        "Do not use placeholders. "
+        "You are replying in an ongoing conversation. "
+        "Read the full message history and write a reply that naturally "
+        "continues from where the conversation left off. "
+        "Do NOT repeat links, offers, or CTAs already sent. "
+        "Do NOT send the same message twice in any form."
     )
+    if selected_prompt:
+        system_prompt += f"\n\nPrimary instruction:\n{selected_prompt}"
+    system_prompt += (
+        f"\n\nContext:\n"
+        f"- Contact: {contact_name}\n"
+        f"- Group: {origin_group}\n"
+        f"- Keyword/topic: {keyword}\n"
+        f"- Desired tone: {tone}\n"
+        f"- Conversation stage: {stage}"
+    )
+
     if not selected_prompt:
         return ConversationAISuggestResponse(
             success=True,
@@ -6600,17 +6609,18 @@ def _generate_conversation_ai_suggest(
             model=None,
         )
 
-    user_prompt = (
-        f"Primary instruction:\n{selected_prompt}\n\n"
-        f"Context:\n"
-        f"- Contact: {contact_name}\n"
-        f"- Group: {origin_group}\n"
-        f"- Keyword/topic: {keyword}\n"
-        f"- Desired tone: {tone}\n"
-        f"- Conversation stage: {stage}\n"
-        f"- Recent chat history:\n{history}\n\n"
-        "Write one DM reply in English."
-    )
+    # Build multi-turn messages array
+    ai_messages = [{"role": "system", "content": system_prompt}]
+    for msg in message_rows:
+        text = str(msg["text"] or "").strip()
+        if not text:
+            continue
+        sender_raw = str(msg["sender"] or "").strip().lower()
+        if sender_raw == "outbound":
+            ai_messages.append({"role": "assistant", "content": text})
+        else:
+            ai_messages.append({"role": "user", "content": f"{contact_name}: {text}"})
+    ai_messages.append({"role": "user", "content": "Write the next reply now."})
 
     api_key = _get_openai_key_for_dm()
     # -- Model resolution: settings > env > default --
@@ -6629,7 +6639,7 @@ def _generate_conversation_ai_suggest(
         )
 
     try:
-        generated = _openai_generate_dm_rest(api_key=api_key, model=model, system_prompt=system_prompt, user_prompt=user_prompt)
+        generated = _openai_generate_dm_rest(api_key=api_key, model=model, system_prompt=system_prompt, user_prompt="", messages=ai_messages)
         if not generated:
             raise RuntimeError("empty_generation")
         return ConversationAISuggestResponse(success=True, text=generated, source=source, model=model)

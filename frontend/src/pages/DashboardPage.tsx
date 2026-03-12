@@ -927,9 +927,9 @@ export default function DashboardPage() {
               <div key={item.id} className={`px-5 py-3.5 ${queueExpanded ? "flex items-start" : "flex items-center gap-4"}`}>
                 <div className="flex-1 min-w-0">
                   <p className="text-sm font-medium text-foreground">{item.profile}</p>
-                  <p className="text-xs text-muted-foreground">{item.community} В· <span className="text-primary">{item.keyword}</span></p>
+                  <p className="text-xs text-muted-foreground">{item.isFollowUp ? <span className="text-info">📩 Follow-up DM</span> : <>{item.community} · <span className="text-primary">{item.keyword}</span></>}</p>
                   {queueExpanded && (
-                    <p className="text-[11px] text-muted-foreground mt-0.5">Post: {item.postId} В· Priority: {item.priorityScore}</p>
+                    <p className="text-[11px] text-muted-foreground mt-0.5">{item.isFollowUp ? `Lead: ${item.followUpLeadName || "Unknown"} · Follow-up DM` : `Post: ${item.postId} · Priority: ${item.priorityScore}`}</p>
                   )}
                 </div>
                 {!queueExpanded && (
@@ -967,7 +967,7 @@ export default function DashboardPage() {
                       )}
                     </p>
                     <p className="text-[10px] text-muted-foreground">
-                      {isN8nMode ? ((item as any).isFollowUp ? <span className="text-info/70 italic">Follow-up</span> : item.scheduledFor ? new Date(item.scheduledFor).toLocaleTimeString() : item.scheduledTime) : (engineStatus?.isRunning && !engineStatus?.isPaused ? item.scheduledTime : "Waiting for start")}
+                      {isN8nMode ? (item.isFollowUp ? <span className="text-info/70 italic">Follow-up</span> : item.scheduledFor ? new Date(item.scheduledFor).toLocaleTimeString() : item.scheduledTime) : (engineStatus?.isRunning && !engineStatus?.isPaused ? item.scheduledTime : "Waiting for start")}
                     </p>
                   </div>
                 )}

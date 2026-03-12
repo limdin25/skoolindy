@@ -54,7 +54,7 @@ export const useQueuePreview = () =>
     queryKey: ["queuePreview"],
     queryFn: () => api.getQueuePreview(30, 7),
     refetchInterval: 30000,
-    refetchIntervalInBackground: false,
+    refetchIntervalInBackground: true,
     refetchOnWindowFocus: false,
   });
 

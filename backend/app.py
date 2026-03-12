@@ -6094,6 +6094,10 @@ class QueueItemModel(BaseModel):
     scheduledFor: str
     priorityScore: int
     countdown: int
+    # Follow-up fields (only present when isFollowUp = True)
+    isFollowUp: Optional[bool] = None
+    followUpConversationId: Optional[str] = None
+    followUpLeadName: Optional[str] = None
 
 
 class QueueListResponse(BaseModel):
@@ -8295,6 +8299,56 @@ def read_queue(profile_id: Optional[str] = None):
         if not took_any:
             break
     items = [QueueItemModel(**_queue_row_to_api_payload(row)) for row in interleaved]
+
+    # Append follow-up DM rows from conversations table
+    try:
+        with get_db() as db_fu:
+            follow_up_rows = db_fu.execute("""
+                SELECT
+                    c.id,
+                    p.name as profileName,
+                    c.profileId,
+                    c.contactName,
+                    c.followUpDueAt,
+                    c.originGroup,
+                    c.keyword
+                FROM conversations c
+                LEFT JOIN profiles p ON p.id = c.profileId
+                WHERE c.followUpDueAt IS NOT NULL
+                  AND c.isDeletedUi = 0
+                  AND c.isArchived = 0
+                ORDER BY c.followUpDueAt ASC
+                LIMIT 20
+            """).fetchall()
+            for row in follow_up_rows:
+                items.append(QueueItemModel(
+                    id=f"followup-{row['id']}",
+                    profile=str(row["profileName"] or ""),
+                    profileId=str(row["profileId"] or ""),
+                    community=str(row["originGroup"] or "DM Follow-up"),
+                    communityId="",
+                    postId="",
+                    keyword=str(row["keyword"] or "follow-up"),
+                    keywordId="",
+                    scheduledTime="",
+                    scheduledFor=str(row["followUpDueAt"] or ""),
+                    priorityScore=0,
+                    countdown=0,
+                    isFollowUp=True,
+                    followUpConversationId=str(row["id"] or ""),
+                    followUpLeadName=str(row["contactName"] or ""),
+                ))
+    except Exception:
+        pass
+
+    # Sort combined list by scheduledFor
+    def _sort_key(item):
+        sf = item.scheduledFor or ""
+        if not sf:
+            return "9999"
+        return sf
+    items.sort(key=_sort_key)
+
     return QueueListResponse(
         items=items,
         dailyCapExhausted=daily_cap_exhausted,

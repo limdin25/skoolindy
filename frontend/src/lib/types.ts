@@ -98,6 +98,10 @@ export interface QueueItem {
   scheduledFor: string;
   priorityScore: number;
   countdown: number;
+  // Follow-up fields (only present when isFollowUp = true)
+  isFollowUp?: boolean;
+  followUpConversationId?: string;
+  followUpLeadName?: string;
 }
 
 export interface QueueListResponse {

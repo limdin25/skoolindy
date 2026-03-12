@@ -1,6 +1,6 @@
-# SkoolProjectUP
+# Skoolindy
 
-Automation platform for Skool workflows:
+Automation platform for Skool workflows (public repo: **[limdin25/skoolindy](https://github.com/limdin25/skoolindy)**):
 - backend: FastAPI API + automation engine
 - frontend: React/Vite dashboard
 
@@ -83,7 +83,13 @@ powershell -ExecutionPolicy Bypass -File scripts/cleanup_handover.ps1
 bash scripts/cleanup_handover.sh
 ```
 
+## Documentation (canonical)
+
+**Start here:** [`docs/README.md`](docs/README.md) — DISCIPLINE, PROJECT_STATE, PROJECT_HISTORY, n8n pack index.  
+Edit docs in this repo only; sync VPS with `git pull origin main` from `/root/.openclaw/workspace/skoolindy`.
+
 ## Extra Docs
 
 - Backend setup/details: `backend/README.md`
 - Frontend setup/details: `frontend/README.md`
+- n8n workflows: `n8n/README.md`

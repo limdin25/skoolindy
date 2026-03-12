@@ -1,0 +1,80 @@
+{
+  "name": "Skoollindy Healthcheck",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "a1b2c3d4-0001-4000-8000-000000000001",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SKOOLLINDY_BASE_URL || 'http://localhost:3113' }}/api/n8n/health",
+        "options": { "timeout": 10000 },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-N8N-KEY", "value": "={{ $env.SKOOLLINDY_N8N_KEY }}" }
+          ]
+        }
+      },
+      "id": "a1b2c3d4-0002-4000-8000-000000000002",
+      "name": "GET Health",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 280],
+      "notesInFlow": true,
+      "notes": "Requires SKOOLLINDY_BASE_URL and SKOOLLINDY_N8N_KEY."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SKOOLLINDY_BASE_URL || 'http://localhost:3113' }}/api/n8n/runtime-config",
+        "options": { "timeout": 10000 },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-N8N-KEY", "value": "={{ $env.SKOOLLINDY_N8N_KEY }}" }
+          ]
+        }
+      },
+      "id": "a1b2c3d4-0003-4000-8000-000000000003",
+      "name": "GET Runtime Config",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 280],
+      "notesInFlow": true,
+      "notes": "Returns masterEnabled, enabledProfiles, communitiesByProfile, keywordRules."
+    },
+    {
+      "parameters": {
+        "jsCode": "const health = $('GET Health').first().json;\nconst config = $input.first().json;\nconst ok = health && health.masterEnabled !== undefined && health.orchestrationMode !== undefined;\nconst profilesOk = Array.isArray(config.enabledProfiles) && config.enabledProfiles.length > 0;\nreturn [{\n  json: {\n    success: ok && profilesOk,\n    masterEnabled: health.masterEnabled,\n    orchestrationMode: health.orchestrationMode,\n    queueCount: health.queueCount,\n    enabledProfilesCount: health.enabledProfilesCount,\n    profilesOk,\n    timestamp: health.timestamp\n  }\n}];"
+      },
+      "id": "a1b2c3d4-0004-4000-8000-000000000004",
+      "name": "Validate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [[{ "node": "GET Health", "type": "main", "index": 0 }]]
+    },
+    "GET Health": {
+      "main": [[{ "node": "GET Runtime Config", "type": "main", "index": 0 }]]
+    },
+    "GET Runtime Config": {
+      "main": [[{ "node": "Validate", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "versionId": "healthcheck-v1",
+  "meta": { "templateCredsSetupCompleted": false },
+  "id": "skoollindy-healthcheck",
+  "tags": [{ "name": "skoollindy", "createdAt": "2026-03-10T00:00:00.000Z", "updatedAt": "2026-03-10T00:00:00.000Z" }]
+}

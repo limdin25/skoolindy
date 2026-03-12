@@ -1,0 +1,215 @@
+{
+  "name": "Skoollindy Scan and Queue (Cron)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "minutes", "minutesInterval": 15 }]
+        }
+      },
+      "id": "e5f6a7b8-0001-4000-8000-000000000001",
+      "name": "Every 15 min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 400]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SKOOLLINDY_BASE_URL || 'http://localhost:3113' }}/api/n8n/health",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "X-N8N-KEY", "value": "={{ $env.SKOOLLINDY_N8N_KEY }}" }]
+        }
+      },
+      "id": "e5f6a7b8-0002-4000-8000-000000000002",
+      "name": "GET Health",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "const health = $input.first().json;\nconst go = health && health.masterEnabled === true && String(health.orchestrationMode || '').toLowerCase() === 'n8n';\nreturn [{ json: { go, reason: go ? null : 'master_or_mode', timestamp: new Date().toISOString() } }];"
+      },
+      "id": "e5f6a7b8-0003-4000-8000-000000000003",
+      "name": "Guard Mode",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 400]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "id": "g1", "leftValue": "={{ $json.go }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "e5f6a7b8-0004-4000-8000-000000000004",
+      "name": "Run Allowed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [900, 400]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SKOOLLINDY_BASE_URL || 'http://localhost:3113' }}/api/n8n/runtime-config",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "X-N8N-KEY", "value": "={{ $env.SKOOLLINDY_N8N_KEY }}" }]
+        }
+      },
+      "id": "e5f6a7b8-0005-4000-8000-000000000005",
+      "name": "GET Config",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 320]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SKOOLLINDY_BASE_URL || 'http://localhost:3113' }}/queue"
+      },
+      "id": "e5f6a7b8-0006-4000-8000-000000000006",
+      "name": "GET Queue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 320]
+    },
+    {
+      "parameters": {
+        "jsCode": "const config = $('GET Config').first().json;\nconst queueRes = $input.first().json;\nconst items = queueRes.items || [];\nconst QUEUE_CAP = 2;\nif (items.length >= QUEUE_CAP) {\n  return [{ json: { skipRun: true, reason: 'queue_cap', queueLength: items.length, timestamp: new Date().toISOString() } }];\n}\nconst profileId = (config.enabledProfiles && config.enabledProfiles[0] && config.enabledProfiles[0].id) || '';\nconst comms = (config.communitiesByProfile || {})[profileId] || [];\nconst communityId = (comms[0] && comms[0].id) || '';\nif (!profileId || !communityId) {\n  return [{ json: { skipRun: true, reason: 'no_profile_or_community', timestamp: new Date().toISOString() } }];\n}\nreturn [{ json: { skipRun: false, profile_id: profileId, community_id: communityId, max_posts: 5, queueLength: items.length, timestamp: new Date().toISOString() } }];"
+      },
+      "id": "e5f6a7b8-0007-4000-8000-000000000007",
+      "name": "Queue Cap and Pick Target",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 320]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "id": "q1", "leftValue": "={{ $json.skipRun }}", "rightValue": false, "operator": { "type": "boolean", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "e5f6a7b8-0008-4000-8000-000000000008",
+      "name": "Do Scan?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1780, 320]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SKOOLLINDY_BASE_URL || 'http://localhost:3113' }}/api/n8n/scan-community",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"profile_id\": \"{{ $json.profile_id }}\",\n  \"community_id\": \"{{ $json.community_id }}\",\n  \"max_posts\": {{ $json.max_posts || 5 }}\n}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "X-N8N-KEY", "value": "={{ $env.SKOOLLINDY_N8N_KEY }}" }]
+        }
+      },
+      "id": "e5f6a7b8-0009-4000-8000-000000000009",
+      "name": "POST Scan Community",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2000, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const scan = $input.first().json;\nconst target = $('Queue Cap and Pick Target').first().json;\nif (scan.error) {\n  return [{ json: { error: scan.error, skipQueue: true, skipReason: scan.error, profile_id: target.profile_id, community_id: target.community_id, timestamp: new Date().toISOString() } }];\n}\nconst posts = (scan.posts || []).filter(\n  p => !p.already_commented && !p.blacklisted_match && (p.post_text || '').trim().length > 0\n);\nconst config = $('GET Config').first().json;\nconst fallbackPrompt = (config.commentFallbackPrompt || '').trim() || 'Add value, be friendly and keep short.';\nconst first = posts[0];\nif (!first) {\n  return [{ json: { skipQueue: true, skipReason: 'no_eligible_posts', profile_id: target.profile_id, community_id: target.community_id, timestamp: new Date().toISOString() } }];\n}\nconst keywordRules = config.keywordRules || [];\nlet keyword = 'general';\nlet keyword_rule_id = '';\nlet fallback_level_used = 'general_comment_fallback';\nconst text = (first.post_text || '').toLowerCase();\nfor (const rule of keywordRules) {\n  if (!rule.active) continue;\n  const k = (rule.keyword || '').toLowerCase();\n  if (k && text.includes(k)) {\n    keyword = rule.keyword;\n    keyword_rule_id = rule.id || '';\n    fallback_level_used = 'keyword_rule';\n    break;\n  }\n}\nreturn [{\n  json: {\n    profile_id: target.profile_id,\n    community_id: target.community_id,\n    post_url: first.post_url,\n    post_id: first.post_id || first.post_url,\n    post_text: (first.post_text || '').slice(0, 500),\n    keyword,\n    keyword_rule_id,\n    prompt_used: fallbackPrompt,\n    fallback_level_used,\n    skipQueue: false,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "e5f6a7b8-0010-4000-8000-000000000010",
+      "name": "Filter and Match",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2220, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "id": "s1", "leftValue": "={{ $json.skipQueue }}", "rightValue": false, "operator": { "type": "boolean", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "e5f6a7b8-0011-4000-8000-000000000011",
+      "name": "Skip Queue?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2440, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst scheduled = new Date(Date.now() + 60 * 1000);\nconst scheduled_for = scheduled.toISOString().replace(/\\.\\d{3}Z$/, 'Z');\nreturn [{ json: { ...item, generated_comment: 'Nice point, that stood out to me too.', scheduled_for } }];"
+      },
+      "id": "e5f6a7b8-0012-4000-8000-000000000012",
+      "name": "Build Payload (Static Comment)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2660, 280],
+      "notesInFlow": true,
+      "notes": "Phase 1: static comment. Replace with OpenAI node for AI comment."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SKOOLLINDY_BASE_URL || 'http://localhost:3113' }}/api/n8n/queue-comment",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-N8N-KEY", "value": "={{ $env.SKOOLLINDY_N8N_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"profile_id\": \"{{ $json.profile_id }}\",\n  \"community_id\": \"{{ $json.community_id }}\",\n  \"post_url\": \"{{ $json.post_url }}\",\n  \"post_id\": \"{{ $json.post_id || $json.post_url }}\",\n  \"keyword\": \"{{ $json.keyword }}\",\n  \"keyword_rule_id\": \"{{ $json.keyword_rule_id || '' }}\",\n  \"generated_comment\": {{ JSON.stringify($json.generated_comment) }},\n  \"scheduled_for\": \"{{ $json.scheduled_for }}\",\n  \"fallback_level_used\": \"{{ $json.fallback_level_used || 'keyword_rule' }}\"\n}"
+      },
+      "id": "e5f6a7b8-0013-4000-8000-000000000013",
+      "name": "POST Queue Comment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2880, 280]
+    },
+    {
+      "parameters": {
+        "jsCode": "const res = $input.first().json;\nconst prev = $('Build Payload (Static Comment)').first().json;\nreturn [{ json: { run: 'scan_and_queue', action: 'queued', queue_item_id: res.queue_item_id || res.id, profile_id: prev.profile_id, community_id: prev.community_id, post_url: prev.post_url, timestamp: new Date().toISOString() } }];"
+      },
+      "id": "e5f6a7b8-0014-4000-8000-000000000014",
+      "name": "Output Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3100, 280]
+    }
+  ],
+  "connections": {
+    "Every 15 min": { "main": [[{ "node": "GET Health", "type": "main", "index": 0 }]] },
+    "GET Health": { "main": [[{ "node": "Guard Mode", "type": "main", "index": 0 }]] },
+    "Guard Mode": { "main": [[{ "node": "Run Allowed?", "type": "main", "index": 0 }]] },
+    "Run Allowed?": { "main": [[{ "node": "GET Config", "type": "main", "index": 0 }], []] },
+    "GET Config": { "main": [[{ "node": "GET Queue", "type": "main", "index": 0 }]] },
+    "GET Queue": { "main": [[{ "node": "Queue Cap and Pick Target", "type": "main", "index": 0 }]] },
+    "Queue Cap and Pick Target": { "main": [[{ "node": "Do Scan?", "type": "main", "index": 0 }]] },
+    "Do Scan?": { "main": [[{ "node": "POST Scan Community", "type": "main", "index": 0 }], []] },
+    "POST Scan Community": { "main": [[{ "node": "Filter and Match", "type": "main", "index": 0 }]] },
+    "Filter and Match": { "main": [[{ "node": "Skip Queue?", "type": "main", "index": 0 }]] },
+    "Skip Queue?": { "main": [[{ "node": "Build Payload (Static Comment)", "type": "main", "index": 0 }], []] },
+    "Build Payload (Static Comment)": { "main": [[{ "node": "POST Queue Comment", "type": "main", "index": 0 }]] },
+    "POST Queue Comment": { "main": [[{ "node": "Output Summary", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "versionId": "scan-queue-cron-v1",
+  "meta": { "templateCredsSetupCompleted": false },
+  "id": "skoollindy-scan-queue-cron",
+  "tags": [{ "name": "skoollindy", "createdAt": "2026-03-10T00:00:00.000Z", "updatedAt": "2026-03-10T00:00:00.000Z" }]
+}

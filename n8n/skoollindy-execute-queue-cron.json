@@ -1,0 +1,140 @@
+{
+  "name": "Skoollindy Execute Queue (Cron)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "minutes", "minutesInterval": 5 }]
+        }
+      },
+      "id": "f6a7b8c9-0001-4000-8000-000000000001",
+      "name": "Every 5 min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SKOOLLINDY_BASE_URL || 'http://localhost:3113' }}/api/n8n/health",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "X-N8N-KEY", "value": "={{ $env.SKOOLLINDY_N8N_KEY }}" }]
+        }
+      },
+      "id": "f6a7b8c9-0002-4000-8000-000000000002",
+      "name": "GET Health",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const health = $input.first().json;\nconst go = health && String(health.orchestrationMode || '').toLowerCase() === 'n8n';\nreturn [{ json: { go, reason: go ? null : 'orchestration_mode_not_n8n', timestamp: new Date().toISOString() } }];"
+      },
+      "id": "f6a7b8c9-0003-4000-8000-000000000003",
+      "name": "Guard Mode",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "id": "g1", "leftValue": "={{ $json.go }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "f6a7b8c9-0004-4000-8000-000000000004",
+      "name": "Run Allowed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SKOOLLINDY_BASE_URL || 'http://localhost:3113' }}/queue"
+      },
+      "id": "f6a7b8c9-0005-4000-8000-000000000005",
+      "name": "GET Queue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 280]
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json;\nconst items = body.items || [];\nconst first = items[0];\nif (!first || !first.id) {\n  return [{ json: { queue_item_id: '', executed: false, skipReason: 'no_queue_item', timestamp: new Date().toISOString() } }];\n}\nreturn [{ json: { queue_item_id: first.id, executed: false, timestamp: new Date().toISOString() } }];"
+      },
+      "id": "f6a7b8c9-0006-4000-8000-000000000006",
+      "name": "Pick First Item",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 280]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            { "id": "c1", "leftValue": "={{ $json.queue_item_id }}", "rightValue": "", "operator": { "type": "string", "operation": "notEmpty" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "f6a7b8c9-0007-4000-8000-000000000007",
+      "name": "Has Item?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1560, 280]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SKOOLLINDY_BASE_URL || 'http://localhost:3113' }}/api/n8n/execute-comment",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"queue_item_id\": \"{{ $json.queue_item_id }}\"\n}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-N8N-KEY", "value": "={{ $env.SKOOLLINDY_N8N_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        }
+      },
+      "id": "f6a7b8c9-0008-4000-8000-000000000008",
+      "name": "POST Execute Comment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1780, 260]
+    },
+    {
+      "parameters": {
+        "jsCode": "const exec = $input.first().json;\nconst prev = $('Pick First Item').first().json;\nreturn [{ json: { run: 'execute_queue', queue_item_id: prev.queue_item_id, success: exec.success === true, error: exec.error || null, timestamp: new Date().toISOString() } }];"
+      },
+      "id": "f6a7b8c9-0009-4000-8000-000000000009",
+      "name": "Output Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2000, 260]
+    }
+  ],
+  "connections": {
+    "Every 5 min": { "main": [[{ "node": "GET Health", "type": "main", "index": 0 }]] },
+    "GET Health": { "main": [[{ "node": "Guard Mode", "type": "main", "index": 0 }]] },
+    "Guard Mode": { "main": [[{ "node": "Run Allowed?", "type": "main", "index": 0 }]] },
+    "Run Allowed?": { "main": [[{ "node": "GET Queue", "type": "main", "index": 0 }], []] },
+    "GET Queue": { "main": [[{ "node": "Pick First Item", "type": "main", "index": 0 }]] },
+    "Pick First Item": { "main": [[{ "node": "Has Item?", "type": "main", "index": 0 }]] },
+    "Has Item?": { "main": [[{ "node": "POST Execute Comment", "type": "main", "index": 0 }], []] },
+    "POST Execute Comment": { "main": [[{ "node": "Output Summary", "type": "main", "index": 0 }]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "versionId": "execute-queue-cron-v1",
+  "meta": { "templateCredsSetupCompleted": false },
+  "id": "skoollindy-execute-queue-cron",
+  "tags": [{ "name": "skoollindy", "createdAt": "2026-03-10T00:00:00.000Z", "updatedAt": "2026-03-10T00:00:00.000Z" }]
+}

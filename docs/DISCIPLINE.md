@@ -1,13 +1,13 @@
-# DISCIPLINE — EngageFlow + Joiner Integration
+# DISCIPLINE — Skoolindy + Joiner
 
-Non-negotiable rules for the hybrid EngageFlow + community-join-manager integration.
+Non-negotiable rules for the Skoolindy backend + joiner integration. **Skoolindy is standalone** — no separate EngageFlow repo (see `docs/SKOOLINDY_STANDALONE.md` for legacy filenames only).
 
 ## 1) Hybrid Architecture Invariants
 
-- **Profiles**: Managed in EngageFlow only. Joiner READS profiles from engageflow.db. No Add/Delete in joiner UI.
-- **Browser locks**: Both EngageFlow and joiner acquire/release locks before using skool_accounts/. No concurrent browser use.
-- **Communities**: Joiner WRITES via webhook only (auto-register after successful join). EngageFlow owns communities table.
-- **Joiner DB**: join_queue, profile_discovery_info, join_logs, joiner_profile_state — joiner owns. EngageFlow never touches.
+- **Profiles**: Managed in **Skoolindy backend only**. Joiner READs profiles from `engageflow.db` (SQLite). No Add/Delete in joiner UI for core profiles.
+- **Browser locks**: Skoolindy backend and joiner acquire/release locks before using `skool_accounts/`. No concurrent browser use.
+- **Communities**: Joiner WRITES via webhook only (auto-register after successful join). Skoolindy backend owns `communities` table.
+- **Joiner DB**: `join_queue`, profile discovery, join logs, joiner state — joiner owns. Skoolindy backend must not write joiner-only tables directly.
 
 ## 2) Minimal Diff, One Intent
 
@@ -20,11 +20,18 @@ Non-negotiable rules for the hybrid EngageFlow + community-join-manager integrat
 
 ## 4) Security Checklist
 
-- No secrets in code or logs.
+- No secrets in code or logs (including n8n docs — use placeholders).
 - Validate external inputs.
 - Timeouts on HTTP and spawn.
+- Never commit `.env`, `*.db`, or `venv/`.
 
 ## 5) Completion Standard
 
-- docs/PROJECT_STATE.md updated after changes.
-- docs/PROJECT_HISTORY.md appended.
+- `docs/PROJECT_STATE.md` updated after material changes.
+- `docs/PROJECT_HISTORY.md` appended.
+
+## 6) Source of Truth
+
+- **Repo:** [github.com/limdin25/skoolindy](https://github.com/limdin25/skoolindy)
+- **VPS root:** `/root/.openclaw/workspace/skoolindy`
+- **Main DB:** `backend/engageflow.db` (name retained; app is Skoolindy)

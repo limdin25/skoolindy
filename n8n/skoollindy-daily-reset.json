@@ -1,0 +1,46 @@
+{
+  "name": "Skoollindy Daily Reset",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "cronExpression", "expression": "5 0 * * *" }]
+        }
+      },
+      "id": "b2c3d4e5-0001-4000-8000-000000000001",
+      "name": "Daily 00:05",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SKOOLLINDY_BASE_URL || 'http://localhost:3113' }}/api/n8n/reset-daily",
+        "options": { "timeout": 15000 },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-N8N-KEY", "value": "={{ $env.SKOOLLINDY_N8N_KEY }}" }
+          ]
+        }
+      },
+      "id": "b2c3d4e5-0002-4000-8000-000000000002",
+      "name": "POST Reset Daily",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 300]
+    }
+  ],
+  "connections": {
+    "Daily 00:05": {
+      "main": [[{ "node": "POST Reset Daily", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "versionId": "daily-reset-v1",
+  "meta": { "templateCredsSetupCompleted": false },
+  "id": "skoollindy-daily-reset",
+  "tags": [{ "name": "skoollindy", "createdAt": "2026-03-10T00:00:00.000Z", "updatedAt": "2026-03-10T00:00:00.000Z" }]
+}

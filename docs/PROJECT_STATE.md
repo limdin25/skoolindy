@@ -1,70 +1,68 @@
-# PROJECT STATE — EngageFlow + Joiner Hybrid
+# PROJECT STATE — Skoolindy
 
-**Last updated:** 2026-03-02
-**Max 300 lines.**
+**Last updated:** 2026-03-12  
+**Max ~300 lines.**
 
 ---
 
 ## Current Objective
 
-Integrate community-join-manager into EngageFlow as `engageflow/joiner/`. Hybrid architecture: shared profiles + browser profiles, separate joiner DB, browser locks for coordination.
+**Skoolindy** — automation for Skool engagement: FastAPI backend (Playwright scan/execute), Vite/React dashboard, Node joiner for community joins. Optional **n8n** orchestration when `automation_settings.orchestrationMode` is `n8n`.
 
 ---
 
-## System Status
+## System Status (VPS reference)
 
-| Component | Port | Status | Notes |
-|-----------|------|--------|-------|
-| EngageFlow backend | 3103 | Running | FastAPI, engageflow.db |
-| EngageFlow frontend | 3080 | Served | Static from dist/, nginx |
-| Joiner backend | 3100 | Running | Node/Express, joiner.db |
+| Component | PM2 name | Typical port | Notes |
+|-----------|----------|--------------|--------|
+| Backend | `skoolindy-backend` | 3113 | FastAPI, `backend/engageflow.db` |
+| Frontend | `skoolindy-frontend` | 4014 | Vite dev (`npm run dev` in `frontend/`) |
+| Joiner | `skoolindy-joiner` | (see joiner config) | Node `joiner/backend/server.js` |
+
+**Paths on VPS:** `/root/.openclaw/workspace/skoolindy`  
+**GitHub:** [github.com/limdin25/skoolindy](https://github.com/limdin25/skoolindy)
 
 ---
 
 ## Architecture
 
-```
-engageflow/
-├── backend/          # FastAPI — engagement automation, engageflow.db
-├── frontend/         # React — unified dashboard
-├── joiner/           # Node.js — join automation
-│   ├── backend/      # server.js, joiner.db, config.js
-│   └── src/          # Components (copied to frontend)
-└── engageflow.db     # profiles, communities, browser_locks
+```text
+skoolindy/   (repo root)
+├── backend/           # FastAPI app.py, automation engine, engageflow.db
+├── frontend/          # Vite + React dashboard
+├── joiner/
+│   └── backend/       # server.js, joiner DBs
+├── n8n/               # Workflow JSON (import into n8n)
+├── scripts/           # e.g. n8n-activate-skoollindy.sh
+└── docs/              # DISCIPLINE, PROJECT_STATE, PROJECT_HISTORY, N8N_*
 ```
 
-**Database access:**
-| Table | DB | Joiner | EngageFlow |
-|-------|-----|--------|------------|
+**Database (main):** `backend/engageflow.db` — profiles, communities, keyword_rules, queue_items, conversations, join_jobs, etc. (see `docs/N8N_FULL_REPORT.md` for n8n-related tables.)
+
+**Joiner DBs:** under `joiner/backend/` — joiner-owned only.
+
+---
+
+## Hybrid Invariants (unchanged)
+
+| Table / concern | Main DB | Joiner | Skoolindy backend |
+|-----------------|--------|--------|-------------------|
 | profiles | engageflow.db | READ | RW |
 | browser_locks | engageflow.db | RW | RW |
 | communities | engageflow.db | Webhook write | RW |
-| join_queue | joiner.db | RW | — |
-| profile_discovery_info | joiner.db | RW | — |
+| join_queue / joiner state | joiner DB | RW | — |
 
 ---
 
-## Join Tab Structure
+## n8n (when orchestrationMode = n8n)
 
-Communities page → Join tab → 4 sub-tabs:
-- **Accounts** — Per-account stats, Run/Stop, Cancel Pending (AccountsTab)
-- **Survey Info** — Discovery info per profile (SurveyTab)
-- **Communities & Queue** — Add to queue, manage queue (QueueTab)
-- **Live Logs** — Join logs (LogsTab)
-
----
-
-## API Proxy
-
-- `/api/` → EngageFlow backend (3103)
-- `/api/joiner/` → Joiner backend (3100), rewrite to `/api/`
+- Internal scheduler does not prefill/execute comment queue; n8n calls `/api/n8n/*` (see `docs/N8N_FULL_REPORT.md`).
+- Env on n8n host: `SKOOLLINDY_BASE_URL`, `SKOOLLINDY_N8N_KEY` (must match backend `N8N_API_KEY` if set).
 
 ---
 
 ## Next Actions
 
-1. ~~Wire Join tab with all 4 components.~~ Done.
-2. ~~Add nginx location for /api/joiner/.~~ Done.
-3. ~~PM2 start engageflow-joiner.~~ Done.
-4. ~~Remove Add/Delete from AccountsTab.~~ Done.
-5. Manual test: open http://38.242.229.161:3080/communities → Join tab → Accounts/Survey/Queue/Logs.
+1. Keep docs in sync when PM2 names, ports, or paths change.
+2. After deploys: append PROJECT_HISTORY; refresh PROJECT_STATE if behavior or layout changes.
+3. Rotate any exposed API keys; never commit real keys (use `docs/N8N_ENV_VARIABLES.md` pattern).

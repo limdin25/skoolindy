@@ -414,9 +414,18 @@ export default function AutomationPage() {
                 </div>
               </div>
 
-              {/* n8n timing strip */}
+              {/* n8n status + scheduled actions */}
               {n8nTiming && (
-                <div className="text-xs text-muted-foreground mt-2 pt-2 border-t border-border space-y-2">
+                <div className="text-xs text-muted-foreground mt-2 pt-2 border-t border-border space-y-3">
+                  {/* Status header */}
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span className="text-success text-sm">{"\uD83D\uDFE2"}</span>
+                      <span className="font-medium text-foreground">System {settings.masterEnabled ? "Running" : "Stopped"}</span>
+                    </div>
+                    <span>Queue: <span className="text-foreground font-medium">{realQueue.length}</span> pending</span>
+                  </div>
+
                   {/* Past events */}
                   <div className="grid grid-cols-2 gap-x-6 gap-y-1">
                     <div>Last scan: <span className="text-foreground">{formatAgo(n8nTiming.lastScanTime)}</span></div>
@@ -424,85 +433,134 @@ export default function AutomationPage() {
                     <div>Last queued: <span className="text-foreground">{formatAgo(n8nTiming.lastQueueInsert)}</span></div>
                     <div>Pending: <span className="text-foreground">{n8nTiming.pendingQueueItems}</span></div>
                   </div>
-                  {/* Upcoming countdowns */}
+
+                  {/* Next follow-up + next comment cards */}
                   {settings.masterEnabled && (
-                    <div className="grid grid-cols-2 gap-x-6 gap-y-1 pt-1 border-t border-border/50">
-                      <div>Next scan: <span className="text-foreground font-mono">{(() => {
-                        if (!n8nTiming.lastScanTime) return "unknown";
-                        const lastScan = new Date(n8nTiming.lastScanTime).getTime();
-                        if (isNaN(lastScan)) return "unknown";
-                        const interval = (n8nTiming.executorIntervalSeconds || 120) * 1000;
-                        const nextScanMs = lastScan + interval;
-                        const sec = Math.floor((nextScanMs - nowMs) / 1000);
-                        if (sec > 0) return formatLiveCountdown(sec);
-                        // Already overdue — show cycle info
-                        const elapsed = Math.floor((nowMs - lastScan) / 1000);
-                        const cyclePos = elapsed % Math.max(1, n8nTiming.executorIntervalSeconds || 120);
-                        const remaining = Math.max(0, (n8nTiming.executorIntervalSeconds || 120) - cyclePos);
-                        return remaining > 0 ? formatLiveCountdown(remaining) : "imminent";
-                      })()}</span></div>
-                      <div>Next execute check: <span className="text-foreground font-mono">{(() => {
-                        // Executor loop runs on a fixed interval from startup, not from last event
-                        // Best estimate: use modular arithmetic on the interval
-                        const interval = n8nTiming.executorIntervalSeconds || 120;
-                        if (!n8nTiming.lastScanTime && !n8nTiming.lastExecuteTime) return "unknown";
-                        // Use the most recent event as anchor
-                        const anchors = [n8nTiming.lastScanTime, n8nTiming.lastExecuteTime].filter(Boolean).map(t => new Date(t!).getTime()).filter(t => !isNaN(t));
-                        if (anchors.length === 0) return "unknown";
-                        const latest = Math.max(...anchors);
-                        const elapsed = Math.floor((nowMs - latest) / 1000);
-                        const cyclePos = elapsed % Math.max(1, interval);
-                        const remaining = Math.max(0, interval - cyclePos);
-                        return remaining > 0 ? formatLiveCountdown(remaining) : "imminent";
-                      })()}</span></div>
-                      <div className="col-span-2">Next planned comment: <span className="text-foreground font-mono">{(() => {
-                        // Real queue first
-                        if (n8nTiming.nextScheduledFor) {
-                          const d = new Date(n8nTiming.nextScheduledFor).getTime();
-                          if (!isNaN(d)) {
-                            const sec = Math.max(0, Math.floor((d - nowMs) / 1000));
-                            return sec <= 0 ? "ready now" : formatLiveCountdown(sec);
-                          }
-                        }
-                        // Projected fallback
-                        if (projectedQueue.length > 0) {
-                          const sorted = projectedQueue
-                            .map((p: any) => new Date(String(p.scheduledFor || "")).getTime())
-                            .filter((t: number) => !isNaN(t) && t > nowMs)
-                            .sort((a: number, b: number) => a - b);
-                          if (sorted.length > 0) {
-                            const sec = Math.max(0, Math.floor((sorted[0] - nowMs) / 1000));
-                            return sec > 0 ? `${formatLiveCountdown(sec)} (projected)` : "imminent";
-                          }
-                        }
-                        return "no upcoming actions";
-                      })()}</span></div>
-                      {/* Next planned target */}
-                      {(() => {
-                        // Show target profile > community for next planned
-                        let target: { profile?: string; community?: string } | null = null;
-                        let isProjected = false;
-                        if (realQueue.length > 0 && n8nTiming.nextScheduledFor) {
-                          const sorted = [...realQueue].filter(i => i.scheduledFor).sort((a, b) =>
-                            new Date(a.scheduledFor!).getTime() - new Date(b.scheduledFor!).getTime()
+                    <div className="grid grid-cols-2 gap-3 pt-1 border-t border-border/50">
+                      <div className="bg-muted/30 rounded-lg p-2.5">
+                        <p className="text-[11px] text-muted-foreground mb-1">{"\uD83D\uDCE9"} Next follow-up DM</p>
+                        {(() => {
+                          const fu = realQueue.find((i: any) => i.isFollowUp);
+                          if (!fu) return <p className="text-[11px] italic">None scheduled</p>;
+                          const ts = new Date(String(fu.scheduledFor || "")).getTime();
+                          const sec = Number.isFinite(ts) ? Math.max(0, Math.floor((ts - nowMs) / 1000)) : 0;
+                          return (
+                            <>
+                              <p className="text-sm font-medium text-foreground truncate">{(fu as any).followUpLeadName || fu.profile}</p>
+                              <p className="text-[11px]">
+                                {Number.isFinite(ts) ? new Date(ts).toLocaleString("en-GB", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : "—"}
+                                {" · "}
+                                {sec <= 0
+                                  ? <span className="text-destructive">{"\uD83D\uDD34"} Overdue</span>
+                                  : <span>{"\u23F1"} {formatLiveCountdown(sec)}</span>}
+                              </p>
+                            </>
                           );
-                          if (sorted.length > 0) target = sorted[0];
-                        } else if (projectedQueue.length > 0) {
-                          const sorted = [...projectedQueue].filter((p: any) => p.scheduledFor).sort((a: any, b: any) =>
-                            new Date(a.scheduledFor).getTime() - new Date(b.scheduledFor).getTime()
+                        })()}
+                      </div>
+                      <div className="bg-muted/30 rounded-lg p-2.5">
+                        <p className="text-[11px] text-muted-foreground mb-1">{"\uD83D\uDCAC"} Next comment</p>
+                        {(() => {
+                          const cm = realQueue.find((i: any) => !i.isFollowUp);
+                          if (!cm) {
+                            // Use n8nTiming.nextCommentAt
+                            const nca = n8nTiming.nextCommentAt;
+                            if (!nca) return <p className="text-[11px] italic">None scheduled</p>;
+                            const ts = new Date(String(nca)).getTime();
+                            const sec = Number.isFinite(ts) ? Math.max(0, Math.floor((ts - nowMs) / 1000)) : 0;
+                            const src = (n8nTiming as any).nextCommentSource;
+                            return (
+                              <>
+                                <p className="text-sm font-medium text-foreground truncate">
+                                  {src === "after_reset" ? "Daily cap reached" : src === "scanning_soon" ? "Scanning soon" : "Idle"}
+                                </p>
+                                <p className="text-[11px]">
+                                  {sec > 0 ? <span>{"\u23F1"} {formatLiveCountdown(sec)}</span> : "—"}
+                                </p>
+                              </>
+                            );
+                          }
+                          const ts = new Date(String(cm.scheduledFor || "")).getTime();
+                          const sec = Number.isFinite(ts) ? Math.max(0, Math.floor((ts - nowMs) / 1000)) : 0;
+                          return (
+                            <>
+                              <p className="text-sm font-medium text-foreground truncate">{cm.profile}</p>
+                              <p className="text-[11px] truncate">{cm.community} · {sec <= 0
+                                ? <span className="text-destructive">{"\uD83D\uDD34"} Overdue</span>
+                                : <span>{"\u23F1"} {formatLiveCountdown(sec)}</span>}</p>
+                            </>
                           );
-                          if (sorted.length > 0) { target = sorted[0] as any; isProjected = true; }
-                        }
-                        return target ? (
-                          <div className={`col-span-2 ${isProjected ? "italic text-muted-foreground/70" : ""}`}>
-                            {isProjected ? "Next planned" : "Next queued"}: <span className="text-foreground">
-                              {(target as any).profile} &gt; {(target as any).community}
-                            </span>
-                          </div>
-                        ) : null;
-                      })()}
+                        })()}
+                      </div>
                     </div>
                   )}
+
+                  {/* Scheduled Actions Table */}
+                  {settings.masterEnabled && (() => {
+                    const allItems = [...realQueue, ...projectedQueue.filter((p: any) => !realQueue.some((r: any) => r.id === p.id))]
+                      .map((item: any) => {
+                        const sf = item.scheduledFor || "";
+                        const ts = sf ? new Date(String(sf)).getTime() : Infinity;
+                        return { ...item, _ts: Number.isFinite(ts) ? ts : Infinity };
+                      })
+                      .sort((a: any, b: any) => a._ts - b._ts);
+                    if (allItems.length === 0) return null;
+                    const fmtDate = (ts: number) => {
+                      if (!Number.isFinite(ts) || ts === Infinity) return "—";
+                      const d = new Date(ts);
+                      const now = new Date();
+                      const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+                      const tmrStart = todayStart + 86400000;
+                      const time = d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+                      if (ts >= todayStart && ts < tmrStart) return `Today ${time}`;
+                      if (ts >= tmrStart && ts < tmrStart + 86400000) return `Tomorrow ${time}`;
+                      return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short" }) + " " + time;
+                    };
+                    const fmtCountdown = (ts: number) => {
+                      const diff = ts - nowMs;
+                      if (!Number.isFinite(ts) || ts === Infinity) return <span className="text-muted-foreground">—</span>;
+                      if (diff <= 0) return <span className="text-destructive font-medium">{"\uD83D\uDD34"} Overdue</span>;
+                      const s = Math.floor(diff / 1000);
+                      let label = "";
+                      if (s < 60) label = `${s}s`;
+                      else if (s < 3600) { const m = Math.floor(s/60); label = `${m}m ${s%60}s`; }
+                      else if (s < 86400) { const h = Math.floor(s/3600); label = `${h}h ${Math.floor((s%3600)/60)}m`; }
+                      else { const dd = Math.floor(s/86400); label = `${dd}d ${Math.floor((s%86400)/3600)}h`; }
+                      return <span className="text-muted-foreground">{"\uD83D\uDD04"} {"\u23F1"} {label}</span>;
+                    };
+                    return (
+                      <div className="pt-1 border-t border-border/50">
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wide">
+                            Scheduled Actions ({allItems.length} scheduled)
+                          </span>
+                        </div>
+                        <div className="rounded-md border border-border/50 overflow-hidden">
+                          <div className="grid grid-cols-[1.5rem_1fr_1.5fr_5rem_5.5rem] gap-1 px-2 py-1.5 bg-muted/20 text-[10px] text-muted-foreground uppercase tracking-wide font-medium">
+                            <span>#</span><span>Account</span><span>Type</span><span>Date</span><span>Status</span>
+                          </div>
+                          <div className="max-h-60 overflow-y-auto divide-y divide-border/30">
+                            {allItems.map((item: any, idx: number) => {
+                              const isFu = !!(item.isFollowUp || (item.actionLabel || "").toLowerCase().includes("follow") || (item.community || "").toLowerCase().includes("follow"));
+                              const typeLabel = isFu
+                                ? `\uD83D\uDCE9 DM \u00b7 ${item.followUpLeadName || item.contactName || "contact"}`
+                                : `\uD83D\uDCAC Comment \u00b7 ${item.community || ""}`;
+                              return (
+                                <div key={item.id || idx} className="grid grid-cols-[1.5rem_1fr_1.5fr_5rem_5.5rem] gap-1 px-2 py-1.5 items-center hover:bg-muted/10 transition-colors">
+                                  <span className="text-[10px] text-muted-foreground">{idx + 1}</span>
+                                  <p className="text-[11px] font-medium text-foreground truncate">{item.profile || "—"}</p>
+                                  <p className="text-[11px] text-muted-foreground truncate">{typeLabel}</p>
+                                  <span className="text-[10px] text-muted-foreground">{fmtDate(item._ts)}</span>
+                                  <span className="text-[10px]">{fmtCountdown(item._ts)}</span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })()}
+
                   {settings.masterEnabled && n8nTiming.executorIntervalSeconds && (
                     <div className="pt-1 border-t border-border/50">
                       Executor interval: <span className="text-foreground">{Math.round(n8nTiming.executorIntervalSeconds / 60)}m</span>

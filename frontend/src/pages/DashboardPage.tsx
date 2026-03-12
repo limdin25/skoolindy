@@ -390,7 +390,7 @@ export default function DashboardPage() {
   const isN8nMode = settings?.orchestrationMode === "n8n";
   const n8nTimingQuery = useN8nTiming(isN8nMode);
   const n8nTiming = n8nTimingQuery.data;
-  const visibleQueue = isN8nMode ? [...queue, ...queuePreview.filter((p: any) => !queue.some((q: any) => q.id === p.id))] : (queue.length > 0 ? queue : queuePreview);
+  const visibleQueue = isN8nMode ? [...queue, ...queuePreview.filter((p: any) => p.isProjected)] : (queue.length > 0 ? queue : queuePreview);
   const displayQueue = interleaveQueueByProfile(visibleQueue);
   const parsedQueue = queue
     .map((item) => ({
@@ -617,7 +617,13 @@ export default function DashboardPage() {
     setTimeout(() => setKeyTestStatus("idle"), 3000);
   };
 
-  const displayedQueue = queueExpanded ? displayQueue : displayQueue.slice(0, 6);
+  const displayedQueue = queueExpanded ? displayQueue : (() => {
+    const followUps = displayQueue.filter((i: any) => i.isFollowUp);
+    const comments = displayQueue.filter((i: any) => !i.isFollowUp);
+    const maxFu = Math.min(followUps.length, 3);
+    const maxComments = Math.max(3, 6 - maxFu);
+    return [...followUps.slice(0, maxFu), ...comments.slice(0, maxComments)];
+  })();
   const commentQueueItems = queue.filter(item => !item.isFollowUp);
   const followUpQueueItems = queue.filter(item => item.isFollowUp);
   const projectedComments = queuePreview.filter((p: any) => p.isProjected && !p.isFollowUp);

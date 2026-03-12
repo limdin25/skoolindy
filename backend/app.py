@@ -7167,17 +7167,53 @@ def automation_n8n_timing():
             ).fetchone()
         next_fu_for = str(next_fu_row["nextDue"]) if next_fu_row and next_fu_row["nextDue"] else None
 
-        # Pick the earliest of queue item or follow-up
-        next_scheduled_for = None
-        candidates = []
+        # --- nextCommentAt / nextCommentSource ---
+        next_comment_at = None
+        next_comment_source = None
         if next_queue_for:
-            candidates.append(next_queue_for)
-        if next_fu_for:
-            candidates.append(next_fu_for)
-        if candidates:
-            next_scheduled_for = min(candidates)
+            next_comment_at = next_queue_for
+            next_comment_source = "queued"
+        else:
+            # Queue empty - check if profiles have capacity
+            active_profiles = db.execute(
+                "SELECT id, dailyUsage FROM profiles WHERE status != 'paused'"
+            ).fetchall()
+            if not active_profiles:
+                next_comment_source = "no_profiles"
+            else:
+                global_cap = max(1, int(s.get("globalDailyCapPerAccount", 5)))
+                all_capped = all(int(p["dailyUsage"] or 0) >= global_cap for p in active_profiles)
+                if all_capped:
+                    from zoneinfo import ZoneInfo
+                    tz = ZoneInfo("Europe/Berlin")
+                    now_local = datetime.now(tz=tz)
+                    midnight = (now_local.replace(hour=0, minute=0, second=5, microsecond=0) + timedelta(days=1))
+                    next_comment_at = midnight.isoformat(timespec="seconds")
+                    next_comment_source = "after_reset"
+                else:
+                    next_comment_at = (datetime.now(tz=timezone.utc) + timedelta(seconds=120)).isoformat(timespec="seconds")
+                    next_comment_source = "scanning_soon"
 
-        # Executor cron interval (for "next scan" estimation)
+        # --- nextFollowUpAt + lead info ---
+        next_follow_up_lead_name = None
+        next_follow_up_conversation_id = None
+        if next_fu_for:
+            next_follow_up_row = db.execute(
+                """SELECT id, contactName
+                   FROM conversations
+                   WHERE aiAutoEnabled = 1 AND isArchived = 0 AND isDeletedUi = 0
+                     AND followUpDueAt IS NOT NULL
+                   ORDER BY followUpDueAt ASC
+                   LIMIT 1"""
+            ).fetchone()
+            if next_follow_up_row:
+                next_follow_up_lead_name = str(next_follow_up_row["contactName"] or "").strip() or None
+                next_follow_up_conversation_id = str(next_follow_up_row["id"] or "").strip() or None
+
+        # Backward compat: nextScheduledFor = nextCommentAt (not followUp)
+        next_scheduled_for = next_comment_at
+
+        # Executor cron interval
         executor_interval = _N8N_EXECUTOR_INTERVAL_SECONDS
 
     return {
@@ -7186,7 +7222,12 @@ def automation_n8n_timing():
         "lastQueueInsert": last_queue_insert,
         "pendingQueueItems": queue_count,
         "nextScheduledFor": next_scheduled_for,
+        "nextCommentAt": next_comment_at,
+        "nextCommentSource": next_comment_source,
+        "nextFollowUpAt": next_fu_for,
         "nextFollowUpFor": next_fu_for,
+        "nextFollowUpLeadName": next_follow_up_lead_name,
+        "nextFollowUpConversationId": next_follow_up_conversation_id,
         "nextQueueItemFor": next_queue_for,
         "masterEnabled": master_enabled,
         "isN8nMode": is_n8n,

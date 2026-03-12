@@ -8049,258 +8049,121 @@ def auto_register_community():
 
 @app.get("/queue/preview")
 def queue_preview(limit: int = 50, days: int = 2):
-    """Read-only projected schedule. No DB writes, no Playwright, no mutation."""
+    """Return next N REAL scheduled actions from queue_items + follow-ups.
+    No synthetic projections — only persisted timestamps."""
     limit = max(1, min(200, limit))
-    days = max(1, min(7, days))
-    now = datetime.now()
-    end_boundary = now + timedelta(days=days)
+    now = datetime.now(tz=timezone.utc)
 
     with get_db() as db:
-        profiles = db.execute("SELECT * FROM profiles WHERE status IN ('ready','running','idle') ORDER BY name").fetchall()
-        communities_rows = db.execute("SELECT * FROM communities WHERE status = 'active' ORDER BY name").fetchall()
-        settings_row = db.execute("SELECT value FROM automation_settings WHERE key = 'default'").fetchone()
-        keyword_rules_rows = db.execute("SELECT id, keyword, assignedProfileIds FROM keyword_rules WHERE active = 1").fetchall()
+        settings = _load_or_create_automation_settings(db)
+        s = settings.model_dump() if hasattr(settings, "model_dump") else {}
+        fu_enabled = bool(s.get("followUpEnabled")) and bool(s.get("masterEnabled"))
 
-    # Build keywords_by_profile for forecast keyword assignment
-    _keywords_by_profile: Dict[str, List[tuple]] = {}
-    for kr in keyword_rules_rows:
-        assigned = str(kr["assignedProfileIds"] or "")
-        for pid_part in assigned.split(","):
-            pid_part = pid_part.strip()
-            if pid_part:
-                _keywords_by_profile.setdefault(pid_part, []).append((str(kr["id"]), str(kr["keyword"])))
+        # Source 1: real pending queue items
+        queue_rows = db.execute(
+            """SELECT id, profile, profileId, community, communityId, postId,
+                      keyword, keywordId, scheduledTime, scheduledFor,
+                      priorityScore, countdown, generatedComment, status
+               FROM queue_items WHERE status = 'pending'
+               ORDER BY scheduledFor ASC LIMIT ?""",
+            (limit,),
+        ).fetchall()
 
-    if not profiles:
-        return []
-
-    profiles = [dict(row) for row in profiles]
-    settings = json.loads(settings_row["value"]) if settings_row else {}
-    global_daily_cap = max(1, int(settings.get("globalDailyCapPerAccount", 5)))
-    scan_interval_minutes = max(1, int(settings.get("scanIntervalMinutes", 5)))
-    step_seconds = scan_interval_minutes * 60
-
-    communities_by_profile: Dict[str, List[Dict[str, Any]]] = {}
-    for row in communities_rows:
-        pid = str(row["profileId"] or "")
-        communities_by_profile.setdefault(pid, []).append(dict(row))
-
-    # Load rotation pointers from run_state
-    rotation_pointers: Dict[str, int] = {}
-    run_state_path = Path(__file__).parent / "skool_run_state.json"
-    try:
-        with open(run_state_path, "r", encoding="utf-8") as f:
-            rs = json.load(f)
-        for p in rs.get("profiles", []):
-            pid = str(p.get("id") or "")
-            if pid:
-                rotation_pointers[pid] = int(p.get("_current_community_index", 0) or 0)
-    except Exception:
-        pass
-
-    # Build per-profile projection state
-    profile_states = []
-    for prof in profiles:
-        pid = str(prof["id"])
-        comms = communities_by_profile.get(pid, [])
-        if not comms:
-            continue
-        done_today = int(prof.get("dailyUsage", 0) or 0)
-        remaining_today = max(0, global_daily_cap - done_today)
-        comm_idx = rotation_pointers.get(pid, 0) % len(comms)
-        profile_states.append({
-            "id": pid,
-            "name": str(prof.get("name") or prof.get("email") or pid),
-            "communities": comms,
-            "comm_idx": comm_idx,
-            "remaining_today": remaining_today,
-            "daily_cap": global_daily_cap,
-            "kw_idx": 0,
-            "keywords": _keywords_by_profile.get(pid, []),
-        })
-
-    if not profile_states:
-        return []
-
-    # ---- Inject REAL follow-up scheduled rows first ----
-    fu_items = []
-    settings_dict = settings  # already parsed above
-    fu_enabled = bool(settings_dict.get("followUpEnabled"))
-    if fu_enabled and bool(settings_dict.get("masterEnabled")):
-        with get_db() as db:
+        # Source 2: real follow-up due dates
+        fu_rows = []
+        if fu_enabled:
             fu_rows = db.execute(
-                """SELECT c.id, c.contactName, c.profileId, c.profileName, c.originGroup,
-                          c.keyword, c.followUpDueAt, c.followUpCount
+                """SELECT c.id, c.contactName, c.profileId, c.profileName,
+                          c.originGroup, c.keyword, c.followUpDueAt, c.followUpCount
                    FROM conversations c
                    WHERE c.aiAutoEnabled = 1 AND c.isArchived = 0 AND c.isDeletedUi = 0
                      AND c.followUpDueAt IS NOT NULL
                    ORDER BY c.followUpDueAt ASC LIMIT ?""",
                 (limit,),
             ).fetchall()
-        for fu in fu_rows:
-            due_str = str(fu["followUpDueAt"] or "")
-            if not due_str:
-                continue
-            try:
-                from datetime import datetime as _dt2
-                if "T" in due_str:
-                    fu_dt = _dt2.fromisoformat(due_str.replace("Z", "+00:00"))
-                else:
-                    fu_dt = _dt2.fromisoformat(due_str)
-                fu_dt_naive = fu_dt.replace(tzinfo=None) if fu_dt.tzinfo else fu_dt
-            except Exception:
-                continue
-            if fu_dt_naive < now - timedelta(hours=1):
-                continue  # Skip stale past items
-            contact = str(fu["contactName"] or "contact")
-            fu_count = int(fu["followUpCount"] or 0)
-            day_label = ""
-            delta_days = (fu_dt_naive.date() - now.date()).days
-            if delta_days == 0:
-                day_label = "Today"
-            elif delta_days == 1:
-                day_label = "Tomorrow"
-            elif delta_days > 1:
-                day_label = fu_dt_naive.strftime("%a %b %d")
-            display_time = fu_dt_naive.strftime("%I:%M %p").lstrip("0")
-            local_tz = now.astimezone().tzinfo
-            scheduled_for_iso = fu_dt_naive.replace(tzinfo=local_tz).isoformat(timespec="seconds") if local_tz else fu_dt_naive.isoformat(timespec="seconds")
-            fu_items.append({
-                "id": f"followup-{fu['id'][-12:]}",
-                "profile": str(fu["profileName"] or ""),
-                "profileId": str(fu["profileId"] or ""),
-                "community": str(fu["originGroup"] or ""),
-                "communityId": "",
-                "postId": "",
-                "keyword": str(fu["keyword"] or ""),
-                "keywordId": "",
-                "scheduledTime": display_time,
-                "scheduledFor": scheduled_for_iso,
-                "priorityScore": 0,
-                "countdown": max(0, int((fu_dt_naive - now).total_seconds())),
-                "isProjected": False,
-                "isFollowUp": True,
-                "dayLabel": day_label,
-                "actionLabel": f"Follow-up #{fu_count + 1} to {contact}",
-            })
 
-    # Generate interleaved projections round-robin across profiles
+    # Build unified list
     items = []
-    slot = 0
-    # Track per-day remaining (resets at midnight boundaries)
-    day_remaining: Dict[str, int] = {ps["id"]: ps["remaining_today"] for ps in profile_states}
-    day_comm_actions: Dict[str, Dict[str, int]] = {ps["id"]: {} for ps in profile_states}
-    current_day = now.date()
 
-    while len(items) < limit:
-        added_this_round = False
-        for ps in profile_states:
-            if len(items) >= limit:
-                break
-            pid = ps["id"]
+    for row in queue_rows:
+        sf = str(row["scheduledFor"] or "")
+        items.append({
+            "id": str(row["id"]),
+            "profile": str(row["profile"] or ""),
+            "profileId": str(row["profileId"] or ""),
+            "community": str(row["community"] or ""),
+            "communityId": str(row["communityId"] or ""),
+            "postId": str(row["postId"] or ""),
+            "keyword": str(row["keyword"] or ""),
+            "keywordId": str(row["keywordId"] or ""),
+            "scheduledTime": str(row["scheduledTime"] or ""),
+            "scheduledFor": sf,
+            "priorityScore": int(row["priorityScore"] or 0),
+            "countdown": int(row["countdown"] or 0),
+            "isProjected": False,
+            "isFollowUp": False,
+            "dayLabel": "",
+            "actionLabel": f"Comment in {row['community'] or 'community'}",
+            "_sortKey": sf,
+        })
 
-            # Compute projected time for this slot
-            projected_dt = now + timedelta(seconds=step_seconds * (slot + 1))
-            if projected_dt > end_boundary:
-                continue
-
-            # Reset daily counters at day boundary
-            proj_day = projected_dt.date()
-            if proj_day != current_day:
-                current_day = proj_day
-                for ps2 in profile_states:
-                    day_remaining[ps2["id"]] = ps2["daily_cap"]
-                    day_comm_actions[ps2["id"]] = {}
-
-            if day_remaining[pid] <= 0:
-                continue
-
-            # Find next eligible community using rotation pointer
-            comms = ps["communities"]
-            found_community = None
-            for _ in range(len(comms)):
-                c = comms[ps["comm_idx"] % len(comms)]
-                ps["comm_idx"] += 1
-                cid = str(c.get("id") or "")
-                c_limit = int(c.get("dailyLimit") or 0)
-                c_used = int(day_comm_actions.get(pid, {}).get(cid, 0) or 0)
-                if c_limit > 0 and c_used >= c_limit:
-                    continue
-                found_community = c
-                break
-
-            if not found_community:
-                continue
-
-            cid = str(found_community.get("id") or "")
-            day_comm_actions.setdefault(pid, {})[cid] = int(day_comm_actions.get(pid, {}).get(cid, 0) or 0) + 1
-            day_remaining[pid] -= 1
-
-            display_time = _format_queue_display_time(projected_dt)
-            local_tz = now.astimezone().tzinfo
-            scheduled_for_iso = projected_dt.replace(tzinfo=local_tz).isoformat(timespec="seconds") if local_tz else projected_dt.isoformat(timespec="seconds")
-
-            day_label = ""
-            delta_days = (projected_dt.date() - now.date()).days
-            if delta_days == 1:
-                day_label = "Tomorrow"
-            elif delta_days > 1:
-                day_label = projected_dt.strftime("%a %b %d")
-
-            # Pick keyword via round-robin
-            kw_name = ""
-            kw_id = ""
-            if ps.get("keywords"):
-                kw_entry = ps["keywords"][ps["kw_idx"] % len(ps["keywords"])]
-                kw_id = kw_entry[0]
-                kw_name = kw_entry[1]
-                ps["kw_idx"] += 1
-
-            items.append({
-                "id": f"preview-{len(items)}",
-                "profile": ps["name"],
-                "profileId": pid,
-                "community": str(found_community.get("name") or ""),
-                "communityId": cid,
-                "postId": "",
-                "keyword": kw_name,
-                "keywordId": kw_id,
-                "scheduledTime": display_time,
-                "scheduledFor": scheduled_for_iso,
-                "priorityScore": 0,
-                "countdown": max(0, int((projected_dt - now).total_seconds())),
-                "isProjected": True,
-                "dayLabel": day_label,
-                "actionLabel": f"Next eligible post in {found_community.get('name', 'community')}",
-            })
-            added_this_round = True
-
-        slot += 1
-        if not added_this_round:
-            # All profiles capped for current day - jump to next day boundary
-            projected_dt = now + timedelta(seconds=step_seconds * (slot + 1))
-            next_day_start = datetime.combine(projected_dt.date() + timedelta(days=1), datetime.min.time())
-            # Add 5 seconds past midnight (matches engine reset timing)
-            next_day_start = next_day_start.replace(second=5)
-            jump_seconds = (next_day_start - now).total_seconds()
-            if jump_seconds <= 0:
-                break
-            new_slot = int(jump_seconds / step_seconds) + 1
-            if new_slot <= slot:
-                break
-            slot = new_slot
-            # Reset daily counters
-            current_day = next_day_start.date()
-            for ps2 in profile_states:
-                day_remaining[ps2["id"]] = ps2["daily_cap"]
-                day_comm_actions[ps2["id"]] = {}
+    local_tz = now.astimezone().tzinfo
+    now_naive = now.replace(tzinfo=None)
+    for fu in fu_rows:
+        due_str = str(fu["followUpDueAt"] or "")
+        if not due_str:
             continue
-        max_slots = int((end_boundary - now).total_seconds() / step_seconds) + limit
-        if slot > max_slots:
-            # Safety valve: don't exceed the forecast window
-            break
+        try:
+            if "T" in due_str:
+                fu_dt = datetime.fromisoformat(due_str.replace("Z", "+00:00"))
+            else:
+                fu_dt = datetime.fromisoformat(due_str)
+            fu_dt_naive = fu_dt.replace(tzinfo=None) if fu_dt.tzinfo else fu_dt
+        except Exception:
+            continue
+        if fu_dt_naive < now_naive - timedelta(hours=1):
+            continue
 
-    # Merge: real follow-ups first, then comment projections
-    return (fu_items + items)[:limit]
+        contact = str(fu["contactName"] or "contact")
+        fu_count = int(fu["followUpCount"] or 0)
+        day_label = ""
+        delta_days = (fu_dt_naive.date() - now_naive.date()).days
+        if delta_days == 0:
+            day_label = "Today"
+        elif delta_days == 1:
+            day_label = "Tomorrow"
+        elif delta_days > 1:
+            day_label = fu_dt_naive.strftime("%a %b %d")
+
+        display_time = fu_dt_naive.strftime("%I:%M %p").lstrip("0")
+        sf_iso = fu_dt_naive.replace(tzinfo=local_tz).isoformat(timespec="seconds") if local_tz else fu_dt_naive.isoformat(timespec="seconds")
+
+        items.append({
+            "id": f"followup-{fu['id'][-12:]}",
+            "profile": str(fu["profileName"] or ""),
+            "profileId": str(fu["profileId"] or ""),
+            "community": str(fu["originGroup"] or ""),
+            "communityId": "",
+            "postId": "",
+            "keyword": str(fu["keyword"] or ""),
+            "keywordId": "",
+            "scheduledTime": display_time,
+            "scheduledFor": sf_iso,
+            "priorityScore": 0,
+            "countdown": max(0, int((fu_dt_naive - now_naive).total_seconds())),
+            "isProjected": False,
+            "isFollowUp": True,
+            "dayLabel": day_label,
+            "actionLabel": f"Follow-up #{fu_count + 1} to {contact}",
+            "_sortKey": sf_iso,
+        })
+
+    # Sort by timestamp, take first N
+    items.sort(key=lambda x: x.get("_sortKey", ""))
+    for item in items:
+        item.pop("_sortKey", None)
+
+    return items[:limit]
 
 
 @app.get("/queue", response_model=QueueListResponse)

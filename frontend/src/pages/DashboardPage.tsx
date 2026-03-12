@@ -390,7 +390,7 @@ export default function DashboardPage() {
   const isN8nMode = settings?.orchestrationMode === "n8n";
   const n8nTimingQuery = useN8nTiming(isN8nMode);
   const n8nTiming = n8nTimingQuery.data;
-  const visibleQueue = isN8nMode ? [...queue, ...queuePreview.filter(p => p.isProjected).slice(0, Math.max(0, 30 - queue.length))] : (queue.length > 0 ? queue : queuePreview);
+  const visibleQueue = isN8nMode ? [...queue, ...queuePreview.slice(0, Math.max(0, 30 - queue.length))] : (queue.length > 0 ? queue : queuePreview);
   const displayQueue = interleaveQueueByProfile(visibleQueue);
   const parsedQueue = queue
     .map((item) => ({
@@ -649,7 +649,7 @@ export default function DashboardPage() {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
         <StatCard icon={Users} label="Active Profiles" value={activeProfiles} sub={`${profiles.length} total В· Cap: ${settings?.globalDailyCapPerAccount ?? "-"}/day`} color="bg-primary/10 text-primary" />
         <StatCard icon={MessageSquare} label="Messages" value={messagesCount} sub={`${conversations.length} conversations`} color="bg-success/10 text-success" />
-        <StatCard icon={Sparkles} label="Queue" value={queue.length} sub={isN8nMode ? `${queue.length} real` + (visibleQueue.length > queue.length ? ` + ${visibleQueue.length - queue.length} projected` : "") : `${visibleQueue.length} queued actions`} color="bg-warning/10 text-warning" />
+        <StatCard icon={Sparkles} label="Queue" value={queue.length} sub={isN8nMode ? `${visibleQueue.length} scheduled` : `${visibleQueue.length} queued actions`} color="bg-warning/10 text-warning" />
         <div className="bg-card border border-border rounded-xl p-5 animate-count-up">
           <div className="flex items-center gap-3 mb-3">
             <div className="flex items-center justify-center w-10 h-10 rounded-lg bg-info/10 text-info">
@@ -854,8 +854,8 @@ export default function DashboardPage() {
           <div className="flex items-center justify-between px-5 py-4 border-b border-border">
             <div className="flex items-center gap-2">
               <Clock className="w-4 h-4 text-muted-foreground" />
-              <h2 className="text-sm font-semibold text-foreground">{queue.length > 0 ? "Action Queue" : "Projected Schedule"}</h2>
-              <span className="text-xs text-muted-foreground">({isN8nMode ? (queue.length > 0 ? `${queue.length} queued` + (visibleQueue.length > queue.length ? ` + ${visibleQueue.length - queue.length} projected` : "") : `${visibleQueue.length} planned`) : queue.length > 0 ? `${queue.length} scheduled` : "0 scheduled"})</span>
+              <h2 className="text-sm font-semibold text-foreground">{queue.length > 0 ? "Action Queue" : "Scheduled Actions"}</h2>
+              <span className="text-xs text-muted-foreground">({isN8nMode ? `${visibleQueue.length} scheduled` : queue.length > 0 ? `${queue.length} scheduled` : "0 scheduled"})</span>
               <div className="ml-2 inline-flex items-center rounded-md border border-border bg-background overflow-hidden">
                 <button
                   type="button"
@@ -931,7 +931,7 @@ export default function DashboardPage() {
                       )}
                     </p>
                     <p className="text-[10px] text-muted-foreground">
-                      {isN8nMode ? ((item as any).isFollowUp ? <span className="text-info/70 italic">Follow-up</span> : (item as any).isProjected ? <span className="text-warning/70 italic">Forecast</span> : item.scheduledFor ? new Date(item.scheduledFor).toLocaleTimeString() : item.scheduledTime) : (engineStatus?.isRunning && !engineStatus?.isPaused ? item.scheduledTime : "Waiting for start")}
+                      {isN8nMode ? ((item as any).isFollowUp ? <span className="text-info/70 italic">Follow-up</span> : item.scheduledFor ? new Date(item.scheduledFor).toLocaleTimeString() : item.scheduledTime) : (engineStatus?.isRunning && !engineStatus?.isPaused ? item.scheduledTime : "Waiting for start")}
                     </p>
                   </div>
                 )}
@@ -939,7 +939,7 @@ export default function DashboardPage() {
             ))}
             {displayedQueue.length === 0 && (
               <div className="px-5 py-8 text-sm text-muted-foreground">
-                {isN8nMode ? (settings?.masterEnabled ? "Running \u2014 auto-scanning for posts..." : "Stopped") : "Queue is empty."}
+                {isN8nMode ? (settings?.masterEnabled ? "No scheduled actions" : "Stopped") : "Queue is empty."}
               </div>
             )}
           </div>

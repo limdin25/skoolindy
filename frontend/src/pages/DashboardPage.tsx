@@ -391,7 +391,7 @@ export default function DashboardPage() {
   const n8nTimingQuery = useN8nTiming(isN8nMode);
   const n8nTiming = n8nTimingQuery.data;
   const visibleQueue = isN8nMode ? [...queue, ...queuePreview.filter((p: any) => p.isProjected)] : (queue.length > 0 ? queue : queuePreview);
-  const displayQueue = interleaveQueueByProfile(visibleQueue);
+  const displayQueue = isN8nMode ? [...visibleQueue].sort((a, b) => new Date(a.scheduledFor || "9999").getTime() - new Date(b.scheduledFor || "9999").getTime()) : interleaveQueueByProfile(visibleQueue);
   const parsedQueue = queue
     .map((item) => ({
       item,
@@ -472,34 +472,22 @@ export default function DashboardPage() {
   const nextCountdown = (() => {
     // n8n mode: use real queue items and n8nTiming as source of truth
     if (isN8nMode) {
-      if (queue.length === 0) {
-        const armed = settings?.masterEnabled;
-        if (!armed) return "Stopped";
-        // Use real nextScheduledFor from backend (persisted queue item timestamp)
-        const realNext = n8nTiming?.nextScheduledFor;
-        if (realNext) {
-          const realTs = new Date(String(realNext)).getTime();
-          if (Number.isFinite(realTs) && realTs > nowMs) {
-            const sec = Math.floor((realTs - nowMs) / 1000);
-            return sec > 0 ? formatCountdown(sec) : "Executing…";
-          }
-          return "Executing…";
-        }
-        // No real scheduled item — show idle, not fake projection
-        return "Idle";
-      }
-      // Real queue items exist - find earliest future
-      const realParsed = queue.map(item => ({
+      const armed = settings?.masterEnabled;
+      if (!armed) return "Stopped";
+      // Find earliest future action across real queue + projected comments
+      const allActions = [...queue, ...queuePreview.filter((p: any) => p.isProjected)];
+      if (allActions.length === 0) return "Idle";
+      const allParsed = allActions.map(item => ({
         item,
         ts: parseQueueTimestampMs(String(item.scheduledFor || ""), String(item.scheduledTime || ""), nowMs),
       })).filter(e => Number.isFinite(e.ts));
-      const sorted = realParsed.sort((a, b) => a.ts - b.ts);
+      const sorted = allParsed.sort((a, b) => a.ts - b.ts);
       const futureItem = sorted.find((e) => e.ts > nowMs);
       if (futureItem) {
         const secondsLeft = Math.floor((futureItem.ts - nowMs) / 1000);
         return formatCountdown(secondsLeft);
       }
-      return `${queue.length} ready`;
+      return `${allActions.length} ready`;
     }
     // Internal scheduler mode
     if (!engineStatus?.isRunning || engineStatus?.isPaused) return "Waiting for start";
@@ -617,13 +605,7 @@ export default function DashboardPage() {
     setTimeout(() => setKeyTestStatus("idle"), 3000);
   };
 
-  const displayedQueue = queueExpanded ? displayQueue : (() => {
-    const followUps = displayQueue.filter((i: any) => i.isFollowUp);
-    const comments = displayQueue.filter((i: any) => !i.isFollowUp);
-    const maxFu = Math.min(followUps.length, 3);
-    const maxComments = Math.max(3, 6 - maxFu);
-    return [...followUps.slice(0, maxFu), ...comments.slice(0, maxComments)];
-  })();
+  const displayedQueue = queueExpanded ? displayQueue : displayQueue.slice(0, 6);
   const commentQueueItems = queue.filter(item => !item.isFollowUp);
   const followUpQueueItems = queue.filter(item => item.isFollowUp);
   const projectedComments = queuePreview.filter((p: any) => p.isProjected && !p.isFollowUp);
@@ -713,14 +695,10 @@ export default function DashboardPage() {
                   <>📩 No follow-ups scheduled</>
                 )}
               </p>
-              {/* Detail line */}
-              {queue.length > 0 && nextQueueItem ? (
+              {/* Detail line — show soonest action across all sources */}
+              {displayQueue.length > 0 ? (
                 <p className="text-[11px] text-muted-foreground mt-0.5">
-                  Next: {nextQueueItem.profile} › {nextQueueItem.community}{" \u00b7 "}<span className="text-primary">{nextQueueItem.keyword}</span>
-                </p>
-              ) : n8nTiming?.nextCommentAt && n8nTiming?.nextCommentSource !== "scanning_soon" ? (
-                <p className="text-[11px] text-muted-foreground/70 mt-0.5 italic">
-                  {new Date(String(n8nTiming.nextCommentAt)).toLocaleString()}
+                  Next: {displayQueue[0].profile} › {displayQueue[0].community}{" \u00b7 "}<span className="text-primary">{(displayQueue[0] as any).isProjected ? "projected" : (displayQueue[0] as any).isFollowUp ? "follow-up" : displayQueue[0].keyword}</span>
                 </p>
               ) : null}
             </>

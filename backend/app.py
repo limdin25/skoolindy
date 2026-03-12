@@ -625,6 +625,14 @@ async def _daily_reset_loop() -> None:
             _reset_daily_counters_if_needed_for_api()
         except Exception:
             pass
+        try:
+            with get_db() as db_prune:
+                db_prune.execute(
+                    "DELETE FROM logs WHERE id NOT IN (SELECT id FROM logs ORDER BY rowid DESC LIMIT 10000)"
+                )
+                db_prune.commit()
+        except Exception:
+            pass
         await asyncio.sleep(3600)  # check every hour
 
 

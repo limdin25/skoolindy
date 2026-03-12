@@ -11,6 +11,7 @@ Edit here, then push to [github.com/limdin25/skoolindy](https://github.com/limdi
 | **N8N_FULL_REPORT.md** | n8n API contract, JSON pack index, DB touchpoints |
 | **N8N_ENV_VARIABLES.md** | Safe env var list (no real keys) |
 | **N8N_*.md** / **SKOOLLINDY_N8N_*.md** | Runbooks, rollout, go-live |
+| **SKOOLINDY_STANDALONE.md** | No separate EngageFlow repo; legacy names only (`engageflow.db`, `ENGAGEFLOW_DB_PATH`) |
 
 **VPS sync (after GitHub updates):**
 

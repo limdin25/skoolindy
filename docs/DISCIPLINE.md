@@ -1,6 +1,6 @@
 # DISCIPLINE — Skoolindy + Joiner
 
-Non-negotiable rules for the Skoolindy backend + joiner integration (successor to the EngageFlow + joiner hybrid; same invariants, current product name **Skoolindy**).
+Non-negotiable rules for the Skoolindy backend + joiner integration. **Skoolindy is standalone** — no separate EngageFlow repo (see `docs/SKOOLINDY_STANDALONE.md` for legacy filenames only).
 
 ## 1) Hybrid Architecture Invariants
 

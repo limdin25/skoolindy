@@ -1,8 +1,8 @@
-# n8n — Full report (Skoolindy / Engageflow)
+# n8n — Full report (Skoolindy)
 
 **Purpose:** Single reference for workflow JSON locations, backend entry points, request/response shapes, DB usage, and ops docs.
 
-**Source tree:** `engageflow-repo/` (same n8n pack can live in `skoolindy` repo under `n8n/` if synced).
+**Source tree:** This repo — `n8n/*.json` (no separate EngageFlow repo; see `docs/SKOOLINDY_STANDALONE.md`).
 
 ---
 
@@ -10,12 +10,12 @@
 
 | File | Purpose |
 |------|--------|
-| `engageflow-repo/n8n/skoollindy-healthcheck.json` | Manual: GET `/api/n8n/health` + GET `/api/n8n/runtime-config` → validate |
-| `engageflow-repo/n8n/skoollindy-scan-and-queue.json` | Manual: config → scan-community → filter/match → AI node → queue-comment |
-| `engageflow-repo/n8n/skoollindy-scan-and-queue-cron.json` | Cron: periodic scan+queue (same API chain, scheduled) |
-| `engageflow-repo/n8n/skoollindy-execute-queue.json` | Manual: GET `/queue` → pick first → POST execute-comment |
-| `engageflow-repo/n8n/skoollindy-execute-queue-cron.json` | Cron every 5 min: health → guard `orchestrationMode === n8n` → GET `/queue` → execute-comment |
-| `engageflow-repo/n8n/skoollindy-daily-reset.json` | Cron: POST `/api/n8n/reset-daily` |
+| `n8n/skoollindy-healthcheck.json` | Manual: GET `/api/n8n/health` + GET `/api/n8n/runtime-config` → validate |
+| `n8n/skoollindy-scan-and-queue.json` | Manual: config → scan-community → filter/match → AI node → queue-comment |
+| `n8n/skoollindy-scan-and-queue-cron.json` | Cron: periodic scan+queue (same API chain, scheduled) |
+| `n8n/skoollindy-execute-queue.json` | Manual: GET `/queue` → pick first → POST execute-comment |
+| `n8n/skoollindy-execute-queue-cron.json` | Cron every 5 min: health → guard `orchestrationMode === n8n` → GET `/queue` → execute-comment |
+| `n8n/skoollindy-daily-reset.json` | Cron: POST `/api/n8n/reset-daily` |
 
 **Common URL pattern in JSON:**  
 `{{ $env.SKOOLLINDY_BASE_URL || 'http://localhost:3113' }}/api/n8n/...`
@@ -155,13 +155,13 @@ Built by `_build_n8n_runtime_config(db)` in `app.py` (read-only).
 
 - **`api.n8nTiming()`** → GET `/automation/n8n-timing`  
   Type: `lastScanTime`, `lastExecuteTime`, `lastQueueInsert`, `pendingQueueItems`, `nextScheduledFor`, `masterEnabled`, `isN8nMode`, `executorIntervalSeconds`
-- **`useN8nTiming(enabled)`** in `useEngageFlow.ts` polls when enabled.
+- **`useN8nTiming(enabled)`** in `frontend/src/hooks/useEngageFlow.ts` (legacy filename) polls when enabled.
 
 ---
 
 ## 7. Activation script
 
-**`engageflow-repo/scripts/n8n-activate-skoollindy.sh`**
+**`scripts/n8n-activate-skoollindy.sh`**
 
 - Requires `N8N_INSTANCE_API_KEY` (n8n Settings → API).
 - POST `${N8N_URL}/api/v1/workflows` with JSON from `skoollindy-scan-and-queue-cron.json` and `skoollindy-execute-queue-cron.json`, then POST `.../workflows/:id/activate`.
@@ -169,19 +169,19 @@ Built by `_build_n8n_runtime_config(db)` in `app.py` (read-only).
 
 ---
 
-## 8. Documentation index (read in this order)
+## 8. Documentation index (this repo, `docs/`)
 
 | Doc | Content |
 |-----|--------|
-| `engageflow-repo/docs/N8N_COMMENT_AUTOMATION.md` | Contract: who owns what; endpoints; GET /queue note |
-| `engageflow-repo/docs/N8N_WORKFLOW_ROLLOUT_PLAN.md` | Workflow A–D table, env vars, import steps |
-| `engageflow-repo/docs/N8N_CRON_ROLLOUT_PLAN.md` | Cron scheduling, rollout |
-| `engageflow-repo/docs/N8N_OPERATIONS_RUNBOOK.md` | Ops |
-| `engageflow-repo/docs/N8N_SET_VARIABLES_NOW.md` | Docker env for n8n container (**contains plaintext key in repo — rotate if exposed**) |
-| `engageflow-repo/docs/N8N_ACTIVATION_RUNBOOK.md` | Activation |
-| `engageflow-repo/docs/SKOOLLINDY_N8N_FINAL_GO_LIVE.md` | Go-live |
-| `engageflow-repo/docs/SKOOLLINDY_N8N_ACTIVATION_REPORT.md` | Report |
-| `engageflow-repo/backend/tests/test_n8n_activity_feed.py` | Tests around n8n activity |
+| `docs/N8N_COMMENT_AUTOMATION.md` | Contract: who owns what; endpoints; GET /queue note |
+| `docs/N8N_WORKFLOW_ROLLOUT_PLAN.md` | Workflow A–D table, env vars, import steps |
+| `docs/N8N_CRON_ROLLOUT_PLAN.md` | Cron scheduling, rollout |
+| `docs/N8N_OPERATIONS_RUNBOOK.md` | Ops |
+| `docs/N8N_ENV_VARIABLES.md` | Safe env list (use instead of any old doc that had real keys) |
+| `docs/N8N_ACTIVATION_RUNBOOK.md` | Activation |
+| `docs/SKOOLLINDY_N8N_FINAL_GO_LIVE.md` | Go-live |
+| `docs/SKOOLLINDY_N8N_ACTIVATION_REPORT.md` | Report |
+| `backend/tests/test_n8n_activity_feed.py` | Tests around n8n activity |
 
 ---
 
@@ -190,7 +190,7 @@ Built by `_build_n8n_runtime_config(db)` in `app.py` (read-only).
 | Where | Variable | Purpose |
 |-------|----------|--------|
 | Backend | `N8N_API_KEY` or `SKOOLLINDY_N8N_API_KEY` | Protects `/api/n8n/*` |
-| Backend | `ENGAGEFLOW_DB_PATH` | SQLite path |
+| Backend | `ENGAGEFLOW_DB_PATH` | SQLite path (legacy env name — points at Skoolindy DB, e.g. `backend/engageflow.db`) |
 | n8n container / process | `SKOOLLINDY_BASE_URL` | Backend base URL, no trailing slash |
 | n8n container / process | `SKOOLLINDY_N8N_KEY` | Same value as backend key → `X-N8N-KEY` |
 | n8n (workflow B) | `OPENAI_API_KEY` | Optional; AI node for comment text |

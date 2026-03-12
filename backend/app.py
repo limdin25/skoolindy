@@ -465,12 +465,14 @@ async def _follow_up_checker_loop(app: FastAPI) -> None:
 
 
 _N8N_EXECUTOR_INTERVAL_SECONDS = 120  # check every 2 minutes
+_N8N_EXECUTOR_LOCK = asyncio.Lock()
 
 async def _n8n_executor_loop(app: FastAPI) -> None:
     """Background loop: every 2 min, execute all due queue items (n8n mode only)."""
     pass  # executor loop
     await asyncio.sleep(15)  # wait for startup
     while True:
+        await _N8N_EXECUTOR_LOCK.acquire()
         try:
             with get_db() as db:
                 settings = _load_or_create_automation_settings(db)
@@ -609,6 +611,8 @@ async def _n8n_executor_loop(app: FastAPI) -> None:
                     db.commit()
             except Exception:
                 pass
+        finally:
+            _N8N_EXECUTOR_LOCK.release()
         await asyncio.sleep(_N8N_EXECUTOR_INTERVAL_SECONDS)
 
 

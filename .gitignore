@@ -86,3 +86,9 @@ joiner/backend/*.db-wal
 
 # Non-essential docs/meta files
 tatus*
+
+# Root db
+skoolindy.db
+
+frontend/.next/
+

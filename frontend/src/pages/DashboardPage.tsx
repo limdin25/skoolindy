@@ -618,6 +618,8 @@ export default function DashboardPage() {
   };
 
   const displayedQueue = queueExpanded ? displayQueue : displayQueue.slice(0, 6);
+  const commentQueueItems = queue.filter(item => !item.isFollowUp);
+  const followUpQueueItems = queue.filter(item => item.isFollowUp);
 
   const changeQueueRoundLimit = async (delta: number) => {
     if (!settings || queueRoundSavePending) return;
@@ -649,7 +651,7 @@ export default function DashboardPage() {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
         <StatCard icon={Users} label="Active Profiles" value={activeProfiles} sub={`${profiles.length} total В· Cap: ${settings?.globalDailyCapPerAccount ?? "-"}/day`} color="bg-primary/10 text-primary" />
         <StatCard icon={MessageSquare} label="Messages" value={messagesCount} sub={`${conversations.length} conversations`} color="bg-success/10 text-success" />
-        <StatCard icon={Sparkles} label="Queue" value={queue.length} sub={isN8nMode ? `${visibleQueue.length} scheduled` : `${visibleQueue.length} queued actions`} color="bg-warning/10 text-warning" />
+        <StatCard icon={Sparkles} label="Queue" value={commentQueueItems.length} sub={isN8nMode ? `${visibleQueue.length} scheduled` : `${visibleQueue.length} queued actions`} color="bg-warning/10 text-warning" />
         <div className="bg-card border border-border rounded-xl p-5 animate-count-up">
           <div className="flex items-center gap-3 mb-3">
             <div className="flex items-center justify-center w-10 h-10 rounded-lg bg-info/10 text-info">
@@ -662,8 +664,8 @@ export default function DashboardPage() {
             <>
               {/* Row 1: Next Comment */}
               <p className="text-xs text-muted-foreground mt-1">
-                {queue.length > 0 ? (
-                  <><span className="text-success font-medium">💬 Running</span>{" \u00b7 "}{queue.length} pending</>
+                {commentQueueItems.length > 0 ? (
+                  <><span className="text-success font-medium">💬 Running</span>{" \u00b7 "}{commentQueueItems.length} pending</>
                 ) : n8nTiming?.nextCommentSource === "after_reset" ? (
                   <><span className="text-warning font-medium">💬 Daily cap reached</span>{" \u00b7 "}resets at midnight</>
                 ) : n8nTiming?.nextCommentSource === "scanning_soon" ? (
@@ -890,7 +892,7 @@ export default function DashboardPage() {
           <div className="flex items-center justify-between px-5 py-4 border-b border-border">
             <div className="flex items-center gap-2">
               <Clock className="w-4 h-4 text-muted-foreground" />
-              <h2 className="text-sm font-semibold text-foreground">{queue.length > 0 ? "Action Queue" : "Scheduled Actions"}</h2>
+              <h2 className="text-sm font-semibold text-foreground">{commentQueueItems.length > 0 ? "Action Queue" : "Scheduled Actions"}</h2>
               <span className="text-xs text-muted-foreground">({isN8nMode ? `${visibleQueue.length} scheduled` : queue.length > 0 ? `${queue.length} scheduled` : "0 scheduled"})</span>
               <div className="ml-2 inline-flex items-center rounded-md border border-border bg-background overflow-hidden">
                 <button

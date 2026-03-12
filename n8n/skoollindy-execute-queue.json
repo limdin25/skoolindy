@@ -1,0 +1,91 @@
+{
+  "name": "Skoollindy Execute Queue",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "d4e5f6a7-0001-4000-8000-000000000001",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.SKOOLLINDY_BASE_URL || 'http://localhost:3113' }}/queue",
+        "options": { "timeout": 10000 }
+      },
+      "id": "d4e5f6a7-0002-4000-8000-000000000002",
+      "name": "GET Queue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 300],
+      "notesInFlow": true,
+      "notes": "Backend GET /queue returns items (id, profileId, scheduledFor, ...). Picks first item; backend has generatedComment in DB."
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json;\nconst items = body.items || [];\nconst first = items[0];\nif (!first || !first.id) {\n  return [{ json: { success: false, error: 'no_queue_item', queue_item_id: '' } }];\n}\nreturn [{ json: { queue_item_id: first.id, success: true } }];"
+      },
+      "id": "d4e5f6a7-0003-4000-8000-000000000003",
+      "name": "Pick First Item",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "c1", "leftValue": "={{ $json.queue_item_id }}", "rightValue": "", "operator": { "type": "string", "operation": "notEmpty" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "d4e5f6a7-0004-4000-8000-000000000004",
+      "name": "Has Item?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SKOOLLINDY_BASE_URL || 'http://localhost:3113' }}/api/n8n/execute-comment",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"queue_item_id\": \"{{ $json.queue_item_id }}\"\n}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-N8N-KEY", "value": "={{ $env.SKOOLLINDY_N8N_KEY }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        }
+      },
+      "id": "d4e5f6a7-0005-4000-8000-000000000005",
+      "name": "POST Execute Comment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 280]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": { "main": [[{ "node": "GET Queue", "type": "main", "index": 0 }]] },
+    "GET Queue": { "main": [[{ "node": "Pick First Item", "type": "main", "index": 0 }]] },
+    "Pick First Item": { "main": [[{ "node": "Has Item?", "type": "main", "index": 0 }]] },
+    "Has Item?": {
+      "main": [
+        [{ "node": "POST Execute Comment", "type": "main", "index": 0 }],
+        []
+      ]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "versionId": "execute-queue-v1",
+  "meta": { "templateCredsSetupCompleted": false },
+  "id": "skoollindy-execute-queue",
+  "tags": [{ "name": "skoollindy", "createdAt": "2026-03-10T00:00:00.000Z", "updatedAt": "2026-03-10T00:00:00.000Z" }]
+}

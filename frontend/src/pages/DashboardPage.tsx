@@ -660,22 +660,58 @@ export default function DashboardPage() {
           <p className="text-2xl font-bold text-foreground">{nextCountdown}</p>
           {isN8nMode ? (
             <>
+              {/* Row 1: Next Comment */}
               <p className="text-xs text-muted-foreground mt-1">
                 {queue.length > 0 ? (
-                  <><span className="text-success font-medium">Running</span>{" \u00b7 "}{queue.length} pending</>
-                ) : n8nTiming?.nextScheduledFor ? (
-                  <><span className="text-info font-medium">Scheduled</span>{" \u00b7 "}next scheduled action</>
+                  <><span className="text-success font-medium">💬 Running</span>{" \u00b7 "}{queue.length} pending</>
+                ) : n8nTiming?.nextCommentSource === "after_reset" ? (
+                  <><span className="text-warning font-medium">💬 Daily cap reached</span>{" \u00b7 "}resets at midnight</>
+                ) : n8nTiming?.nextCommentSource === "scanning_soon" ? (
+                  <><span className="text-info font-medium">💬 Scanning soon</span>{" \u00b7 "}queue refilling</>
+                ) : n8nTiming?.nextCommentAt ? (
+                  <><span className="text-info font-medium">💬 Next comment</span></>
                 ) : (
-                  <><span className="text-muted-foreground">Idle</span>{" \u00b7 "}no actions in queue</>
+                  <><span className="text-muted-foreground">💬 Idle</span>{" \u00b7 "}no comments scheduled</>
                 )}
               </p>
+              {/* Row 2: Next Follow-up */}
+              <p className="text-[11px] text-muted-foreground/80 mt-1">
+                {n8nTiming?.nextFollowUpAt ? (
+                  <>
+                    📩{" "}
+                    {n8nTiming?.nextFollowUpConversationId ? (
+                      <a
+                        href={`/inbox?conversation=${n8nTiming.nextFollowUpConversationId}`}
+                        className="text-primary underline underline-offset-2 hover:opacity-80 transition-opacity"
+                        title="Open lead inbox"
+                      >
+                        {n8nTiming.nextFollowUpLeadName
+                          ? `${n8nTiming.nextFollowUpLeadName}`
+                          : "Lead"}
+                      </a>
+                    ) : (
+                      <span>{n8nTiming?.nextFollowUpLeadName || "Lead"}</span>
+                    )}
+                    {" \u00b7 "}
+                    {new Date(String(n8nTiming.nextFollowUpAt)).toLocaleString("en-GB", {
+                      day: "2-digit",
+                      month: "short",
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    })}
+                  </>
+                ) : (
+                  <>📩 No follow-ups scheduled</>
+                )}
+              </p>
+              {/* Detail line */}
               {queue.length > 0 && nextQueueItem ? (
-                <p className="text-[11px] text-muted-foreground mt-1">
-                  Next queued: {nextQueueItem.profile} &gt; {nextQueueItem.community}{" \u00b7 "}<span className="text-primary">{nextQueueItem.keyword}</span>
+                <p className="text-[11px] text-muted-foreground mt-0.5">
+                  Next: {nextQueueItem.profile} › {nextQueueItem.community}{" \u00b7 "}<span className="text-primary">{nextQueueItem.keyword}</span>
                 </p>
-              ) : queue.length === 0 && n8nTiming?.nextScheduledFor ? (
-                <p className="text-[11px] text-muted-foreground/70 mt-1 italic">
-                  Next: {new Date(String(n8nTiming.nextScheduledFor)).toLocaleString()}
+              ) : n8nTiming?.nextCommentAt && n8nTiming?.nextCommentSource !== "scanning_soon" ? (
+                <p className="text-[11px] text-muted-foreground/70 mt-0.5 italic">
+                  {new Date(String(n8nTiming.nextCommentAt)).toLocaleString()}
                 </p>
               ) : null}
             </>

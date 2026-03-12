@@ -349,7 +349,7 @@ export const api = {
   automationStatus: () => request<AutomationEngineStatus>("/automation/status"),
 
   n8nScanNow: () => request<{ success: boolean; scanned: number; posts_found: number; queued: number; skipped: number; errors: string[] }>("/automation/n8n-scan-now", { method: "POST" }),
-  n8nTiming: () => request<{ lastScanTime: string | null; lastExecuteTime: string | null; lastQueueInsert: string | null; pendingQueueItems: number; nextScheduledFor: string | null; masterEnabled: boolean; isN8nMode: boolean; executorIntervalSeconds: number }>("/automation/n8n-timing"),
+  n8nTiming: () => request<{ lastScanTime: string | null; lastExecuteTime: string | null; lastQueueInsert: string | null; pendingQueueItems: number; nextScheduledFor: string | null; nextCommentAt: string | null; nextCommentSource: string | null; nextFollowUpAt: string | null; nextFollowUpLeadName: string | null; nextFollowUpConversationId: string | null; masterEnabled: boolean; isN8nMode: boolean; executorIntervalSeconds: number }>("/automation/n8n-timing"),
   profileCheckLogin: (profileId: string) => request<{ success: boolean; status: string; message: string }>(`/profiles/${profileId}/check-login`, { method: "POST" }),
   profileCheckProxy: (profileId: string) => request<{ success: boolean; status: string; message: string }>(`/profiles/${profileId}/check-proxy`, { method: "POST" }),
   automationCheckLogin: (profileId: string) => request<{ success: boolean; status: string; message: string }>(`/automation/profiles/${profileId}/check-login`, { method: "POST" }),

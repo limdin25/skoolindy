@@ -390,7 +390,7 @@ export default function DashboardPage() {
   const isN8nMode = settings?.orchestrationMode === "n8n";
   const n8nTimingQuery = useN8nTiming(isN8nMode);
   const n8nTiming = n8nTimingQuery.data;
-  const visibleQueue = isN8nMode ? [...queue, ...queuePreview.slice(0, Math.max(0, 30 - queue.length))] : (queue.length > 0 ? queue : queuePreview);
+  const visibleQueue = isN8nMode ? [...queue, ...queuePreview.filter((p: any) => !queue.some((q: any) => q.id === p.id))] : (queue.length > 0 ? queue : queuePreview);
   const displayQueue = interleaveQueueByProfile(visibleQueue);
   const parsedQueue = queue
     .map((item) => ({
@@ -620,6 +620,7 @@ export default function DashboardPage() {
   const displayedQueue = queueExpanded ? displayQueue : displayQueue.slice(0, 6);
   const commentQueueItems = queue.filter(item => !item.isFollowUp);
   const followUpQueueItems = queue.filter(item => item.isFollowUp);
+  const projectedComments = queuePreview.filter((p: any) => p.isProjected && !p.isFollowUp);
 
   const changeQueueRoundLimit = async (delta: number) => {
     if (!settings || queueRoundSavePending) return;
@@ -651,7 +652,7 @@ export default function DashboardPage() {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
         <StatCard icon={Users} label="Active Profiles" value={activeProfiles} sub={`${profiles.length} total В· Cap: ${settings?.globalDailyCapPerAccount ?? "-"}/day`} color="bg-primary/10 text-primary" />
         <StatCard icon={MessageSquare} label="Messages" value={messagesCount} sub={`${conversations.length} conversations`} color="bg-success/10 text-success" />
-        <StatCard icon={Sparkles} label="Queue" value={commentQueueItems.length} sub={isN8nMode ? `${visibleQueue.length} scheduled` : `${visibleQueue.length} queued actions`} color="bg-warning/10 text-warning" />
+        <StatCard icon={Sparkles} label="Queue" value={commentQueueItems.length + projectedComments.length} sub={isN8nMode ? `${projectedComments.length} projected` : `${visibleQueue.length} queued actions`} color="bg-warning/10 text-warning" />
         <div className="bg-card border border-border rounded-xl p-5 animate-count-up">
           <div className="flex items-center gap-3 mb-3">
             <div className="flex items-center justify-center w-10 h-10 rounded-lg bg-info/10 text-info">
@@ -667,7 +668,7 @@ export default function DashboardPage() {
                 {commentQueueItems.length > 0 ? (
                   <><span className="text-success font-medium">💬 Running</span>{" \u00b7 "}{commentQueueItems.length} pending</>
                 ) : n8nTiming?.nextCommentSource === "after_reset" ? (
-                  <><span className="text-warning font-medium">💬 Daily cap reached</span>{" \u00b7 "}resets at midnight</>
+                  <><span className="text-warning font-medium">💬 Daily cap reached</span>{" \u00b7 "}{projectedComments.length} projected tomorrow</>
                 ) : n8nTiming?.nextCommentSource === "scanning_soon" ? (
                   <><span className="text-info font-medium">💬 Scanning soon</span>{" \u00b7 "}queue refilling</>
                 ) : n8nTiming?.nextCommentAt ? (
@@ -893,7 +894,7 @@ export default function DashboardPage() {
             <div className="flex items-center gap-2">
               <Clock className="w-4 h-4 text-muted-foreground" />
               <h2 className="text-sm font-semibold text-foreground">{commentQueueItems.length > 0 ? "Action Queue" : "Scheduled Actions"}</h2>
-              <span className="text-xs text-muted-foreground">({isN8nMode ? `${visibleQueue.length} scheduled` : queue.length > 0 ? `${queue.length} scheduled` : "0 scheduled"})</span>
+              <span className="text-xs text-muted-foreground">({isN8nMode ? `${visibleQueue.filter((i: any) => !i.isFollowUp).length} comments · ${visibleQueue.filter((i: any) => i.isFollowUp).length} follow-ups` : queue.length > 0 ? `${queue.length} scheduled` : "0 scheduled"})</span>
               <div className="ml-2 inline-flex items-center rounded-md border border-border bg-background overflow-hidden">
                 <button
                   type="button"

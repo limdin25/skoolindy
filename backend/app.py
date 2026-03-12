@@ -8121,6 +8121,68 @@ def queue_preview(limit: int = 50, days: int = 2):
     if not profile_states:
         return []
 
+    # ---- Inject REAL follow-up scheduled rows first ----
+    fu_items = []
+    settings_dict = settings  # already parsed above
+    fu_enabled = bool(settings_dict.get("followUpEnabled"))
+    if fu_enabled and bool(settings_dict.get("masterEnabled")):
+        with get_db() as db:
+            fu_rows = db.execute(
+                """SELECT c.id, c.contactName, c.profileId, c.profileName, c.originGroup,
+                          c.keyword, c.followUpDueAt, c.followUpCount
+                   FROM conversations c
+                   WHERE c.aiAutoEnabled = 1 AND c.isArchived = 0 AND c.isDeletedUi = 0
+                     AND c.followUpDueAt IS NOT NULL
+                   ORDER BY c.followUpDueAt ASC LIMIT ?""",
+                (limit,),
+            ).fetchall()
+        for fu in fu_rows:
+            due_str = str(fu["followUpDueAt"] or "")
+            if not due_str:
+                continue
+            try:
+                from datetime import datetime as _dt2
+                if "T" in due_str:
+                    fu_dt = _dt2.fromisoformat(due_str.replace("Z", "+00:00"))
+                else:
+                    fu_dt = _dt2.fromisoformat(due_str)
+                fu_dt_naive = fu_dt.replace(tzinfo=None) if fu_dt.tzinfo else fu_dt
+            except Exception:
+                continue
+            if fu_dt_naive < now - timedelta(hours=1):
+                continue  # Skip stale past items
+            contact = str(fu["contactName"] or "contact")
+            fu_count = int(fu["followUpCount"] or 0)
+            day_label = ""
+            delta_days = (fu_dt_naive.date() - now.date()).days
+            if delta_days == 0:
+                day_label = "Today"
+            elif delta_days == 1:
+                day_label = "Tomorrow"
+            elif delta_days > 1:
+                day_label = fu_dt_naive.strftime("%a %b %d")
+            display_time = fu_dt_naive.strftime("%I:%M %p").lstrip("0")
+            local_tz = now.astimezone().tzinfo
+            scheduled_for_iso = fu_dt_naive.replace(tzinfo=local_tz).isoformat(timespec="seconds") if local_tz else fu_dt_naive.isoformat(timespec="seconds")
+            fu_items.append({
+                "id": f"followup-{fu['id'][-12:]}",
+                "profile": str(fu["profileName"] or ""),
+                "profileId": str(fu["profileId"] or ""),
+                "community": str(fu["originGroup"] or ""),
+                "communityId": "",
+                "postId": "",
+                "keyword": str(fu["keyword"] or ""),
+                "keywordId": "",
+                "scheduledTime": display_time,
+                "scheduledFor": scheduled_for_iso,
+                "priorityScore": 0,
+                "countdown": max(0, int((fu_dt_naive - now).total_seconds())),
+                "isProjected": False,
+                "isFollowUp": True,
+                "dayLabel": day_label,
+                "actionLabel": f"Follow-up #{fu_count + 1} to {contact}",
+            })
+
     # Generate interleaved projections round-robin across profiles
     items = []
     slot = 0
@@ -8237,7 +8299,8 @@ def queue_preview(limit: int = 50, days: int = 2):
             # Safety valve: don't exceed the forecast window
             break
 
-    return items
+    # Merge: real follow-ups first, then comment projections
+    return (fu_items + items)[:limit]
 
 
 @app.get("/queue", response_model=QueueListResponse)

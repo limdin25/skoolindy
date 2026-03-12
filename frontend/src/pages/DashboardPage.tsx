@@ -904,13 +904,20 @@ export default function DashboardPage() {
                         if (!Number.isFinite(ts)) return "Pending";
                         const sec = Math.floor((ts - nowMs) / 1000);
                         if (sec <= 0) return "Ready";
-                        if (sec < 60) return `${sec}s`;
-                        if (sec < 3600) {
-                          const m = Math.floor(sec / 60);
-                          const s = sec % 60;
-                          return `${m}:${String(s).padStart(2, "0")}`;
+                        // For items > 24h away, show date instead of countdown
+                        if (sec > 86400) {
+                          const d = new Date(ts);
+                          return d.toLocaleDateString("en-GB", { day: "2-digit", month: "short" });
                         }
-                        return `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`;
+                        if (sec >= 3600) {
+                          const h = Math.floor(sec / 3600);
+                          const m = Math.floor((sec % 3600) / 60);
+                          return `${h}h ${m}m`;
+                        }
+                        if (sec < 60) return `${sec}s`;
+                        const m = Math.floor(sec / 60);
+                        const s = sec % 60;
+                        return `${m}:${String(s).padStart(2, "0")}`;
                       })() : formatQueueEta(
                         item.scheduledFor,
                         item.scheduledTime,
@@ -924,7 +931,7 @@ export default function DashboardPage() {
                       )}
                     </p>
                     <p className="text-[10px] text-muted-foreground">
-                      {isN8nMode ? ((item as any).isProjected ? <span className="text-warning/70 italic">Projected</span> : item.scheduledFor ? new Date(item.scheduledFor).toLocaleTimeString() : item.scheduledTime) : (engineStatus?.isRunning && !engineStatus?.isPaused ? item.scheduledTime : "Waiting for start")}
+                      {isN8nMode ? ((item as any).isFollowUp ? <span className="text-info/70 italic">Follow-up</span> : (item as any).isProjected ? <span className="text-warning/70 italic">Forecast</span> : item.scheduledFor ? new Date(item.scheduledFor).toLocaleTimeString() : item.scheduledTime) : (engineStatus?.isRunning && !engineStatus?.isPaused ? item.scheduledTime : "Waiting for start")}
                     </p>
                   </div>
                 )}

@@ -8216,12 +8216,110 @@ def queue_preview(limit: int = 50, days: int = 2):
             "_sortKey": sf_iso,
         })
 
+    # ── Projected comment slots (fill up to `limit` total) ──
+    # When queue_items is empty (e.g. daily cap reached), project future comment
+    # slots based on profiles, communities, and scheduling config.
+    real_comment_count = sum(1 for i in items if not i.get("isFollowUp"))
+    projected_needed = limit  # Always generate full set of projected comments
+    if real_comment_count == 0:
+        try:
+            with get_db() as db_proj:
+                proj_settings = _load_or_create_automation_settings(db_proj)
+                proj_s = proj_settings.model_dump() if hasattr(proj_settings, "model_dump") else {}
+                global_cap = max(1, int(proj_s.get("globalDailyCapPerAccount", 5)))
+                delay_min = max(1, int(proj_s.get("delayMin", 3)))
+                delay_max = max(delay_min, int(proj_s.get("delayMax", 10)))
+
+                active_profiles = db_proj.execute(
+                    "SELECT id, name FROM profiles WHERE status != 'paused'"
+                ).fetchall()
+                active_communities = db_proj.execute(
+                    "SELECT id, profileId, name FROM communities WHERE status = 'active' ORDER BY profileId, name"
+                ).fetchall()
+
+                if active_profiles and active_communities:
+                    # Group communities by profile
+                    comms_by_profile = {}
+                    for c in active_communities:
+                        pid = str(c["profileId"])
+                        if pid not in comms_by_profile:
+                            comms_by_profile[pid] = []
+                        comms_by_profile[pid].append(c)
+
+                    import random
+                    from zoneinfo import ZoneInfo
+                    tz = ZoneInfo("Europe/Berlin")
+                    now_local = datetime.now(tz=tz)
+                    # Start from next midnight reset
+                    next_reset = (now_local.replace(hour=0, minute=0, second=5, microsecond=0) + timedelta(days=1))
+
+                    projected_items = []
+                    day_offset = 0
+                    comm_index_by_profile = {str(p["id"]): 0 for p in active_profiles}
+
+                    while len(projected_items) < projected_needed and day_offset < 7:
+                        day_start = next_reset + timedelta(days=day_offset)
+                        cursor = day_start + timedelta(seconds=random.randint(60, 300))
+
+                        for slot in range(global_cap):
+                            if len(projected_items) >= projected_needed:
+                                break
+                            for prof in active_profiles:
+                                if len(projected_items) >= projected_needed:
+                                    break
+                                pid = str(prof["id"])
+                                profile_comms = comms_by_profile.get(pid, [])
+                                if not profile_comms:
+                                    continue
+                                ci = comm_index_by_profile[pid] % len(profile_comms)
+                                comm = profile_comms[ci]
+                                comm_index_by_profile[pid] = ci + 1
+
+                                sf_iso = cursor.isoformat(timespec="seconds")
+                                delta_days = (cursor.date() - now_local.date()).days
+                                if delta_days == 0:
+                                    day_label = "Today"
+                                elif delta_days == 1:
+                                    day_label = "Tomorrow"
+                                else:
+                                    day_label = cursor.strftime("%a %b %d")
+
+                                display_time = cursor.strftime("%I:%M %p").lstrip("0")
+
+                                projected_items.append({
+                                    "id": f"proj-{pid[-8:]}-d{day_offset}-s{slot}-{ci}",
+                                    "profile": str(prof["name"] or ""),
+                                    "profileId": pid,
+                                    "community": str(comm["name"] or ""),
+                                    "communityId": str(comm["id"] or ""),
+                                    "postId": "",
+                                    "keyword": "projected",
+                                    "keywordId": "",
+                                    "scheduledTime": display_time,
+                                    "scheduledFor": sf_iso,
+                                    "priorityScore": 0,
+                                    "countdown": max(0, int((cursor - now_local).total_seconds())),
+                                    "isProjected": True,
+                                    "isFollowUp": False,
+                                    "dayLabel": day_label,
+                                    "actionLabel": f"Comment in {comm['name'] or 'community'}",
+                                    "_sortKey": sf_iso,
+                                })
+                                cursor += timedelta(seconds=random.randint(delay_min, delay_max))
+
+                        day_offset += 1
+
+                    items.extend(projected_items)
+        except Exception:
+            pass
+
     # Sort by timestamp, take first N
     items.sort(key=lambda x: x.get("_sortKey", ""))
     for item in items:
         item.pop("_sortKey", None)
 
-    return items[:limit]
+    # Return all items: follow-ups + all projected comments (no truncation)
+    return items
 
 
 @app.get("/queue", response_model=QueueListResponse)

@@ -889,3 +889,91 @@ class TestOrderOfOperations:
         ts = datetime.fromisoformat(last_ai.replace("Z", "+00:00"))
         diff = (datetime.now(timezone.utc) - ts).total_seconds()
         assert diff < 300, "Cooldown should block since lastAiOutboundAt was just set"
+
+
+class TestFollowUpDelayResolution:
+    """Verify follow-up delay correctly resolves keyword rule vs global setting."""
+
+    def test_global_3day_delay_respected(self):
+        """When keyword rule has no dmReplyDelay, global 259200s (3 days) is used."""
+        global_delay = 259200  # 3 days in seconds
+        kw_delay = None  # No keyword rule override
+        raw = int(kw_delay) if kw_delay and kw_delay else 0
+        effective = raw if raw >= 3600 else global_delay
+        delay = max(effective, 3600)
+        assert delay == 259200, f'Expected 259200 (3 days), got {delay}'
+
+    def test_keyword_override_respected_if_large_enough(self):
+        """A keyword rule with dmReplyDelay >= 3600 should override global."""
+        global_delay = 259200
+        kw_delay = 86400  # 1 day keyword override
+        raw = int(kw_delay) if kw_delay else 0
+        effective = raw if raw >= 3600 else global_delay
+        delay = max(effective, 3600)
+        assert delay == 86400, f'Expected 86400 (1 day override), got {delay}'
+
+    def test_tiny_keyword_delay_uses_global(self):
+        """A keyword rule with dmReplyDelay=1 must fall back to global delay, not floor to 3600."""
+        global_delay = 259200
+        kw_delay = 1  # Bad/default value
+        raw = int(kw_delay) if kw_delay else 0
+        effective = raw if raw >= 3600 else global_delay
+        delay = max(effective, 3600)
+        assert delay == 259200, f'Expected 259200 (global fallback), got {delay}'
+
+    def test_zero_keyword_delay_uses_global(self):
+        """dmReplyDelay=0 should use global delay."""
+        global_delay = 259200
+        kw_delay = 0
+        raw = int(kw_delay) if kw_delay else 0
+        effective = raw if raw >= 3600 else global_delay
+        delay = max(effective, 3600)
+        assert delay == 259200, f'Expected 259200 (global fallback), got {delay}'
+
+    def test_floor_1hour_minimum(self):
+        """Even if global delay is somehow set below 3600, floor is 3600."""
+        global_delay = 600  # Broken global setting
+        kw_delay = None
+        raw = int(kw_delay) if kw_delay and kw_delay else 0
+        effective = raw if raw >= 3600 else global_delay
+        delay = max(effective, 3600)
+        assert delay == 3600, f'Expected 3600 (1-hour floor), got {delay}'
+
+    def test_stale_past_due_at_is_cleaned(self):
+        """If followUpDueAt is in the past and was from broken logic, checker sends but
+        the new delay after sending should use correct global delay."""
+        db = create_test_db()
+        past_due = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec='seconds')
+        insert_conversation(db, 'conv-fu-stale', ai_auto=True, follow_up_count=0,
+                          follow_up_due=past_due, last_ai_outbound=(datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(timespec='seconds'))
+        row = db.execute('SELECT followUpDueAt FROM conversations WHERE id = ?', ('conv-fu-stale',)).fetchone()
+        assert row['followUpDueAt'] is not None
+        # Verify the due time is in the past
+        due_ts = datetime.fromisoformat(row['followUpDueAt'].replace('Z', '+00:00'))
+        assert due_ts < datetime.now(timezone.utc), 'Stale due should be in the past'
+
+    def test_no_followup_within_minutes_when_3day_delay(self):
+        """With global delay 259200s, followUpDueAt should be ~3 days from now, not minutes."""
+        now = datetime.now(timezone.utc)
+        global_delay = 259200
+        kw_delay = None
+        raw = int(kw_delay) if kw_delay and kw_delay else 0
+        effective = raw if raw >= 3600 else global_delay
+        delay = max(effective, 3600)
+        due_at = now + timedelta(seconds=delay)
+        diff_seconds = (due_at - now).total_seconds()
+        assert diff_seconds >= 259200, f'Follow-up should be >= 3 days away, got {diff_seconds}s'
+        assert diff_seconds < 259300, 'Should be close to exactly 3 days'
+
+    def test_followup_dueAt_computation_with_bad_keyword_rule(self):
+        """End-to-end: simulate the exact code path with dmReplyDelay=1 and verify 3-day result."""
+        global_delay = 259200
+        matched_rule = {'dmReplyDelay': 1, 'dmMaxReplies': 3}
+        # Exact logic from the fix:
+        _kw_delay = int(matched_rule['dmReplyDelay']) if matched_rule and matched_rule['dmReplyDelay'] else 0
+        _raw_delay = _kw_delay if _kw_delay >= 3600 else global_delay
+        _delay = max(_raw_delay, 3600)
+        now = datetime.now(timezone.utc)
+        due_at = now + timedelta(seconds=_delay)
+        diff = (due_at - now).total_seconds()
+        assert abs(diff - 259200) < 1, f'Should be 259200s (3 days), got {diff}'

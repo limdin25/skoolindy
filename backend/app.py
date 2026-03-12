@@ -431,7 +431,8 @@ async def _follow_up_checker_loop(app: FastAPI) -> None:
                         if latest_out:
                             db.execute("UPDATE messages SET isAiGenerated = 1 WHERE id = ?", (latest_out["id"],))
                         new_count = current_count + 1
-                        delay_sec = max(int(matched_rule["dmReplyDelay"]) if matched_rule and matched_rule["dmReplyDelay"] else global_delay, 3600)
+                        _kw_fu_delay = int(matched_rule["dmReplyDelay"]) if matched_rule and matched_rule["dmReplyDelay"] else 0
+                        delay_sec = max(_kw_fu_delay if _kw_fu_delay >= 3600 else global_delay, 3600)
                         new_due = None if new_count >= max_fu else (datetime.now(tz=timezone.utc) + timedelta(seconds=delay_sec)).isoformat(timespec="seconds")
                         fu_now = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
                         db.execute(
@@ -4640,7 +4641,8 @@ def _try_ai_auto_reply(
             _global_delay = int(_fu_s.get("followUpDelaySeconds", 86400))
             _kw = str(conversation_row["keyword"] if conversation_row else "").strip()
             _matched_rule = _find_matching_keyword_rule(db, profile_id, _kw)
-            _raw_delay = int(_matched_rule["dmReplyDelay"]) if _matched_rule and _matched_rule["dmReplyDelay"] else _global_delay
+            _kw_delay = int(_matched_rule["dmReplyDelay"]) if _matched_rule and _matched_rule["dmReplyDelay"] else 0
+            _raw_delay = _kw_delay if _kw_delay >= 3600 else _global_delay  # Only use keyword override if >= 1 hour
             _delay = max(_raw_delay, 3600)  # Floor: minimum 1 hour between follow-ups
             _due_at = (datetime.now(tz=timezone.utc) + timedelta(seconds=_delay)).isoformat(timespec="seconds") if _fu_enabled and _delay > 0 else None
             db.execute(
@@ -7135,11 +7137,32 @@ def automation_n8n_timing():
         last_queue_insert = _latest_iso("%n8n queue-comment item=%")
         queue_count = db.execute("SELECT COUNT(*) as c FROM queue_items WHERE status = 'pending'").fetchone()["c"]
 
-        # Next scheduled item
+        # Next scheduled item (queue OR follow-up, whichever is soonest)
         next_item_row = db.execute(
             "SELECT scheduledFor FROM queue_items WHERE status = 'pending' ORDER BY scheduledFor ASC LIMIT 1"
         ).fetchone()
-        next_scheduled_for = str(next_item_row["scheduledFor"]) if next_item_row else None
+        next_queue_for = str(next_item_row["scheduledFor"]) if next_item_row else None
+
+        # Also check follow-up due dates (these are real scheduled actions too)
+        fu_enabled = bool(s.get("followUpEnabled"))
+        next_fu_row = None
+        if fu_enabled and master_enabled:
+            next_fu_row = db.execute(
+                """SELECT MIN(followUpDueAt) as nextDue FROM conversations
+                   WHERE aiAutoEnabled = 1 AND isArchived = 0 AND isDeletedUi = 0
+                     AND followUpDueAt IS NOT NULL"""
+            ).fetchone()
+        next_fu_for = str(next_fu_row["nextDue"]) if next_fu_row and next_fu_row["nextDue"] else None
+
+        # Pick the earliest of queue item or follow-up
+        next_scheduled_for = None
+        candidates = []
+        if next_queue_for:
+            candidates.append(next_queue_for)
+        if next_fu_for:
+            candidates.append(next_fu_for)
+        if candidates:
+            next_scheduled_for = min(candidates)
 
         # Executor cron interval (for "next scan" estimation)
         executor_interval = _N8N_EXECUTOR_INTERVAL_SECONDS
@@ -7150,6 +7173,8 @@ def automation_n8n_timing():
         "lastQueueInsert": last_queue_insert,
         "pendingQueueItems": queue_count,
         "nextScheduledFor": next_scheduled_for,
+        "nextFollowUpFor": next_fu_for,
+        "nextQueueItemFor": next_queue_for,
         "masterEnabled": master_enabled,
         "isN8nMode": is_n8n,
         "executorIntervalSeconds": executor_interval,

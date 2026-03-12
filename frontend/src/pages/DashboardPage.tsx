@@ -664,7 +664,7 @@ export default function DashboardPage() {
                 {queue.length > 0 ? (
                   <><span className="text-success font-medium">Running</span>{" \u00b7 "}{queue.length} pending</>
                 ) : n8nTiming?.nextScheduledFor ? (
-                  <><span className="text-info font-medium">Scheduled</span>{" \u00b7 "}next queued action</>
+                  <><span className="text-info font-medium">Scheduled</span>{" \u00b7 "}next scheduled action</>
                 ) : (
                   <><span className="text-muted-foreground">Idle</span>{" \u00b7 "}no actions in queue</>
                 )}
